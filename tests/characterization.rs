@@ -20,6 +20,7 @@ fn base_options(session_dir: &std::path::Path) -> ReportOptions {
     ReportOptions {
         since: None,
         until: None,
+        last_days: None,
         timezone: "UTC".to_string(),
         locale: "en-US".to_string(),
         number_format: NumberFormat::Short,
@@ -121,6 +122,7 @@ fn duplicate_session_ids_across_roots_prefer_the_longer_file() {
         &ReportOptions {
             since: None,
             until: None,
+            last_days: None,
             timezone: "UTC".to_string(),
             locale: "en-US".to_string(),
             number_format: NumberFormat::Short,
@@ -165,6 +167,7 @@ fn session_last_activity_uses_selected_timezone() {
         &ReportOptions {
             since: None,
             until: None,
+            last_days: None,
             timezone: "Europe/Warsaw".to_string(),
             locale: "en-US".to_string(),
             number_format: NumberFormat::Short,
@@ -308,6 +311,7 @@ fn invalid_timezone_is_rejected() {
         &ReportOptions {
             since: None,
             until: None,
+            last_days: None,
             timezone: "Europe/Warswa".to_string(),
             locale: "en-US".to_string(),
             number_format: NumberFormat::Short,

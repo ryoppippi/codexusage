@@ -1,7 +1,7 @@
 //! CLI orchestration and report building.
 
 use crate::pricing::{Pricing, PricingCatalog, PricingLoadOptions, load_pricing_catalog};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use chrono_tz::Tz;
 use clap::{Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, eyre};
@@ -74,6 +74,8 @@ pub struct ReportOptions {
     pub since: Option<String>,
     /// Inclusive upper bound.
     pub until: Option<String>,
+    /// Trailing calendar days ending today in the selected timezone. Daily report only.
+    pub last_days: Option<NonZeroUsize>,
     /// IANA timezone name.
     pub timezone: String,
     /// Output locale hint.
@@ -246,16 +248,14 @@ pub enum ReportOutput {
 /// read, or an event timestamp is malformed.
 pub fn build_report(kind: ReportKind, options: &ReportOptions) -> Result<ReportOutput> {
     let timezone = parse_timezone(&options.timezone)?;
-    let since = options
-        .since
-        .as_deref()
-        .map(normalize_filter_date)
-        .transpose()?;
-    let until = options
-        .until
-        .as_deref()
-        .map(normalize_filter_date)
-        .transpose()?;
+    let (since, until) = resolve_report_date_filters(
+        kind,
+        options.last_days,
+        options.since.as_deref(),
+        options.until.as_deref(),
+        timezone,
+        Utc::now(),
+    )?;
     let session_dirs = resolve_session_dirs(&options.session_dirs);
     let pricing = load_pricing_catalog(&PricingLoadOptions {
         offline: options.offline,
@@ -276,10 +276,12 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let cli = Cli::parse_from(args);
-    let kind = cli.command.unwrap_or(Command::Daily).into();
+    let command = cli.command.unwrap_or_default();
+    let kind = ReportKind::from(&command);
     let options = ReportOptions {
         since: cli.since,
         until: cli.until,
+        last_days: cli.last_days,
         timezone: cli.timezone.unwrap_or_else(default_timezone_name),
         locale: cli.locale,
         number_format: cli.number_format,
@@ -320,6 +322,16 @@ struct Cli {
     /// Inclusive end date in YYYY-MM-DD or YYYYMMDD form.
     #[arg(long, short = 'u', global = true)]
     until: Option<String>,
+    /// Show the last N calendar days ending today in the selected timezone.
+    #[arg(
+        long,
+        short = 'L',
+        global = true,
+        value_name = "N",
+        value_parser = clap::value_parser!(NonZeroUsize),
+        conflicts_with_all = ["since", "until"]
+    )]
+    last_days: Option<NonZeroUsize>,
     /// IANA timezone used for grouping. Defaults to the system timezone.
     #[arg(long, short = 'z', global = true)]
     timezone: Option<String>,
@@ -347,9 +359,10 @@ struct Cli {
 }
 
 /// CLI subcommands.
-#[derive(Clone, Copy, Debug, Subcommand)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Subcommand)]
 enum Command {
     /// Group usage by day.
+    #[default]
     Daily,
     /// Group usage by month.
     Monthly,
@@ -357,8 +370,8 @@ enum Command {
     Session,
 }
 
-impl From<Command> for ReportKind {
-    fn from(value: Command) -> Self {
+impl From<&Command> for ReportKind {
+    fn from(value: &Command) -> Self {
         match value {
             Command::Daily => Self::Daily,
             Command::Monthly => Self::Monthly,
@@ -435,6 +448,41 @@ fn normalize_filter_date(value: &str) -> Result<NaiveDate> {
     }
     NaiveDate::parse_from_str(&compact, "%Y%m%d")
         .wrap_err_with(|| format!("failed to parse date {value}"))
+}
+
+/// Resolve the effective date filters for the requested report.
+fn resolve_report_date_filters(
+    kind: ReportKind,
+    last_days: Option<NonZeroUsize>,
+    since: Option<&str>,
+    until: Option<&str>,
+    timezone: Tz,
+    now_utc: DateTime<Utc>,
+) -> Result<(Option<NaiveDate>, Option<NaiveDate>)> {
+    if last_days.is_some() && kind != ReportKind::Daily {
+        return Err(eyre!("last_days is only supported for the daily report"));
+    }
+    if last_days.is_some() && (since.is_some() || until.is_some()) {
+        return Err(eyre!(
+            "last_days cannot be combined with explicit since/until filters"
+        ));
+    }
+
+    match last_days {
+        Some(last_days) => {
+            let until = now_utc.with_timezone(&timezone).date_naive();
+            let offset_days = u64::try_from(last_days.get() - 1)
+                .wrap_err("failed to convert last_days window width")?;
+            let since = until
+                .checked_sub_days(Days::new(offset_days))
+                .ok_or_else(|| eyre!("last_days window underflowed the supported date range"))?;
+            Ok((Some(since), Some(until)))
+        }
+        None => Ok((
+            since.map(normalize_filter_date).transpose()?,
+            until.map(normalize_filter_date).transpose()?,
+        )),
+    }
 }
 
 /// Resolve session directories from CLI options or environment defaults.
@@ -3092,6 +3140,7 @@ mod tests {
             &ReportOptions {
                 since: None,
                 until: None,
+                last_days: None,
                 timezone: "UTC".to_string(),
                 locale: "en-US".to_string(),
                 number_format: NumberFormat::Short,
@@ -3121,6 +3170,108 @@ mod tests {
         let cli = Cli::try_parse_from(["codexusage", "--threads", "1", "daily"]).expect("cli");
 
         assert_eq!(cli.threads, NonZeroUsize::new(1));
+    }
+
+    #[test]
+    fn cli_accepts_daily_last_days_flag() {
+        let cli = Cli::try_parse_from(["codexusage", "daily", "--last-days", "7"]).expect("cli");
+
+        assert_eq!(cli.command, Some(Command::Daily));
+        assert_eq!(cli.last_days, NonZeroUsize::new(7));
+    }
+
+    #[test]
+    fn cli_accepts_daily_last_days_short_flag() {
+        let cli = Cli::try_parse_from(["codexusage", "daily", "-L", "7"]).expect("cli");
+
+        assert_eq!(cli.command, Some(Command::Daily));
+        assert_eq!(cli.last_days, NonZeroUsize::new(7));
+    }
+
+    #[test]
+    fn cli_accepts_last_days_for_implicit_daily() {
+        let cli = Cli::try_parse_from(["codexusage", "--last-days", "7"]).expect("cli");
+
+        assert_eq!(cli.command, None);
+        assert_eq!(cli.last_days, NonZeroUsize::new(7));
+    }
+
+    #[test]
+    fn cli_rejects_zero_last_days() {
+        let error = Cli::try_parse_from(["codexusage", "daily", "--last-days", "0"])
+            .expect_err("zero last_days should fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("--last-days"));
+        assert!(rendered.contains('0'));
+    }
+
+    #[test]
+    fn effective_filters_reject_last_days_with_since() {
+        let timezone = "UTC".parse::<Tz>().expect("timezone");
+        let now_utc = DateTime::parse_from_rfc3339("2025-09-11T12:00:00+00:00")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let error = resolve_report_date_filters(
+            ReportKind::Daily,
+            Some(NonZeroUsize::new(7).expect("non-zero")),
+            Some("2025-09-10"),
+            None,
+            timezone,
+            now_utc,
+        )
+        .expect_err("conflicting date filters should fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("last_days"));
+        assert!(rendered.contains("since/until"));
+    }
+
+    #[test]
+    fn effective_filters_reject_last_days_with_until() {
+        let timezone = "UTC".parse::<Tz>().expect("timezone");
+        let now_utc = DateTime::parse_from_rfc3339("2025-09-11T12:00:00+00:00")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let error = resolve_report_date_filters(
+            ReportKind::Daily,
+            Some(NonZeroUsize::new(7).expect("non-zero")),
+            None,
+            Some("2025-09-12"),
+            timezone,
+            now_utc,
+        )
+        .expect_err("conflicting date filters should fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("last_days"));
+        assert!(rendered.contains("since/until"));
+    }
+
+    #[test]
+    fn effective_last_days_window_uses_selected_timezone_today() {
+        let now_utc = DateTime::parse_from_rfc3339("2025-09-11T22:30:00+00:00")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let timezone = "Europe/Warsaw".parse::<Tz>().expect("timezone");
+        let (since, until) = resolve_report_date_filters(
+            ReportKind::Daily,
+            Some(NonZeroUsize::new(2).expect("non-zero")),
+            None,
+            None,
+            timezone,
+            now_utc,
+        )
+        .expect("filters");
+
+        assert_eq!(
+            since,
+            Some(NaiveDate::from_ymd_opt(2025, 9, 11).expect("since"))
+        );
+        assert_eq!(
+            until,
+            Some(NaiveDate::from_ymd_opt(2025, 9, 12).expect("until"))
+        );
     }
 
     #[test]

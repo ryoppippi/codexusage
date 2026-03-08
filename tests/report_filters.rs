@@ -1,6 +1,7 @@
 use codexusage::app::{
     NumberFormat, ReportKind, ReportOptions, ReportOutput, ScannerParallelism, build_report,
 };
+use std::num::NonZeroUsize;
 use std::fs;
 use tempfile::TempDir;
 
@@ -16,6 +17,7 @@ fn options(session_dir: &std::path::Path) -> ReportOptions {
     ReportOptions {
         since: None,
         until: None,
+        last_days: None,
         timezone: "UTC".to_string(),
         locale: "en-US".to_string(),
         number_format: NumberFormat::Short,
@@ -112,4 +114,25 @@ fn timezone_conversion_happens_before_daily_grouping() {
         }
         other => panic!("unexpected report: {other:?}"),
     }
+}
+
+#[test]
+fn last_days_is_rejected_for_non_daily_reports() {
+    let temp = TempDir::new().expect("tempdir");
+    write_session(
+        &temp,
+        "sessions/project/session.jsonl",
+        concat!(
+            "{\"timestamp\":\"2025-09-11T22:30:00.000Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2025-09-11T22:31:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":400,\"cached_input_tokens\":0,\"output_tokens\":40,\"reasoning_output_tokens\":0,\"total_tokens\":440}}}}\n"
+        ),
+    );
+
+    let mut report_options = options(&temp.path().join("sessions"));
+    report_options.last_days = Some(NonZeroUsize::new(2).expect("non-zero"));
+    let error = build_report(ReportKind::Monthly, &report_options).expect_err("monthly should reject last_days");
+
+    let rendered = error.to_string();
+    assert!(rendered.contains("last_days"));
+    assert!(rendered.contains("daily"));
 }

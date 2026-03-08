@@ -9,6 +9,7 @@ fn base_options(session_dirs: Vec<std::path::PathBuf>) -> ReportOptions {
     ReportOptions {
         since: None,
         until: None,
+        last_days: None,
         timezone: "UTC".to_string(),
         locale: "en-US".to_string(),
         number_format: NumberFormat::Short,
