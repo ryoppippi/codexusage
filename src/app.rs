@@ -1585,6 +1585,9 @@ fn scan_session_file(file: &Path, session_id: &str, builder: &mut ReportBuilder)
         if trimmed.is_empty() {
             continue;
         }
+        if !line_might_affect_usage(trimmed) {
+            continue;
+        }
         if let Some(event) = parse_token_usage_line(
             trimmed,
             session_id,
@@ -1597,6 +1600,12 @@ fn scan_session_file(file: &Path, session_id: &str, builder: &mut ReportBuilder)
         }
     }
     Ok(())
+}
+
+/// Return whether one JSONL line might affect usage aggregation.
+fn line_might_affect_usage(line: &str) -> bool {
+    // Fail open for escaped JSON strings because relevant event types may be unicode-escaped.
+    line.contains("\\u") || line.contains("turn_context") || line.contains("token_count")
 }
 
 /// Derive the stable session identifier from a JSONL path.
@@ -2584,6 +2593,38 @@ mod tests {
         let error =
             scan_session_file(&session_file, "project/session", &mut builder).expect_err("error");
         assert!(error.to_string().contains("invalid timestamp"));
+    }
+
+    #[test]
+    fn line_might_affect_usage_accepts_relevant_markers() {
+        assert!(line_might_affect_usage(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#
+        ));
+        assert!(line_might_affect_usage(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count"}}"#
+        ));
+        assert!(line_might_affect_usage(
+            r#"{ "timestamp":"2026-01-01T00:00:00Z", "type":"event_msg", "payload":{"type":"token_count"} }"#
+        ));
+    }
+
+    #[test]
+    fn line_might_affect_usage_rejects_irrelevant_lines() {
+        assert!(!line_might_affect_usage(r#"{"type":"response_item"}"#));
+        assert!(!line_might_affect_usage(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"agent_reasoning"}}"#
+        ));
+        assert!(!line_might_affect_usage("not-json"));
+    }
+
+    #[test]
+    fn line_might_affect_usage_fails_open_for_escaped_json_strings() {
+        assert!(line_might_affect_usage(
+            r#"{"type":"turn\u005fcontext","payload":{"model":"gpt-5"}}"#
+        ));
+        assert!(line_might_affect_usage(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token\u005fcount"}}"#
+        ));
     }
 
     #[test]
