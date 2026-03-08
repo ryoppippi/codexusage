@@ -1,4 +1,4 @@
-use codexusage::app::{ReportKind, ReportOptions, ReportOutput, build_report};
+use codexusage::app::{NumberFormat, ReportKind, ReportOptions, ReportOutput, build_report};
 use codexusage::pricing::{CacheDecision, decide_cache_action};
 use std::fs;
 use std::time::{Duration, SystemTime};
@@ -18,6 +18,7 @@ fn base_options(session_dir: &std::path::Path) -> ReportOptions {
         until: None,
         timezone: "UTC".to_string(),
         locale: "en-US".to_string(),
+        number_format: NumberFormat::Short,
         json: true,
         offline: true,
         refresh_pricing: false,
@@ -117,6 +118,7 @@ fn duplicate_session_ids_across_roots_prefer_the_longer_file() {
             until: None,
             timezone: "UTC".to_string(),
             locale: "en-US".to_string(),
+            number_format: NumberFormat::Short,
             json: true,
             offline: true,
             refresh_pricing: false,
@@ -159,6 +161,7 @@ fn session_last_activity_uses_selected_timezone() {
             until: None,
             timezone: "Europe/Warsaw".to_string(),
             locale: "en-US".to_string(),
+            number_format: NumberFormat::Short,
             json: true,
             offline: true,
             refresh_pricing: false,
@@ -247,6 +250,7 @@ fn invalid_timezone_is_rejected() {
             until: None,
             timezone: "Europe/Warswa".to_string(),
             locale: "en-US".to_string(),
+            number_format: NumberFormat::Short,
             json: true,
             offline: true,
             refresh_pricing: false,

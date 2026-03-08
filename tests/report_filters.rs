@@ -1,4 +1,4 @@
-use codexusage::app::{ReportKind, ReportOptions, ReportOutput, build_report};
+use codexusage::app::{NumberFormat, ReportKind, ReportOptions, ReportOutput, build_report};
 use std::fs;
 use tempfile::TempDir;
 
@@ -16,6 +16,7 @@ fn options(session_dir: &std::path::Path) -> ReportOptions {
         until: None,
         timezone: "UTC".to_string(),
         locale: "en-US".to_string(),
+        number_format: NumberFormat::Short,
         json: true,
         offline: true,
         refresh_pricing: false,

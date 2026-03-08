@@ -1,4 +1,4 @@
-use codexusage::app::{ReportKind, ReportOptions, build_report};
+use codexusage::app::{NumberFormat, ReportKind, ReportOptions, build_report};
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::fs;
 use std::time::Duration;
@@ -28,6 +28,7 @@ fn parser_benchmark(criterion: &mut Criterion) {
         until: None,
         timezone: "UTC".to_string(),
         locale: "en-US".to_string(),
+        number_format: NumberFormat::Short,
         json: true,
         offline: true,
         refresh_pricing: false,

@@ -3,7 +3,7 @@
 use crate::pricing::{Pricing, PricingCatalog, PricingLoadOptions, load_pricing_catalog};
 use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, eyre};
 use serde::Serialize;
 use serde_json::Value;
@@ -34,6 +34,16 @@ pub enum ReportKind {
     Session,
 }
 
+/// Numeric table display mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum NumberFormat {
+    /// Shorten token counts using integer K/M/B/T suffixes.
+    #[default]
+    Short,
+    /// Show full token counts with separators.
+    Full,
+}
+
 /// CLI-free options passed into report generation.
 #[derive(Clone, Debug)]
 pub struct ReportOptions {
@@ -45,6 +55,8 @@ pub struct ReportOptions {
     pub timezone: String,
     /// Output locale hint.
     pub locale: String,
+    /// Human-readable number formatting mode.
+    pub number_format: NumberFormat,
     /// Emit JSON instead of table output.
     pub json: bool,
     /// Disable network pricing refreshes.
@@ -245,6 +257,7 @@ where
         until: cli.until,
         timezone: cli.timezone.unwrap_or_else(default_timezone_name),
         locale: cli.locale,
+        number_format: cli.number_format,
         json: cli.json,
         offline: cli.offline,
         refresh_pricing: cli.refresh_pricing,
@@ -254,7 +267,10 @@ where
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("{}", render_report(&output, &options.locale));
+        println!(
+            "{}",
+            render_report(&output, &options.locale, options.number_format)
+        );
     }
     Ok(())
 }
@@ -282,6 +298,9 @@ struct Cli {
     /// Locale hint reserved for display formatting.
     #[arg(long, short = 'l', default_value = "en-US", global = true)]
     locale: String,
+    /// Table number formatting mode.
+    #[arg(long, value_enum, default_value_t = NumberFormat::Short, global = true)]
+    number_format: NumberFormat,
     /// Disable network pricing refreshes.
     #[arg(long, short = 'O', global = true)]
     offline: bool,
@@ -861,11 +880,17 @@ fn split_session_id(session_id: &str) -> (String, String) {
 }
 
 /// Render a report as a text table.
-fn render_report(report: &ReportOutput, locale: &str) -> String {
+fn render_report(report: &ReportOutput, locale: &str, number_format: NumberFormat) -> String {
     let mut output = match report {
-        ReportOutput::Daily { rows, totals, .. } => render_daily_report(rows, totals, locale),
-        ReportOutput::Monthly { rows, totals, .. } => render_monthly_report(rows, totals, locale),
-        ReportOutput::Session { rows, totals, .. } => render_session_report(rows, totals, locale),
+        ReportOutput::Daily { rows, totals, .. } => {
+            render_daily_report(rows, totals, locale, number_format)
+        }
+        ReportOutput::Monthly { rows, totals, .. } => {
+            render_monthly_report(rows, totals, locale, number_format)
+        }
+        ReportOutput::Session { rows, totals, .. } => {
+            render_session_report(rows, totals, locale, number_format)
+        }
     };
 
     let missing_directories = match report {
@@ -896,13 +921,20 @@ fn render_report(report: &ReportOutput, locale: &str) -> String {
 }
 
 /// Render the daily report body.
-fn render_daily_report(rows: &[DailyRow], totals: &Totals, locale: &str) -> String {
-    let style = detect_table_style();
-    let borders = detect_border_style();
+fn render_daily_report(
+    rows: &[DailyRow],
+    totals: &Totals,
+    locale: &str,
+    number_format: NumberFormat,
+) -> String {
+    let render_config = TableRenderConfig {
+        style: detect_table_style(),
+        borders: detect_border_style(),
+        number_format,
+    };
     render_usage_table(
         "Daily",
-        style,
-        borders,
+        render_config,
         locale,
         &[
             "Date",
@@ -920,13 +952,20 @@ fn render_daily_report(rows: &[DailyRow], totals: &Totals, locale: &str) -> Stri
 }
 
 /// Render the monthly report body.
-fn render_monthly_report(rows: &[MonthlyRow], totals: &Totals, locale: &str) -> String {
-    let style = detect_table_style();
-    let borders = detect_border_style();
+fn render_monthly_report(
+    rows: &[MonthlyRow],
+    totals: &Totals,
+    locale: &str,
+    number_format: NumberFormat,
+) -> String {
+    let render_config = TableRenderConfig {
+        style: detect_table_style(),
+        borders: detect_border_style(),
+        number_format,
+    };
     render_usage_table(
         "Monthly",
-        style,
-        borders,
+        render_config,
         locale,
         &[
             "Month",
@@ -944,13 +983,20 @@ fn render_monthly_report(rows: &[MonthlyRow], totals: &Totals, locale: &str) -> 
 }
 
 /// Render the session report body.
-fn render_session_report(rows: &[SessionRow], totals: &Totals, locale: &str) -> String {
-    let style = detect_table_style();
-    let borders = detect_border_style();
+fn render_session_report(
+    rows: &[SessionRow],
+    totals: &Totals,
+    locale: &str,
+    number_format: NumberFormat,
+) -> String {
+    let render_config = TableRenderConfig {
+        style: detect_table_style(),
+        borders: detect_border_style(),
+        number_format,
+    };
     render_usage_table(
         "Session",
-        style,
-        borders,
+        render_config,
         locale,
         &[
             "Directory",
@@ -1007,6 +1053,17 @@ enum BorderStyle {
     Ascii,
     /// Unicode box-drawing borders.
     Unicode,
+}
+
+/// Rendering controls for the human-readable table.
+#[derive(Clone, Copy, Debug)]
+struct TableRenderConfig {
+    /// ANSI styling mode.
+    style: TableStyle,
+    /// Border glyph mode.
+    borders: BorderStyle,
+    /// Numeric display mode.
+    number_format: NumberFormat,
 }
 
 /// Detect the best table style for the current stdout stream.
@@ -1101,11 +1158,11 @@ fn daily_display_rows(rows: &[DailyRow]) -> Vec<DisplayRow> {
             cells: vec![
                 row.date.clone(),
                 "TOTAL".to_string(),
-                format_u64(row.input_tokens),
-                format_u64(row.cached_input_tokens),
-                format_u64(row.output_tokens),
-                format_u64(row.reasoning_output_tokens),
-                format_u64(row.total_tokens),
+                row.input_tokens.to_string(),
+                row.cached_input_tokens.to_string(),
+                row.output_tokens.to_string(),
+                row.reasoning_output_tokens.to_string(),
+                row.total_tokens.to_string(),
                 format_currency(row.cost_usd),
             ],
             kind: DisplayRowKind::Subtotal,
@@ -1129,11 +1186,11 @@ fn monthly_display_rows(rows: &[MonthlyRow]) -> Vec<DisplayRow> {
             cells: vec![
                 row.month.clone(),
                 "TOTAL".to_string(),
-                format_u64(row.input_tokens),
-                format_u64(row.cached_input_tokens),
-                format_u64(row.output_tokens),
-                format_u64(row.reasoning_output_tokens),
-                format_u64(row.total_tokens),
+                row.input_tokens.to_string(),
+                row.cached_input_tokens.to_string(),
+                row.output_tokens.to_string(),
+                row.reasoning_output_tokens.to_string(),
+                row.total_tokens.to_string(),
                 format_currency(row.cost_usd),
             ],
             kind: DisplayRowKind::Subtotal,
@@ -1162,11 +1219,11 @@ fn session_display_rows(rows: &[SessionRow]) -> Vec<DisplayRow> {
                 },
                 row.session_file.clone(),
                 "TOTAL".to_string(),
-                format_u64(row.input_tokens),
-                format_u64(row.cached_input_tokens),
-                format_u64(row.output_tokens),
-                format_u64(row.reasoning_output_tokens),
-                format_u64(row.total_tokens),
+                row.input_tokens.to_string(),
+                row.cached_input_tokens.to_string(),
+                row.output_tokens.to_string(),
+                row.reasoning_output_tokens.to_string(),
+                row.total_tokens.to_string(),
                 format_currency(row.cost_usd),
                 row.last_activity.clone(),
             ],
@@ -1219,11 +1276,11 @@ fn model_display_row(
     let mut cells = vec![String::new(); columns_before_model];
     cells.push(format!("  {model_label}"));
     cells.extend_from_slice(&[
-        format_u64(usage.input),
-        format_u64(usage.cached_input),
-        format_u64(usage.output),
-        format_u64(usage.reasoning_output),
-        format_u64(usage.total),
+        usage.input.to_string(),
+        usage.cached_input.to_string(),
+        usage.output.to_string(),
+        usage.reasoning_output.to_string(),
+        usage.total.to_string(),
         format_currency(cost_usd),
     ]);
     if include_last_activity_column {
@@ -1260,8 +1317,7 @@ fn explicit_usage(breakdown: &ModelBreakdown) -> UsageTotals {
 /// Render a rectangular table with grouped rows and a totals row.
 fn render_usage_table(
     title: &str,
-    style: TableStyle,
-    borders: BorderStyle,
+    render_config: TableRenderConfig,
     _locale: &str,
     headers: &[&str],
     rows: Vec<DisplayRow>,
@@ -1269,27 +1325,35 @@ fn render_usage_table(
 ) -> String {
     let mut all_rows = rows;
     let grand_total_row = grand_total_row(headers, totals);
-    let widths = column_widths(headers, &all_rows, &grand_total_row);
+    let widths = column_widths(
+        headers,
+        &all_rows,
+        &grand_total_row,
+        render_config.number_format,
+    );
     all_rows.push(grand_total_row);
 
     let mut output = String::new();
-    write_table_title(&mut output, style, title);
+    write_table_title(&mut output, render_config.style, title);
     let _ = writeln!(&mut output);
-    write_table_header(&mut output, style, borders, headers, &widths);
+    write_table_header(&mut output, render_config, headers, &widths);
     for row in all_rows {
         if row.kind == DisplayRowKind::Spacer {
             write_table_rule(
                 &mut output,
-                style,
+                render_config.style,
                 table_rule_element(TableRuleKind::GroupSeparator),
-                &table_rule(TableRuleKind::GroupSeparator, borders, &widths),
+                &table_rule(
+                    TableRuleKind::GroupSeparator,
+                    render_config.borders,
+                    &widths,
+                ),
             );
             continue;
         }
         write_table_row(
             &mut output,
-            style,
-            borders,
+            render_config,
             headers,
             &widths,
             &row.cells,
@@ -1298,9 +1362,9 @@ fn render_usage_table(
     }
     write_table_rule(
         &mut output,
-        style,
+        render_config.style,
         table_rule_element(TableRuleKind::Bottom),
-        &table_rule(TableRuleKind::Bottom, borders, &widths),
+        &table_rule(TableRuleKind::Bottom, render_config.borders, &widths),
     );
     output
 }
@@ -1312,11 +1376,11 @@ fn grand_total_row(headers: &[&str], totals: &Totals) -> DisplayRow {
             String::new(),
             String::new(),
             "GRAND TOTAL".to_string(),
-            format_u64(totals.input_tokens),
-            format_u64(totals.cached_input_tokens),
-            format_u64(totals.output_tokens),
-            format_u64(totals.reasoning_output_tokens),
-            format_u64(totals.total_tokens),
+            totals.input_tokens.to_string(),
+            totals.cached_input_tokens.to_string(),
+            totals.output_tokens.to_string(),
+            totals.reasoning_output_tokens.to_string(),
+            totals.total_tokens.to_string(),
             format_currency(totals.cost_usd),
             String::new(),
         ]
@@ -1324,11 +1388,11 @@ fn grand_total_row(headers: &[&str], totals: &Totals) -> DisplayRow {
         vec![
             String::new(),
             "GRAND TOTAL".to_string(),
-            format_u64(totals.input_tokens),
-            format_u64(totals.cached_input_tokens),
-            format_u64(totals.output_tokens),
-            format_u64(totals.reasoning_output_tokens),
-            format_u64(totals.total_tokens),
+            totals.input_tokens.to_string(),
+            totals.cached_input_tokens.to_string(),
+            totals.output_tokens.to_string(),
+            totals.reasoning_output_tokens.to_string(),
+            totals.total_tokens.to_string(),
             format_currency(totals.cost_usd),
         ]
     };
@@ -1344,6 +1408,7 @@ fn column_widths(
     headers: &[&str],
     rows: &[DisplayRow],
     grand_total_row: &DisplayRow,
+    number_format: NumberFormat,
 ) -> Vec<usize> {
     let mut widths = headers
         .iter()
@@ -1351,7 +1416,8 @@ fn column_widths(
         .collect::<Vec<_>>();
     for row in rows.iter().chain(std::iter::once(grand_total_row)) {
         for (index, cell) in row.cells.iter().enumerate() {
-            widths[index] = widths[index].max(cell.len());
+            widths[index] =
+                widths[index].max(format_table_cell(headers, index, cell, number_format).len());
         }
     }
     widths
@@ -1373,16 +1439,15 @@ fn write_table_title(output: &mut String, style: TableStyle, title: &str) {
 /// Write the table header and separator.
 fn write_table_header(
     output: &mut String,
-    style: TableStyle,
-    borders: BorderStyle,
+    render_config: TableRenderConfig,
     headers: &[&str],
     widths: &[usize],
 ) {
     write_table_rule(
         output,
-        style,
+        render_config.style,
         table_rule_element(TableRuleKind::Top),
-        &table_rule(TableRuleKind::Top, borders, widths),
+        &table_rule(TableRuleKind::Top, render_config.borders, widths),
     );
     let header_cells = headers
         .iter()
@@ -1390,8 +1455,7 @@ fn write_table_header(
         .collect::<Vec<_>>();
     write_table_row(
         output,
-        style,
-        borders,
+        render_config,
         headers,
         widths,
         &header_cells,
@@ -1399,9 +1463,13 @@ fn write_table_header(
     );
     write_table_rule(
         output,
-        style,
+        render_config.style,
         table_rule_element(TableRuleKind::HeaderSeparator),
-        &table_rule(TableRuleKind::HeaderSeparator, borders, widths),
+        &table_rule(
+            TableRuleKind::HeaderSeparator,
+            render_config.borders,
+            widths,
+        ),
     );
 }
 
@@ -1414,26 +1482,34 @@ fn format_data_row(
     cells: &[String],
 ) -> String {
     let theme = border_theme(borders);
-    let body = format_aligned_cells(headers, widths, cells).join(&theme.vertical.to_string());
+    let body = format_aligned_cells(headers, widths, cells, NumberFormat::Full)
+        .join(&theme.vertical.to_string());
     format!("{}{}{}", theme.vertical, body, theme.vertical)
 }
 
 /// Render one row with border segments styled independently from the cell text.
 fn write_table_row(
     output: &mut String,
-    style: TableStyle,
-    borders: BorderStyle,
+    render_config: TableRenderConfig,
     headers: &[&str],
     widths: &[usize],
     cells: &[String],
     cell_element: TableElement,
 ) {
-    let theme = border_theme(borders);
-    let border = paint(style, TableElement::Border, &theme.vertical.to_string());
-    let separator = paint(style, TableElement::Border, &theme.vertical.to_string());
-    let styled_cells = format_aligned_cells(headers, widths, cells)
+    let theme = border_theme(render_config.borders);
+    let border = paint(
+        render_config.style,
+        TableElement::Border,
+        &theme.vertical.to_string(),
+    );
+    let separator = paint(
+        render_config.style,
+        TableElement::Border,
+        &theme.vertical.to_string(),
+    );
+    let styled_cells = format_aligned_cells(headers, widths, cells, render_config.number_format)
         .into_iter()
-        .map(|cell| paint(style, cell_element, &cell))
+        .map(|cell| paint(render_config.style, cell_element, &cell))
         .collect::<Vec<_>>();
     let _ = writeln!(
         output,
@@ -1445,24 +1521,52 @@ fn write_table_row(
 }
 
 /// Align row cells before borders or colors are applied.
-fn format_aligned_cells(headers: &[&str], widths: &[usize], cells: &[String]) -> Vec<String> {
+fn format_aligned_cells(
+    headers: &[&str],
+    widths: &[usize],
+    cells: &[String],
+    number_format: NumberFormat,
+) -> Vec<String> {
     cells
         .iter()
         .enumerate()
         .map(|(index, cell)| {
+            let display = format_table_cell(headers, index, cell, number_format);
             let formatted = if index <= text_column_limit(headers)
                 || headers[index] == "Directory"
                 || headers[index] == "Session"
                 || headers[index] == "Model"
                 || headers[index] == "Last Activity"
             {
-                format!("{cell:width$}", width = widths[index])
+                format!("{display:width$}", width = widths[index])
             } else {
-                format!("{cell:>width$}", width = widths[index])
+                format!("{display:>width$}", width = widths[index])
             };
             format!(" {formatted} ")
         })
         .collect()
+}
+
+/// Format one table cell according to its column semantics.
+fn format_table_cell(
+    headers: &[&str],
+    index: usize,
+    cell: &str,
+    number_format: NumberFormat,
+) -> String {
+    if is_token_column(headers[index]) {
+        cell.parse::<u64>().map_or_else(
+            |_| cell.to_string(),
+            |value| format_u64_with(value, number_format),
+        )
+    } else {
+        cell.to_string()
+    }
+}
+
+/// Return whether the table column contains token counts.
+fn is_token_column(header: &str) -> bool {
+    matches!(header, "Input" | "Cache" | "Output" | "Reasoning" | "Total")
 }
 
 /// One row-rule kind for the table frame.
@@ -1638,6 +1742,76 @@ fn format_u64(value: u64) -> String {
         output.push(*character);
     }
     output.chars().rev().collect()
+}
+
+/// Format an integer according to the selected display mode.
+fn format_u64_with(value: u64, number_format: NumberFormat) -> String {
+    match number_format {
+        NumberFormat::Full => format_u64(value),
+        NumberFormat::Short => format_u64_short(value),
+    }
+}
+
+/// Format an integer using 3 significant digits and K/M/B/T suffixes.
+fn format_u64_short(value: u64) -> String {
+    const UNITS: [(u64, &str); 4] = [
+        (1_000, "K"),
+        (1_000_000, "M"),
+        (1_000_000_000, "B"),
+        (1_000_000_000_000, "T"),
+    ];
+
+    if value < UNITS[0].0 {
+        return value.to_string();
+    }
+
+    let mut unit_index = UNITS
+        .iter()
+        .enumerate()
+        .rfind(|(_index, (divisor, _suffix))| value >= *divisor)
+        .map_or(0, |(index, _unit)| index);
+
+    loop {
+        let (divisor, suffix) = UNITS[unit_index];
+        let whole = value / divisor;
+        let decimals: u32 = if whole >= 100 {
+            0
+        } else if whole >= 10 {
+            1
+        } else {
+            2
+        };
+        let multiplier = 10_u128.pow(decimals);
+        let rounded_units =
+            ((u128::from(value) * multiplier) + (u128::from(divisor) / 2)) / u128::from(divisor);
+
+        if rounded_units >= 1_000 * multiplier && unit_index + 1 < UNITS.len() {
+            unit_index += 1;
+            continue;
+        }
+
+        return format_short_with_suffix(rounded_units, decimals, suffix);
+    }
+}
+
+/// Format a rounded abbreviated value and trim redundant trailing zeros.
+fn format_short_with_suffix(value: u128, decimals: u32, suffix: &str) -> String {
+    if decimals == 0 {
+        return format!("{value}{suffix}");
+    }
+
+    let divisor = 10_u128.pow(decimals);
+    let integer = value / divisor;
+    let fractional = value % divisor;
+    let fractional_width = usize::try_from(decimals).expect("decimal width fits usize");
+    let mut number = format!("{integer}.{fractional:0fractional_width$}");
+    while number.ends_with('0') {
+        number.pop();
+    }
+    if number.ends_with('.') {
+        number.pop();
+    }
+    format!("{number}{suffix}")
 }
 
 /// Format USD with two decimal places.
@@ -2138,6 +2312,26 @@ mod tests {
     }
 
     #[test]
+    fn short_number_format_uses_three_significant_digits() {
+        assert_eq!(format_u64_with(999, NumberFormat::Short), "999");
+        assert_eq!(format_u64_with(1_000, NumberFormat::Short), "1K");
+        assert_eq!(format_u64_with(1_234, NumberFormat::Short), "1.23K");
+        assert_eq!(format_u64_with(12_345, NumberFormat::Short), "12.3K");
+        assert_eq!(format_u64_with(123_456, NumberFormat::Short), "123K");
+        assert_eq!(format_u64_with(1_234_567, NumberFormat::Short), "1.23M");
+        assert_eq!(format_u64_with(12_345_678, NumberFormat::Short), "12.3M");
+        assert_eq!(format_u64_with(123_456_789, NumberFormat::Short), "123M");
+        assert_eq!(format_u64_with(1_000_000_000, NumberFormat::Short), "1B");
+        assert_eq!(format_u64_with(1_200_000_000, NumberFormat::Short), "1.2B");
+        assert_eq!(format_u64_with(1_000_000_000_000, NumberFormat::Short), "1T");
+    }
+
+    #[test]
+    fn full_number_format_preserves_grouped_digits() {
+        assert_eq!(format_u64_with(1_234_567, NumberFormat::Full), "1,234,567");
+    }
+
+    #[test]
     fn calculate_cost_applies_cached_input_pricing() {
         let usage = ModelBreakdown {
             input_tokens: 1_000,
@@ -2248,8 +2442,8 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let daily_render = render_report(&daily, "en-US");
-        let session_render = render_report(&session, "en-US");
+        let daily_render = render_report(&daily, "en-US", NumberFormat::Short);
+        let session_render = render_report(&session, "en-US", NumberFormat::Short);
         assert!(daily_render.contains("TOTAL"));
         assert!(daily_render.contains("2025-09-11"));
         assert!(daily_render.contains("Model"));
@@ -2283,7 +2477,7 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let rendered = render_report(&monthly, "en-US");
+        let rendered = render_report(&monthly, "en-US", NumberFormat::Short);
         assert!(rendered.contains("Monthly Codex Usage Report"));
         assert!(rendered.contains("2025-09"));
     }
@@ -2339,7 +2533,7 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let rendered = render_report(&daily, "en-US");
+        let rendered = render_report(&daily, "en-US", NumberFormat::Short);
         let subtotal = rendered
             .lines()
             .find(|line| line.contains("2025-09-11") && line.contains("TOTAL"))
@@ -2398,7 +2592,7 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let rendered = render_report(&session, "en-US");
+        let rendered = render_report(&session, "en-US", NumberFormat::Short);
         let subtotal = rendered
             .lines()
             .find(|line| line.contains("session") && line.contains("TOTAL"))
@@ -2455,7 +2649,7 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let rendered = render_report(&report, "en-US");
+        let rendered = render_report(&report, "en-US", NumberFormat::Short);
         let explicit_row = rendered
             .lines()
             .find(|line| line.contains("  gpt-5") && !line.contains("(fallback)"))
@@ -2570,8 +2764,11 @@ mod tests {
 
         write_table_row(
             &mut output,
-            TableStyle::Ansi256,
-            BorderStyle::Unicode,
+            TableRenderConfig {
+                style: TableStyle::Ansi256,
+                borders: BorderStyle::Unicode,
+                number_format: NumberFormat::Short,
+            },
             &headers,
             &widths,
             &cells,
@@ -2591,10 +2788,81 @@ mod tests {
             missing_directories: vec!["/tmp/missing-a".to_string(), "/tmp/missing-b".to_string()],
         };
 
-        let rendered = render_report(&daily, "en-US");
+        let rendered = render_report(&daily, "en-US", NumberFormat::Short);
         assert!(rendered.contains("Warning: missing session directories"));
         assert!(rendered.contains("/tmp/missing-a"));
         assert!(rendered.contains("/tmp/missing-b"));
+    }
+
+    #[test]
+    fn render_report_shortens_token_columns_but_not_cost_by_default() {
+        let daily = ReportOutput::Daily {
+            rows: vec![DailyRow {
+                date: "2025-09-11".to_string(),
+                input_tokens: 100_000,
+                cached_input_tokens: 10,
+                output_tokens: 50,
+                reasoning_output_tokens: 0,
+                total_tokens: 100_050,
+                cost_usd: 1234.5,
+                models: BTreeMap::new(),
+            }],
+            totals: Totals {
+                input_tokens: 100_000,
+                cached_input_tokens: 10,
+                output_tokens: 50,
+                reasoning_output_tokens: 0,
+                total_tokens: 100_050,
+                cost_usd: 1234.5,
+            },
+            missing_directories: Vec::new(),
+        };
+
+        let short = render_report(&daily, "en-US", NumberFormat::Short);
+        let full = render_report(&daily, "en-US", NumberFormat::Full);
+
+        assert!(short.contains("100K"));
+        assert!(short.contains("$1234.50"));
+        assert!(full.contains("100,000"));
+        assert!(!full.contains("100K"));
+    }
+
+    #[test]
+    fn full_number_format_keeps_table_frame_aligned_for_grouped_digits() {
+        let daily = ReportOutput::Daily {
+            rows: vec![DailyRow {
+                date: "2025-09-11".to_string(),
+                input_tokens: 1_000,
+                cached_input_tokens: 2_000,
+                output_tokens: 3_000,
+                reasoning_output_tokens: 4_000,
+                total_tokens: 5_000,
+                cost_usd: 12.5,
+                models: BTreeMap::new(),
+            }],
+            totals: Totals {
+                input_tokens: 1_000,
+                cached_input_tokens: 2_000,
+                output_tokens: 3_000,
+                reasoning_output_tokens: 4_000,
+                total_tokens: 5_000,
+                cost_usd: 12.5,
+            },
+            missing_directories: Vec::new(),
+        };
+
+        let rendered = render_report(&daily, "en-US", NumberFormat::Full);
+        let lines = rendered.lines().collect::<Vec<_>>();
+        let top = lines
+            .iter()
+            .find(|line| line.starts_with('+') || line.starts_with('┌'))
+            .expect("top border");
+        let subtotal = lines
+            .iter()
+            .find(|line| line.contains("2025-09-11") && line.contains("1,000"))
+            .expect("subtotal row");
+
+        assert_eq!(top.chars().count(), subtotal.chars().count());
     }
 
     #[test]
@@ -2696,6 +2964,7 @@ mod tests {
                 until: None,
                 timezone: "UTC".to_string(),
                 locale: "en-US".to_string(),
+                number_format: NumberFormat::Short,
                 json: true,
                 offline: true,
                 refresh_pricing: false,
