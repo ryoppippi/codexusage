@@ -12,7 +12,9 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::SystemTime;
 
 /// Human-readable table rendering helpers.
@@ -56,6 +58,15 @@ pub enum NumberFormat {
     Full,
 }
 
+/// Scanner worker configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScannerParallelism {
+    /// Use the host's available parallelism.
+    Auto,
+    /// Use an explicit worker count.
+    Fixed(NonZeroUsize),
+}
+
 /// CLI-free options passed into report generation.
 #[derive(Clone, Debug)]
 pub struct ReportOptions {
@@ -77,6 +88,8 @@ pub struct ReportOptions {
     pub refresh_pricing: bool,
     /// Session directories to scan.
     pub session_dirs: Vec<PathBuf>,
+    /// Scanner worker configuration.
+    pub parallelism: ScannerParallelism,
 }
 
 /// Aggregated token usage for a single model.
@@ -249,7 +262,7 @@ pub fn build_report(kind: ReportKind, options: &ReportOptions) -> Result<ReportO
         force_refresh: options.refresh_pricing,
     })?;
     let mut builder = ReportBuilder::new(kind, timezone, since, until);
-    let missing_directories = scan_session_dirs(&session_dirs, &mut builder)?;
+    let missing_directories = scan_session_dirs(&session_dirs, options.parallelism, &mut builder)?;
     builder.finish(&pricing, missing_directories)
 }
 
@@ -274,6 +287,9 @@ where
         offline: cli.offline,
         refresh_pricing: cli.refresh_pricing,
         session_dirs: cli.session_dir,
+        parallelism: cli
+            .threads
+            .map_or(ScannerParallelism::Auto, ScannerParallelism::Fixed),
     };
     let output = build_report(kind, &options)?;
     if cli.json {
@@ -322,6 +338,9 @@ struct Cli {
     /// Override the session directory. May be repeated.
     #[arg(long, global = true)]
     session_dir: Vec<PathBuf>,
+    /// Scanner worker count. Use `1` for single-threaded profiling runs.
+    #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(NonZeroUsize))]
+    threads: Option<NonZeroUsize>,
     /// Report to execute.
     #[command(subcommand)]
     command: Option<Command>,
@@ -1365,6 +1384,30 @@ impl ReportBuilder {
             }
         }
     }
+
+    /// Merge another builder with matching report settings into this one.
+    fn merge(&mut self, other: Self) {
+        debug_assert_eq!(
+            self.kind, other.kind,
+            "parallel scan chunks must preserve report kind",
+        );
+        debug_assert_eq!(
+            self.timezone, other.timezone,
+            "parallel scan chunks must preserve report timezone",
+        );
+        debug_assert_eq!(
+            self.since, other.since,
+            "parallel scan chunks must preserve lower date bound",
+        );
+        debug_assert_eq!(
+            self.until, other.until,
+            "parallel scan chunks must preserve upper date bound",
+        );
+
+        merge_group_summaries(&mut self.daily, other.daily);
+        merge_group_summaries(&mut self.monthly, other.monthly);
+        merge_session_summaries(&mut self.session, other.session);
+    }
 }
 
 /// Sort session entries deterministically for stable CLI output.
@@ -1485,7 +1528,28 @@ fn split_session_id(session_id: &str) -> (String, String) {
 /// Duplicate relative session identifiers across roots intentionally collapse to one selected
 /// file. The user-defined contract is that the session identifier itself is globally unique, and
 /// a longer duplicate file represents a newer version of the same session.
-fn scan_session_dirs(session_dirs: &[PathBuf], builder: &mut ReportBuilder) -> Result<Vec<String>> {
+fn scan_session_dirs(
+    session_dirs: &[PathBuf],
+    parallelism: ScannerParallelism,
+    builder: &mut ReportBuilder,
+) -> Result<Vec<String>> {
+    let (missing_directories, selected_files) = collect_session_scan_targets(session_dirs)?;
+    let scanned = scan_selected_session_targets(
+        &selected_files,
+        parallelism,
+        builder.kind,
+        builder.timezone,
+        builder.since,
+        builder.until,
+    )?;
+    builder.merge(scanned);
+    Ok(missing_directories)
+}
+
+/// Discover selected session files and collect missing roots.
+fn collect_session_scan_targets(
+    session_dirs: &[PathBuf],
+) -> Result<(Vec<String>, Vec<SessionScanTarget>)> {
     let mut missing_directories = Vec::new();
     let mut selected_files = HashMap::new();
     for directory in session_dirs {
@@ -1506,13 +1570,86 @@ fn scan_session_dirs(session_dirs: &[PathBuf], builder: &mut ReportBuilder) -> R
     }
     let mut session_ids = selected_files.keys().cloned().collect::<Vec<_>>();
     session_ids.sort_unstable();
-    for session_id in session_ids {
-        let target = selected_files
-            .remove(&session_id)
-            .ok_or_else(|| eyre!("missing session target for key {session_id}"))?;
-        scan_session_file(&target.path, &target.session_id, builder)?;
+    let targets = session_ids
+        .into_iter()
+        .map(|session_id| {
+            selected_files
+                .remove(&session_id)
+                .ok_or_else(|| eyre!("missing session target for key {session_id}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((missing_directories, targets))
+}
+
+/// Scan all selected targets, optionally across multiple worker threads.
+fn scan_selected_session_targets(
+    selected_files: &[SessionScanTarget],
+    parallelism: ScannerParallelism,
+    kind: ReportKind,
+    timezone: Tz,
+    since: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+) -> Result<ReportBuilder> {
+    if selected_files.is_empty() {
+        return Ok(ReportBuilder::new(kind, timezone, since, until));
     }
-    Ok(missing_directories)
+
+    let worker_count = resolve_scan_worker_count(parallelism, selected_files.len());
+    if worker_count == 1 {
+        return scan_selected_session_chunk(selected_files, kind, timezone, since, until);
+    }
+
+    let chunk_size = selected_files.len().div_ceil(worker_count);
+    thread::scope(|scope| -> Result<ReportBuilder> {
+        let mut chunks = selected_files.chunks(chunk_size);
+        let first_chunk = chunks
+            .next()
+            .ok_or_else(|| eyre!("missing initial scan chunk"))?;
+        let handles = chunks
+            .map(|chunk| {
+                scope
+                    .spawn(move || scan_selected_session_chunk(chunk, kind, timezone, since, until))
+            })
+            .collect::<Vec<_>>();
+
+        let mut merged = scan_selected_session_chunk(first_chunk, kind, timezone, since, until)?;
+        for handle in handles {
+            let partial = handle
+                .join()
+                .map_err(|_| eyre!("session scan worker panicked"))??;
+            merged.merge(partial);
+        }
+        Ok(merged)
+    })
+}
+
+/// Scan one worker chunk of selected session files.
+fn scan_selected_session_chunk(
+    selected_files: &[SessionScanTarget],
+    kind: ReportKind,
+    timezone: Tz,
+    since: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+) -> Result<ReportBuilder> {
+    let mut builder = ReportBuilder::new(kind, timezone, since, until);
+    for target in selected_files {
+        scan_session_file(&target.path, &target.session_id, &mut builder)?;
+    }
+    Ok(builder)
+}
+
+/// Resolve the effective worker count for the current workload.
+fn resolve_scan_worker_count(parallelism: ScannerParallelism, selected_files: usize) -> usize {
+    if selected_files <= 1 {
+        return selected_files.max(1);
+    }
+
+    let configured = match parallelism {
+        ScannerParallelism::Auto => thread::available_parallelism().map_or(1, NonZeroUsize::get),
+        ScannerParallelism::Fixed(threads) => threads.get(),
+    };
+
+    configured.clamp(1, selected_files)
 }
 
 /// Discover the best session file for each session identifier.
@@ -1565,6 +1702,59 @@ fn register_session_target(
         selected_files.insert(session_id, candidate);
     }
     Ok(())
+}
+
+/// Merge grouped report summaries by key.
+fn merge_group_summaries(
+    target: &mut HashMap<String, GroupSummary>,
+    source: HashMap<String, GroupSummary>,
+) {
+    for (key, source_summary) in source {
+        let summary = target.entry(key).or_default();
+        merge_group_summary(summary, source_summary);
+    }
+}
+
+/// Merge one grouped summary into another.
+fn merge_group_summary(target: &mut GroupSummary, source: GroupSummary) {
+    target.totals.add(&source.totals);
+    merge_model_breakdowns(&mut target.models, source.models);
+}
+
+/// Merge session summaries by stable session key.
+fn merge_session_summaries(
+    target: &mut HashMap<String, SessionSummary>,
+    source: HashMap<String, SessionSummary>,
+) {
+    for (session_key, source_summary) in source {
+        if let Some(existing) = target.get_mut(&session_key) {
+            existing.totals.add(&source_summary.totals);
+            existing.last_activity = existing.last_activity.max(source_summary.last_activity);
+            merge_model_breakdowns(&mut existing.models, source_summary.models);
+            continue;
+        }
+
+        target.insert(session_key, source_summary);
+    }
+}
+
+/// Merge per-model usage without allocating intermediate report rows.
+fn merge_model_breakdowns(
+    target: &mut HashMap<String, ModelBreakdown>,
+    source: HashMap<String, ModelBreakdown>,
+) {
+    for (model, source_breakdown) in source {
+        let breakdown = target.entry(model).or_default();
+        breakdown.input_tokens += source_breakdown.input_tokens;
+        breakdown.cached_input_tokens += source_breakdown.cached_input_tokens;
+        breakdown.output_tokens += source_breakdown.output_tokens;
+        breakdown.reasoning_output_tokens += source_breakdown.reasoning_output_tokens;
+        breakdown.total_tokens += source_breakdown.total_tokens;
+        breakdown
+            .fallback_usage
+            .add(&source_breakdown.fallback_usage);
+        breakdown.is_fallback |= source_breakdown.is_fallback;
+    }
 }
 
 /// Scan one JSONL session file.
@@ -2909,6 +3099,7 @@ mod tests {
                 offline: true,
                 refresh_pricing: false,
                 session_dirs: vec![first_sessions, second_sessions],
+                parallelism: ScannerParallelism::Auto,
             },
         )
         .expect("report");
@@ -2923,5 +3114,33 @@ mod tests {
             }
             other => panic!("unexpected report: {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_accepts_threads_flag() {
+        let cli = Cli::try_parse_from(["codexusage", "--threads", "1", "daily"]).expect("cli");
+
+        assert_eq!(cli.threads, NonZeroUsize::new(1));
+    }
+
+    #[test]
+    fn cli_rejects_zero_threads() {
+        let error = Cli::try_parse_from(["codexusage", "--threads", "0", "daily"])
+            .expect_err("zero threads should fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("--threads"));
+        assert!(rendered.contains('0'));
+    }
+
+    #[test]
+    fn resolve_scan_worker_count_caps_explicit_threads_to_workload() {
+        assert_eq!(
+            resolve_scan_worker_count(
+                ScannerParallelism::Fixed(NonZeroUsize::new(4).expect("non-zero")),
+                2,
+            ),
+            2
+        );
     }
 }

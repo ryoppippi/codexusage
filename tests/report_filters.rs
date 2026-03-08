@@ -1,4 +1,6 @@
-use codexusage::app::{NumberFormat, ReportKind, ReportOptions, ReportOutput, build_report};
+use codexusage::app::{
+    NumberFormat, ReportKind, ReportOptions, ReportOutput, ScannerParallelism, build_report,
+};
 use std::fs;
 use tempfile::TempDir;
 
@@ -21,6 +23,7 @@ fn options(session_dir: &std::path::Path) -> ReportOptions {
         offline: true,
         refresh_pricing: false,
         session_dirs: vec![session_dir.to_path_buf()],
+        parallelism: ScannerParallelism::Auto,
     }
 }
 

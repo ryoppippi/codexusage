@@ -1,4 +1,4 @@
-use codexusage::app::{NumberFormat, ReportKind, ReportOptions, build_report};
+use codexusage::app::{NumberFormat, ReportKind, ReportOptions, ScannerParallelism, build_report};
 use criterion::{Criterion, criterion_group, criterion_main};
 use serde_json::json;
 use std::fs;
@@ -16,6 +16,7 @@ fn base_options(session_dirs: Vec<std::path::PathBuf>) -> ReportOptions {
         offline: true,
         refresh_pricing: false,
         session_dirs,
+        parallelism: ScannerParallelism::Auto,
     }
 }
 
@@ -144,11 +145,86 @@ fn duplicate_root_selection_benchmark(criterion: &mut Criterion) {
     );
 }
 
+fn mixed_workload_benchmark(criterion: &mut Criterion) {
+    let fixture = TempDir::new().expect("tempdir");
+    let sessions_dir = fixture.path().join("sessions");
+    let irrelevant_noise = (0..900)
+        .map(|index| {
+            json!({
+                "timestamp": event_timestamp(index),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "text": format!("noise-{index}"),
+                    "details": {
+                        "status": "ok",
+                        "sequence": index
+                    }
+                }
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    let relevant_usage = (0..350)
+        .map(|index| {
+            json!({
+                "timestamp": event_timestamp(index),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 1_000 + index,
+                            "cached_input_tokens": 100,
+                            "output_tokens": 400,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 1_400 + index
+                        }
+                    }
+                }
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    let escaped_turn_contexts = (0..150)
+        .map(|_| {
+            r#"{"type":"turn\u005fcontext","payload":{"metadata":{"model":"gpt\u002d5"}}}"#
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let fixture_contents = std::iter::once(
+        r#"{"timestamp":"2025-09-11T18:00:00.000Z","type":"turn_context","payload":{"model":"gpt-5"}}"#
+            .to_string(),
+    )
+    .chain(irrelevant_noise)
+    .chain(relevant_usage)
+    .chain(escaped_turn_contexts)
+    .collect::<Vec<_>>()
+    .join("\n");
+    write_session_file(
+        &sessions_dir,
+        "project/session.jsonl",
+        &format!("{fixture_contents}\n"),
+    );
+
+    let options = base_options(vec![sessions_dir]);
+    criterion.bench_function("daily_report_scan_mixed_workload_1401_lines", |bench| {
+        bench.iter(|| {
+            let report = build_report(ReportKind::Daily, &options).expect("build report");
+            std::hint::black_box(report);
+        });
+    });
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .sample_size(50)
         .measurement_time(Duration::from_secs(10));
-    targets = parser_benchmark, cumulative_usage_benchmark, duplicate_root_selection_benchmark
+    targets =
+        parser_benchmark,
+        cumulative_usage_benchmark,
+        duplicate_root_selection_benchmark,
+        mixed_workload_benchmark
 }
 criterion_main!(benches);

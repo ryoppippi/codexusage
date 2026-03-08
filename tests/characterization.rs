@@ -1,6 +1,10 @@
-use codexusage::app::{NumberFormat, ReportKind, ReportOptions, ReportOutput, build_report};
+use codexusage::app::{
+    NumberFormat, ReportKind, ReportOptions, ReportOutput, ScannerParallelism, build_report,
+};
 use codexusage::pricing::{CacheDecision, decide_cache_action};
+use serde_json::json;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
@@ -23,6 +27,7 @@ fn base_options(session_dir: &std::path::Path) -> ReportOptions {
         offline: true,
         refresh_pricing: false,
         session_dirs: vec![session_dir.to_path_buf()],
+        parallelism: ScannerParallelism::Auto,
     }
 }
 
@@ -126,6 +131,7 @@ fn duplicate_session_ids_across_roots_prefer_the_longer_file() {
                 first.path().join("sessions"),
                 second.path().join("sessions"),
             ],
+            parallelism: ScannerParallelism::Auto,
         },
     )
     .expect("build report");
@@ -166,6 +172,7 @@ fn session_last_activity_uses_selected_timezone() {
             offline: true,
             refresh_pricing: false,
             session_dirs: vec![temp.path().join("sessions")],
+            parallelism: ScannerParallelism::Auto,
         },
     )
     .expect("build report");
@@ -202,6 +209,59 @@ fn missing_directories_are_reported_without_failing_the_run() {
         }
         other => panic!("unexpected report: {other:?}"),
     }
+}
+
+#[test]
+fn explicit_single_thread_mode_matches_multi_worker_results() {
+    let temp = TempDir::new().expect("tempdir");
+    for index in 0..4 {
+        let session_contents = [
+            json!({
+                "timestamp": "2025-09-11T18:00:00.000Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-5"},
+            })
+            .to_string(),
+            json!({
+                "timestamp": format!("2025-09-11T18:0{index}:00.000Z"),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 100 + index,
+                            "cached_input_tokens": 10,
+                            "output_tokens": 20 + index,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 120 + (index * 2),
+                        }
+                    }
+                }
+            })
+            .to_string(),
+            String::new(),
+        ]
+        .join("\n");
+        write_session_file(
+            &temp,
+            &format!("sessions/project/session-{index}.jsonl"),
+            &session_contents,
+        );
+    }
+
+    let session_dir = temp.path().join("sessions");
+    let mut single_threaded = base_options(&session_dir);
+    single_threaded.parallelism =
+        ScannerParallelism::Fixed(NonZeroUsize::new(1).expect("non-zero"));
+    let mut multi_worker = base_options(&session_dir);
+    multi_worker.parallelism = ScannerParallelism::Fixed(NonZeroUsize::new(2).expect("non-zero"));
+
+    let single_report =
+        build_report(ReportKind::Session, &single_threaded).expect("single-threaded report");
+    let multi_report =
+        build_report(ReportKind::Session, &multi_worker).expect("multi-worker report");
+
+    assert_eq!(single_report, multi_report);
 }
 
 #[test]
@@ -255,6 +315,7 @@ fn invalid_timezone_is_rejected() {
             offline: true,
             refresh_pricing: false,
             session_dirs: vec![temp.path().join("sessions")],
+            parallelism: ScannerParallelism::Auto,
         },
     )
     .expect_err("invalid timezone should fail");
