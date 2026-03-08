@@ -5,12 +5,13 @@ use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use clap::{Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, eyre};
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -503,6 +504,22 @@ impl RawUsage {
     }
 }
 
+impl UsagePayload {
+    /// Convert a deserialized usage payload into raw usage counters.
+    fn into_raw_usage(self) -> RawUsage {
+        RawUsage {
+            input: self.input_tokens,
+            cached_input: self
+                .cached_input_tokens
+                .or(self.cache_read_input_tokens)
+                .unwrap_or(0),
+            output: self.output_tokens,
+            reasoning_output: self.reasoning_output_tokens,
+            total: self.total_tokens,
+        }
+    }
+}
+
 /// Internal usage accumulator.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UsageTotals {
@@ -540,19 +557,578 @@ impl UsageTotals {
 
 /// Event ready for aggregation.
 #[derive(Clone, Debug)]
-struct TokenUsageEvent {
+struct TokenUsageEvent<'session, 'model> {
     /// Unique session key including source-root identity.
-    session_key: String,
+    session_key: &'session str,
     /// Session identifier.
-    session_id: String,
+    session_id: &'session str,
     /// Timestamp as parsed UTC datetime.
     timestamp_utc: DateTime<Utc>,
     /// Model name.
-    model: String,
+    model: &'model str,
     /// Whether model fallback was used.
     is_fallback_model: bool,
     /// Token totals.
     usage: UsageTotals,
+}
+
+/// One parsed JSONL entry.
+#[derive(Deserialize)]
+struct SessionLogEntry<'a> {
+    /// Entry kind.
+    #[serde(
+        rename = "type",
+        borrow,
+        default,
+        deserialize_with = "deserialize_optional_cow_lossy"
+    )]
+    entry_type: Option<Cow<'a, str>>,
+    /// Event timestamp.
+    #[serde(borrow, default, deserialize_with = "deserialize_optional_cow_lossy")]
+    timestamp: Option<Cow<'a, str>>,
+    /// Entry payload.
+    #[serde(
+        borrow,
+        default,
+        deserialize_with = "deserialize_optional_object_lossy"
+    )]
+    payload: Option<EntryPayload<'a>>,
+}
+
+/// Payload fields used by turn-context and token-count events.
+#[derive(Default, Deserialize)]
+struct EntryPayload<'a> {
+    /// Payload kind.
+    #[serde(
+        rename = "type",
+        borrow,
+        default,
+        deserialize_with = "deserialize_optional_cow_lossy"
+    )]
+    payload_type: Option<Cow<'a, str>>,
+    /// Nested event info object.
+    #[serde(
+        borrow,
+        default,
+        deserialize_with = "deserialize_optional_object_lossy"
+    )]
+    info: Option<EntryInfo<'a>>,
+    /// Inline usage delta.
+    #[serde(default, deserialize_with = "deserialize_optional_object_lossy")]
+    last_token_usage: Option<UsagePayload>,
+    /// Inline cumulative usage.
+    #[serde(default, deserialize_with = "deserialize_optional_object_lossy")]
+    total_token_usage: Option<UsagePayload>,
+    /// Model lookup fields.
+    #[serde(flatten, borrow)]
+    model_fields: ModelFields<'a>,
+}
+
+/// Nested info object inside token-count events.
+#[derive(Default, Deserialize)]
+struct EntryInfo<'a> {
+    /// Usage delta.
+    #[serde(default, deserialize_with = "deserialize_optional_object_lossy")]
+    last_token_usage: Option<UsagePayload>,
+    /// Cumulative usage.
+    #[serde(default, deserialize_with = "deserialize_optional_object_lossy")]
+    total_token_usage: Option<UsagePayload>,
+    /// Model lookup fields.
+    #[serde(flatten, borrow)]
+    model_fields: ModelFields<'a>,
+}
+
+/// Common model lookup fields reused across payload shapes.
+#[derive(Default, Deserialize)]
+struct ModelFields<'a> {
+    /// Primary model field.
+    #[serde(borrow, default, deserialize_with = "deserialize_optional_cow_lossy")]
+    model: Option<Cow<'a, str>>,
+    /// Alternate model field.
+    #[serde(
+        rename = "model_name",
+        borrow,
+        default,
+        deserialize_with = "deserialize_optional_cow_lossy"
+    )]
+    model_name: Option<Cow<'a, str>>,
+    /// Nested metadata lookup.
+    #[serde(
+        borrow,
+        default,
+        deserialize_with = "deserialize_optional_object_lossy"
+    )]
+    metadata: Option<ModelMetadata<'a>>,
+}
+
+/// Nested metadata container.
+#[derive(Deserialize)]
+struct ModelMetadata<'a> {
+    /// Model name from metadata.
+    #[serde(borrow, default, deserialize_with = "deserialize_optional_cow_lossy")]
+    model: Option<Cow<'a, str>>,
+}
+
+/// Deserialize an optional string field while ignoring invalid scalar shapes.
+fn deserialize_optional_cow_lossy<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Cow<'de, str>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalCowVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptionalCowVisitor {
+        type Value = Option<Cow<'de, str>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an optional string")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_optional_cow_lossy(deserializer)
+        }
+
+        fn visit_borrowed_str<E>(self, value: &'de str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(Cow::Borrowed(value)))
+        }
+
+        fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(Cow::Owned(value.to_string())))
+        }
+
+        fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(Cow::Owned(value)))
+        }
+
+        fn visit_bool<E>(self, _value: bool) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_i64<E>(self, _value: i64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_u64<E>(self, _value: u64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_f64<E>(self, _value: f64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(OptionalCowVisitor)
+}
+
+/// Deserialize a token counter while treating invalid field types as zero.
+fn deserialize_u64_lossy<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LossyU64Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for LossyU64Visitor {
+        type Value = u64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an integer token count")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_u64_lossy(deserializer)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, _value: i64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_f64<E>(self, _value: f64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_bool<E>(self, _value: bool) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_borrowed_str<E>(self, _value: &'de str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_str<E>(self, _value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_string<E>(self, _value: String) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(0)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(0)
+        }
+    }
+
+    deserializer.deserialize_any(LossyU64Visitor)
+}
+
+/// Deserialize an optional token counter while ignoring invalid field types.
+fn deserialize_optional_u64_lossy<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalU64Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptionalU64Visitor {
+        type Value = Option<u64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an optional integer token count")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_optional_u64_lossy(deserializer)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(value))
+        }
+
+        fn visit_i64<E>(self, _value: i64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_f64<E>(self, _value: f64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_bool<E>(self, _value: bool) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_borrowed_str<E>(self, _value: &'de str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_str<E>(self, _value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_string<E>(self, _value: String) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(OptionalU64Visitor)
+}
+
+/// Deserialize an optional object while ignoring wrong-type values.
+fn deserialize_optional_object_lossy<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct OptionalObjectVisitor<T>(PhantomData<T>);
+
+    impl<'de, T> serde::de::Visitor<'de> for OptionalObjectVisitor<T>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        type Value = Option<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an optional object")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_optional_object_lossy(deserializer)
+        }
+
+        fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let value = T::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+            Ok(Some(value))
+        }
+
+        fn visit_bool<E>(self, _value: bool) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_i64<E>(self, _value: i64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_u64<E>(self, _value: u64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_f64<E>(self, _value: f64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_borrowed_str<E>(self, _value: &'de str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_str<E>(self, _value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_string<E>(self, _value: String) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(OptionalObjectVisitor::<T>(PhantomData))
+}
+
+/// Usage payload read directly from JSON.
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names mirror the Codex JSON payload shape verbatim"
+)]
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+struct UsagePayload {
+    /// Input tokens.
+    #[serde(default, deserialize_with = "deserialize_u64_lossy")]
+    input_tokens: u64,
+    /// Cached input tokens.
+    #[serde(default, deserialize_with = "deserialize_optional_u64_lossy")]
+    cached_input_tokens: Option<u64>,
+    /// Legacy cached input token field.
+    #[serde(default, deserialize_with = "deserialize_optional_u64_lossy")]
+    cache_read_input_tokens: Option<u64>,
+    /// Output tokens.
+    #[serde(default, deserialize_with = "deserialize_u64_lossy")]
+    output_tokens: u64,
+    /// Reasoning output tokens.
+    #[serde(default, deserialize_with = "deserialize_u64_lossy")]
+    reasoning_output_tokens: u64,
+    /// Total tokens.
+    #[serde(default, deserialize_with = "deserialize_u64_lossy")]
+    total_tokens: u64,
 }
 
 /// One per-group summary.
@@ -653,7 +1229,7 @@ impl ReportBuilder {
     }
 
     /// Observe one event.
-    fn observe(&mut self, event: &TokenUsageEvent) {
+    fn observe(&mut self, event: &TokenUsageEvent<'_, '_>) {
         let local = event.timestamp_utc.with_timezone(&self.timezone);
         let date = local.date_naive();
         if self.since.is_some_and(|since| date < since)
@@ -676,9 +1252,9 @@ impl ReportBuilder {
             ReportKind::Session => {
                 let summary = self
                     .session
-                    .entry(event.session_key.clone())
+                    .entry(event.session_key.to_string())
                     .or_insert_with(|| {
-                        SessionSummary::new(event.timestamp_utc, event.session_id.clone())
+                        SessionSummary::new(event.timestamp_utc, event.session_id.to_string())
                     });
                 if event.timestamp_utc > summary.last_activity {
                     summary.last_activity = event.timestamp_utc;
@@ -807,9 +1383,9 @@ fn sort_session_entries(entries: &mut [(String, SessionSummary)]) {
 }
 
 /// Push event data into a grouped summary.
-fn push_event_into_summary(summary: &mut GroupSummary, event: &TokenUsageEvent) {
+fn push_event_into_summary(summary: &mut GroupSummary, event: &TokenUsageEvent<'_, '_>) {
     summary.totals.add(&event.usage);
-    let breakdown = summary.models.entry(event.model.clone()).or_default();
+    let breakdown = ensure_model_breakdown(&mut summary.models, event.model);
     push_usage_into_breakdown(breakdown, &event.usage, event.is_fallback_model);
     if event.is_fallback_model {
         breakdown.is_fallback = true;
@@ -817,13 +1393,27 @@ fn push_event_into_summary(summary: &mut GroupSummary, event: &TokenUsageEvent) 
 }
 
 /// Push event data into a session summary.
-fn push_event_into_session_summary(summary: &mut SessionSummary, event: &TokenUsageEvent) {
+fn push_event_into_session_summary(summary: &mut SessionSummary, event: &TokenUsageEvent<'_, '_>) {
     summary.totals.add(&event.usage);
-    let breakdown = summary.models.entry(event.model.clone()).or_default();
+    let breakdown = ensure_model_breakdown(&mut summary.models, event.model);
     push_usage_into_breakdown(breakdown, &event.usage, event.is_fallback_model);
     if event.is_fallback_model {
         breakdown.is_fallback = true;
     }
+}
+
+/// Fetch or create one model breakdown without allocating on every lookup.
+fn ensure_model_breakdown<'a>(
+    models: &'a mut HashMap<String, ModelBreakdown>,
+    model: &str,
+) -> &'a mut ModelBreakdown {
+    if models.contains_key(model) {
+        return models
+            .get_mut(model)
+            .expect("contains_key true implies get_mut succeeds");
+    }
+
+    models.entry(model.to_string()).or_default()
 }
 
 /// Add usage into a public model breakdown.
@@ -979,7 +1569,6 @@ fn register_session_target(
 
 /// Scan one JSONL session file.
 fn scan_session_file(file: &Path, session_id: &str, builder: &mut ReportBuilder) -> Result<()> {
-    let session_key = session_id.to_string();
     let reader = BufReader::new(File::open(file)?);
     let mut line = String::new();
     let mut previous_totals: Option<RawUsage> = None;
@@ -996,12 +1585,9 @@ fn scan_session_file(file: &Path, session_id: &str, builder: &mut ReportBuilder)
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        if let Some(event) = parse_token_usage_event(
-            &entry,
-            &session_key,
+        if let Some(event) = parse_token_usage_line(
+            trimmed,
+            session_id,
             session_id,
             &mut previous_totals,
             &mut current_model,
@@ -1022,21 +1608,24 @@ fn session_file_id(root: &Path, file: &Path) -> String {
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
-/// Parse one JSONL entry into a token-usage event when applicable.
-fn parse_token_usage_event(
-    entry: &Value,
-    session_key: &str,
-    session_id: &str,
+/// Parse one JSONL line into a token-usage event when applicable.
+fn parse_token_usage_line<'session, 'model>(
+    line: &str,
+    session_key: &'session str,
+    session_id: &'session str,
     previous_totals: &mut Option<RawUsage>,
-    current_model: &mut Option<String>,
+    current_model: &'model mut Option<String>,
     current_model_is_fallback: &mut bool,
-) -> Result<Option<TokenUsageEvent>> {
-    let Some(entry_type) = entry.get("type").and_then(Value::as_str) else {
+) -> Result<Option<TokenUsageEvent<'session, 'model>>> {
+    let Ok(entry) = serde_json::from_str::<SessionLogEntry<'_>>(line) else {
+        return Ok(None);
+    };
+    let Some(entry_type) = entry.entry_type.as_deref() else {
         return Ok(None);
     };
     if entry_type == "turn_context" {
-        if let Some(model) = entry.get("payload").and_then(extract_model) {
-            *current_model = Some(model);
+        if let Some(model) = entry.payload.as_ref().and_then(extract_payload_model) {
+            remember_model(current_model, model);
             *current_model_is_fallback = false;
         }
         return Ok(None);
@@ -1044,13 +1633,13 @@ fn parse_token_usage_event(
     if entry_type != "event_msg" {
         return Ok(None);
     }
-    let Some(payload) = entry.get("payload") else {
+    let Some(payload) = entry.payload.as_ref() else {
         return Ok(None);
     };
-    if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+    if payload.payload_type.as_deref() != Some("token_count") {
         return Ok(None);
     }
-    let Some(timestamp) = entry.get("timestamp").and_then(Value::as_str) else {
+    let Some(timestamp) = entry.timestamp.as_deref() else {
         return Ok(None);
     };
     let Some(usage) = extract_event_usage(payload, previous_totals) else {
@@ -1062,8 +1651,8 @@ fn parse_token_usage_event(
         .wrap_err_with(|| format!("invalid timestamp {timestamp}"))?
         .with_timezone(&Utc);
     Ok(Some(TokenUsageEvent {
-        session_key: session_key.to_string(),
-        session_id: session_id.to_string(),
+        session_key,
+        session_id,
         timestamp_utc,
         model,
         is_fallback_model,
@@ -1073,12 +1662,28 @@ fn parse_token_usage_event(
 
 /// Extract normalized usage from one token-count payload.
 fn extract_event_usage(
-    payload: &Value,
+    payload: &EntryPayload<'_>,
     previous_totals: &mut Option<RawUsage>,
 ) -> Option<UsageTotals> {
-    let info = payload.get("info").unwrap_or(payload);
-    let last_usage = info.get("last_token_usage").and_then(normalize_usage);
-    let total_usage = info.get("total_token_usage").and_then(normalize_usage);
+    let (last_usage, total_usage) = if payload.info.is_some() {
+        (
+            info_usage(payload, UsageKind::Last),
+            info_usage(payload, UsageKind::Total),
+        )
+    } else {
+        (
+            payload
+                .last_token_usage
+                .as_ref()
+                .copied()
+                .map(UsagePayload::into_raw_usage),
+            payload
+                .total_token_usage
+                .as_ref()
+                .copied()
+                .map(UsagePayload::into_raw_usage),
+        )
+    };
     let mut raw_usage = last_usage;
     if raw_usage.is_none()
         && let Some(total_usage) = total_usage
@@ -1102,89 +1707,88 @@ fn extract_event_usage(
 }
 
 /// Resolve the model for one token-count payload and keep parser state in sync.
-fn resolve_event_model(
-    payload: &Value,
-    current_model: &mut Option<String>,
+fn resolve_event_model<'a>(
+    payload: &EntryPayload<'_>,
+    current_model: &'a mut Option<String>,
     current_model_is_fallback: &mut bool,
-) -> (String, bool) {
-    let info = payload.get("info").unwrap_or(payload);
-    let extracted_model = extract_model(payload).or_else(|| extract_model(info));
-    if let Some(model) = extracted_model.clone() {
-        *current_model = Some(model);
+) -> (&'a str, bool) {
+    if let Some(model) = extract_payload_model(payload) {
+        remember_model(current_model, model);
         *current_model_is_fallback = false;
     }
-    match extracted_model.or_else(|| current_model.clone()) {
-        Some(model) if *current_model_is_fallback => (model, true),
-        Some(model) => (model, false),
-        None => {
-            *current_model = Some(DEFAULT_FALLBACK_MODEL.to_string());
-            *current_model_is_fallback = true;
-            (DEFAULT_FALLBACK_MODEL.to_string(), true)
+    if current_model.is_none() {
+        remember_model(current_model, DEFAULT_FALLBACK_MODEL);
+        *current_model_is_fallback = true;
+    }
+
+    (
+        current_model
+            .as_deref()
+            .expect("resolved event model should always be present"),
+        *current_model_is_fallback,
+    )
+}
+
+/// Extract a model name from a payload shape.
+fn extract_payload_model<'a>(payload: &'a EntryPayload<'a>) -> Option<&'a str> {
+    let info_fields = payload.info.as_ref().map(|info| &info.model_fields);
+    [
+        info_fields.and_then(|fields| fields.model.as_deref()),
+        info_fields.and_then(|fields| fields.model_name.as_deref()),
+        payload.model_fields.model.as_deref(),
+        payload.model_fields.model_name.as_deref(),
+        info_fields.and_then(metadata_model),
+        metadata_model(&payload.model_fields),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|model| !model.is_empty())
+}
+
+/// Extract the metadata model from one model lookup container.
+fn metadata_model<'a>(fields: &'a ModelFields<'a>) -> Option<&'a str> {
+    fields
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.model.as_deref())
+}
+
+/// Remember the last resolved model while reusing existing allocation capacity.
+fn remember_model(current_model: &mut Option<String>, model: &str) {
+    match current_model {
+        Some(current) => {
+            current.clear();
+            current.push_str(model);
         }
+        None => *current_model = Some(model.to_string()),
     }
 }
 
-/// Extract a model name from a JSON value.
-fn extract_model(value: &Value) -> Option<String> {
-    let info = value.get("info").unwrap_or(value);
-    let direct = [
-        info.get("model"),
-        info.get("model_name"),
-        value.get("model"),
-        value.get("model_name"),
-    ];
-    for candidate in direct {
-        if let Some(model) = candidate.and_then(Value::as_str).map(str::trim)
-            && !model.is_empty()
-        {
-            return Some(model.to_string());
-        }
-    }
-    for parent in [info, value] {
-        if let Some(model) = parent
-            .get("metadata")
-            .and_then(|metadata| metadata.get("model"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            && !model.is_empty()
-        {
-            return Some(model.to_string());
-        }
-    }
-    None
+/// Usage field selectors reused across payload levels.
+#[derive(Clone, Copy)]
+enum UsageKind {
+    /// Event delta usage.
+    Last,
+    /// Cumulative usage.
+    Total,
 }
 
-/// Normalize usage payloads into a single shape.
-fn normalize_usage(value: &Value) -> Option<RawUsage> {
-    let object = value.as_object()?;
-    let input = object
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached_input = object
-        .get("cached_input_tokens")
-        .or_else(|| object.get("cache_read_input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output = object
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let reasoning_output = object
-        .get("reasoning_output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let total = object
-        .get("total_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    Some(RawUsage {
-        input,
-        cached_input,
-        output,
-        reasoning_output,
-        total,
-    })
+/// Extract one usage payload from the nested `info` object when present.
+fn info_usage(payload: &EntryPayload<'_>, usage_kind: UsageKind) -> Option<RawUsage> {
+    let info = payload.info.as_ref()?;
+    match usage_kind {
+        UsageKind::Last => info
+            .last_token_usage
+            .as_ref()
+            .copied()
+            .map(UsagePayload::into_raw_usage),
+        UsageKind::Total => info
+            .total_token_usage
+            .as_ref()
+            .copied()
+            .map(UsagePayload::into_raw_usage),
+    }
 }
 
 /// Convert cumulative totals into a delta.
@@ -1296,30 +1900,36 @@ mod tests {
 
     #[test]
     fn extract_model_checks_nested_metadata() {
-        let payload = serde_json::json!({
-            "info": {
-                "metadata": {
-                    "model": "gpt-5"
-                }
-            }
-        });
-        assert_eq!(extract_model(&payload).as_deref(), Some("gpt-5"));
+        let payload =
+            serde_json::from_str::<EntryPayload<'_>>(r#"{"info":{"metadata":{"model":"gpt-5"}}}"#)
+                .expect("payload");
+        assert_eq!(extract_payload_model(&payload), Some("gpt-5"));
     }
 
     #[test]
     fn normalize_usage_reads_cache_alias() {
-        let usage = normalize_usage(&serde_json::json!({
-            "input_tokens": 100,
-            "cache_read_input_tokens": 25,
-            "output_tokens": 20,
-            "reasoning_output_tokens": 5,
-        }))
-        .expect("usage");
+        let usage = serde_json::from_str::<UsagePayload>(
+            r#"{"input_tokens":100,"cache_read_input_tokens":25,"output_tokens":20,"reasoning_output_tokens":5}"#,
+        )
+        .expect("usage")
+        .into_raw_usage();
         assert_eq!(usage.input, 100);
         assert_eq!(usage.cached_input, 25);
         assert_eq!(usage.output, 20);
         assert_eq!(usage.reasoning_output, 5);
         assert_eq!(usage.total, 0);
+    }
+
+    #[test]
+    fn normalize_usage_prefers_primary_cached_input_field_when_both_are_present() {
+        let usage = serde_json::from_str::<UsagePayload>(
+            r#"{"input_tokens":100,"cached_input_tokens":10,"cache_read_input_tokens":25,"output_tokens":20,"total_tokens":120}"#,
+        )
+        .expect("usage")
+        .into_raw_usage();
+
+        assert_eq!(usage.cached_input, 10);
+        assert_eq!(usage.total, 120);
     }
 
     #[test]
@@ -2007,6 +2617,221 @@ mod tests {
         assert_eq!(rows[0].input_tokens, 150);
         assert_eq!(rows[0].output_tokens, 20);
         assert_eq!(rows[0].total_tokens, 170);
+    }
+
+    #[test]
+    fn parse_token_usage_line_tracks_turn_context_and_metadata_model() {
+        let mut previous_totals = None;
+        let mut current_model = None;
+        let mut current_model_is_fallback = false;
+
+        let turn_context = parse_token_usage_line(
+            r#"{"type":"turn_context","payload":{"metadata":{"model":"gpt-5-mini"}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("turn context parse");
+        assert!(turn_context.is_none());
+        assert_eq!(current_model.as_deref(), Some("gpt-5-mini"));
+        assert!(!current_model_is_fallback);
+
+        let event = parse_token_usage_line(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":12,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":15}}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("event parse")
+        .expect("token usage event");
+
+        assert_eq!(event.model, "gpt-5-mini");
+        assert!(!event.is_fallback_model);
+        assert_eq!(
+            event.usage,
+            UsageTotals {
+                input: 12,
+                cached_input: 2,
+                output: 3,
+                reasoning_output: 1,
+                total: 15,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_token_usage_line_uses_fallback_model_until_explicit_model_arrives() {
+        let mut previous_totals = None;
+        let mut current_model = None;
+        let mut current_model_is_fallback = false;
+
+        let first_event = parse_token_usage_line(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":8,"output_tokens":2,"total_tokens":10}}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("first event parse")
+        .expect("first token usage event");
+        assert_eq!(first_event.model, DEFAULT_FALLBACK_MODEL);
+        assert!(first_event.is_fallback_model);
+
+        let second_event = parse_token_usage_line(
+            r#"{"timestamp":"2026-01-01T00:01:00Z","type":"event_msg","payload":{"type":"token_count","model":"gpt-5","info":{"last_token_usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("second event parse")
+        .expect("second token usage event");
+        assert_eq!(second_event.model, "gpt-5");
+        assert!(!second_event.is_fallback_model);
+    }
+
+    #[test]
+    fn parse_token_usage_line_does_not_fall_back_to_payload_usage_when_info_exists() {
+        let mut previous_totals = None;
+        let mut current_model = None;
+        let mut current_model_is_fallback = false;
+
+        let event = parse_token_usage_line(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","last_token_usage":{"input_tokens":8,"output_tokens":2,"total_tokens":10},"info":{"model":"gpt-5"}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("event parse");
+
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn parse_token_usage_line_accepts_escaped_model_strings() {
+        let mut previous_totals = None;
+        let mut current_model = None;
+        let mut current_model_is_fallback = false;
+
+        let turn_context = parse_token_usage_line(
+            r#"{"type":"turn_context","payload":{"metadata":{"model":"gpt\u002d5"}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("turn context parse");
+        assert!(turn_context.is_none());
+
+        let event = parse_token_usage_line(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("event parse")
+        .expect("token usage event");
+
+        assert_eq!(event.model, "gpt-5");
+        assert!(!event.is_fallback_model);
+    }
+
+    #[test]
+    fn parse_token_usage_line_prefers_explicit_model_over_nested_metadata() {
+        let mut previous_totals = None;
+        let mut current_model = None;
+        let mut current_model_is_fallback = false;
+
+        let event = parse_token_usage_line(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","model":"gpt-5","info":{"metadata":{"model":"gpt-5-mini"},"last_token_usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("event parse")
+        .expect("token usage event");
+
+        assert_eq!(event.model, "gpt-5");
+    }
+
+    #[test]
+    fn parse_token_usage_line_ignores_invalid_optional_subfields() {
+        let mut previous_totals = None;
+        let mut current_model = None;
+        let mut current_model_is_fallback = false;
+
+        let event = parse_token_usage_line(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"metadata":"invalid","last_token_usage":"invalid","total_token_usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("event parse")
+        .expect("token usage event");
+
+        assert_eq!(event.usage.total, 10);
+        assert_eq!(event.model, DEFAULT_FALLBACK_MODEL);
+        assert!(event.is_fallback_model);
+    }
+
+    #[test]
+    fn parse_token_usage_line_keeps_usage_when_one_counter_has_wrong_type() {
+        let mut previous_totals = None;
+        let mut current_model = None;
+        let mut current_model_is_fallback = false;
+
+        let event = parse_token_usage_line(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"output_tokens":2,"reasoning_output_tokens":"invalid","total_tokens":9}}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("event parse")
+        .expect("token usage event");
+
+        assert_eq!(event.usage.input, 7);
+        assert_eq!(event.usage.output, 2);
+        assert_eq!(event.usage.reasoning_output, 0);
+        assert_eq!(event.usage.total, 9);
+    }
+
+    #[test]
+    fn parse_token_usage_line_keeps_usage_when_model_field_has_wrong_type() {
+        let mut previous_totals = None;
+        let mut current_model = Some("gpt-5".to_string());
+        let mut current_model_is_fallback = false;
+
+        let event = parse_token_usage_line(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","model":["invalid"],"info":{"last_token_usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}}"#,
+            "session-key",
+            "session-id",
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )
+        .expect("event parse")
+        .expect("token usage event");
+
+        assert_eq!(event.model, "gpt-5");
+        assert!(!event.is_fallback_model);
+        assert_eq!(event.usage.total, 5);
     }
 
     #[test]
