@@ -8,10 +8,11 @@ use eyre::{Result, WrapErr, eyre};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -67,6 +68,15 @@ pub struct ModelBreakdown {
     pub reasoning_output_tokens: u64,
     /// Total billable tokens.
     pub total_tokens: u64,
+    /// Precomputed cost in USD for text rendering.
+    #[serde(skip_serializing)]
+    pub cost_usd: f64,
+    /// Fallback-only usage kept for human-readable rendering.
+    #[serde(skip_serializing)]
+    pub fallback_usage: UsageTotals,
+    /// Fallback-only cost kept for human-readable rendering.
+    #[serde(skip_serializing)]
+    pub fallback_cost_usd: f64,
     /// Whether fallback model inference was used.
     #[serde(skip_serializing_if = "is_false")]
     pub is_fallback: bool,
@@ -464,18 +474,18 @@ impl RawUsage {
 }
 
 /// Internal usage accumulator.
-#[derive(Clone, Debug, Default)]
-struct UsageTotals {
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UsageTotals {
     /// Total input tokens.
-    input: u64,
+    pub input: u64,
     /// Total cached input tokens.
-    cached_input: u64,
+    pub cached_input: u64,
     /// Total output tokens.
-    output: u64,
+    pub output: u64,
     /// Total reasoning output tokens.
-    reasoning_output: u64,
+    pub reasoning_output: u64,
     /// Total billable tokens.
-    total: u64,
+    pub total: u64,
 }
 
 impl UsageTotals {
@@ -486,6 +496,15 @@ impl UsageTotals {
         self.output += other.output;
         self.reasoning_output += other.reasoning_output;
         self.total += other.total;
+    }
+
+    /// Return whether this usage bucket contains any billable activity.
+    fn has_usage(&self) -> bool {
+        self.input > 0
+            || self.cached_input > 0
+            || self.output > 0
+            || self.reasoning_output > 0
+            || self.total > 0
     }
 }
 
@@ -656,7 +675,7 @@ impl ReportBuilder {
                         .daily
                         .get(&key)
                         .ok_or_else(|| eyre!("missing daily summary for key {key}"))?;
-                    let models = to_sorted_models(&summary.models);
+                    let models = to_sorted_models(&summary.models, pricing);
                     let cost = calculate_summary_cost(&summary.models, pricing);
                     push_totals(&mut totals, &summary.totals, cost);
                     rows.push(DailyRow {
@@ -686,7 +705,7 @@ impl ReportBuilder {
                         .monthly
                         .get(&key)
                         .ok_or_else(|| eyre!("missing monthly summary for key {key}"))?;
-                    let models = to_sorted_models(&summary.models);
+                    let models = to_sorted_models(&summary.models, pricing);
                     let cost = calculate_summary_cost(&summary.models, pricing);
                     push_totals(&mut totals, &summary.totals, cost);
                     rows.push(MonthlyRow {
@@ -729,7 +748,7 @@ impl ReportBuilder {
                         reasoning_output_tokens: summary.totals.reasoning_output,
                         total_tokens: summary.totals.total,
                         cost_usd: cost,
-                        models: to_sorted_models(&summary.models),
+                        models: to_sorted_models(&summary.models, pricing),
                     });
                 }
                 Ok(ReportOutput::Session {
@@ -761,7 +780,7 @@ fn sort_session_entries(entries: &mut [(String, SessionSummary)]) {
 fn push_event_into_summary(summary: &mut GroupSummary, event: &TokenUsageEvent) {
     summary.totals.add(&event.usage);
     let breakdown = summary.models.entry(event.model.clone()).or_default();
-    push_usage_into_breakdown(breakdown, &event.usage);
+    push_usage_into_breakdown(breakdown, &event.usage, event.is_fallback_model);
     if event.is_fallback_model {
         breakdown.is_fallback = true;
     }
@@ -771,26 +790,44 @@ fn push_event_into_summary(summary: &mut GroupSummary, event: &TokenUsageEvent) 
 fn push_event_into_session_summary(summary: &mut SessionSummary, event: &TokenUsageEvent) {
     summary.totals.add(&event.usage);
     let breakdown = summary.models.entry(event.model.clone()).or_default();
-    push_usage_into_breakdown(breakdown, &event.usage);
+    push_usage_into_breakdown(breakdown, &event.usage, event.is_fallback_model);
     if event.is_fallback_model {
         breakdown.is_fallback = true;
     }
 }
 
 /// Add usage into a public model breakdown.
-fn push_usage_into_breakdown(target: &mut ModelBreakdown, usage: &UsageTotals) {
+fn push_usage_into_breakdown(
+    target: &mut ModelBreakdown,
+    usage: &UsageTotals,
+    is_fallback_model: bool,
+) {
     target.input_tokens += usage.input;
     target.cached_input_tokens += usage.cached_input;
     target.output_tokens += usage.output;
     target.reasoning_output_tokens += usage.reasoning_output;
     target.total_tokens += usage.total;
+    if is_fallback_model {
+        target.fallback_usage.add(usage);
+    }
 }
 
 /// Convert a hash map into a stable `BTreeMap`.
-fn to_sorted_models(models: &HashMap<String, ModelBreakdown>) -> BTreeMap<String, ModelBreakdown> {
+fn to_sorted_models(
+    models: &HashMap<String, ModelBreakdown>,
+    pricing: &PricingCatalog,
+) -> BTreeMap<String, ModelBreakdown> {
     models
         .iter()
-        .map(|(model, usage)| (model.clone(), usage.clone()))
+        .map(|(model, usage)| {
+            let mut breakdown = usage.clone();
+            let resolved_pricing = pricing.resolve(model);
+            breakdown.cost_usd =
+                calculate_cost_from_usage(&explicit_usage(&breakdown), &resolved_pricing);
+            breakdown.fallback_cost_usd =
+                calculate_cost_from_usage(&breakdown.fallback_usage, &resolved_pricing);
+            (model.clone(), breakdown)
+        })
         .collect()
 }
 
@@ -860,11 +897,16 @@ fn render_report(report: &ReportOutput, locale: &str) -> String {
 
 /// Render the daily report body.
 fn render_daily_report(rows: &[DailyRow], totals: &Totals, locale: &str) -> String {
+    let style = detect_table_style();
+    let borders = detect_border_style();
     render_usage_table(
         "Daily",
+        style,
+        borders,
         locale,
         &[
             "Date",
+            "Model",
             "Input",
             "Cache",
             "Output",
@@ -872,28 +914,23 @@ fn render_daily_report(rows: &[DailyRow], totals: &Totals, locale: &str) -> Stri
             "Total",
             "Cost",
         ],
-        rows.iter().map(|row| {
-            vec![
-                row.date.clone(),
-                format_u64(row.input_tokens),
-                format_u64(row.cached_input_tokens),
-                format_u64(row.output_tokens),
-                format_u64(row.reasoning_output_tokens),
-                format_u64(row.total_tokens),
-                format_currency(row.cost_usd),
-            ]
-        }),
+        daily_display_rows(rows),
         totals,
     )
 }
 
 /// Render the monthly report body.
 fn render_monthly_report(rows: &[MonthlyRow], totals: &Totals, locale: &str) -> String {
+    let style = detect_table_style();
+    let borders = detect_border_style();
     render_usage_table(
         "Monthly",
+        style,
+        borders,
         locale,
         &[
             "Month",
+            "Model",
             "Input",
             "Cache",
             "Output",
@@ -901,29 +938,24 @@ fn render_monthly_report(rows: &[MonthlyRow], totals: &Totals, locale: &str) -> 
             "Total",
             "Cost",
         ],
-        rows.iter().map(|row| {
-            vec![
-                row.month.clone(),
-                format_u64(row.input_tokens),
-                format_u64(row.cached_input_tokens),
-                format_u64(row.output_tokens),
-                format_u64(row.reasoning_output_tokens),
-                format_u64(row.total_tokens),
-                format_currency(row.cost_usd),
-            ]
-        }),
+        monthly_display_rows(rows),
         totals,
     )
 }
 
 /// Render the session report body.
 fn render_session_report(rows: &[SessionRow], totals: &Totals, locale: &str) -> String {
+    let style = detect_table_style();
+    let borders = detect_border_style();
     render_usage_table(
         "Session",
+        style,
+        borders,
         locale,
         &[
             "Directory",
             "Session",
+            "Model",
             "Input",
             "Cache",
             "Output",
@@ -932,14 +964,204 @@ fn render_session_report(rows: &[SessionRow], totals: &Totals, locale: &str) -> 
             "Cost",
             "Last Activity",
         ],
-        rows.iter().map(|row| {
-            vec![
+        session_display_rows(rows),
+        totals,
+    )
+}
+
+/// One rendered table row.
+#[derive(Clone, Debug)]
+struct DisplayRow {
+    /// Cells in table order.
+    cells: Vec<String>,
+    /// Visual styling for the row.
+    kind: DisplayRowKind,
+}
+
+/// Styling group for one display row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisplayRowKind {
+    /// Insert a blank line before the next row.
+    Spacer,
+    /// Group subtotal row.
+    Subtotal,
+    /// Per-model child row.
+    Detail,
+    /// Final grand total row.
+    GrandTotal,
+}
+
+/// Terminal color mode for table rendering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TableStyle {
+    /// Do not emit ANSI escapes.
+    Plain,
+    /// Emit 256-color ANSI escapes.
+    Ansi256,
+}
+
+/// Border style for the rendered table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BorderStyle {
+    /// ASCII-safe borders.
+    Ascii,
+    /// Unicode box-drawing borders.
+    Unicode,
+}
+
+/// Detect the best table style for the current stdout stream.
+///
+/// This auto-detect behavior is intentional: the user explicitly chose richer ANSI output on
+/// capable terminals and plain text fallback elsewhere.
+fn detect_table_style() -> TableStyle {
+    detect_table_style_for(
+        std::io::stdout().is_terminal(),
+        env::var("TERM").ok().as_deref(),
+        env::var("COLORTERM").ok().as_deref(),
+        env::var_os("NO_COLOR").is_some(),
+    )
+}
+
+/// Detect the best border style for the current stdout stream.
+///
+/// This auto-detect behavior is intentional: the user explicitly chose Unicode box-drawing on
+/// UTF-8 terminals and ASCII fallback elsewhere.
+fn detect_border_style() -> BorderStyle {
+    detect_border_style_for(
+        std::io::stdout().is_terminal(),
+        env::var("LC_ALL").ok().as_deref(),
+        env::var("LC_CTYPE").ok().as_deref(),
+        env::var("LANG").ok().as_deref(),
+    )
+}
+
+/// Decide whether Unicode box-drawing is safe for the current environment.
+fn detect_border_style_for(
+    stdout_is_terminal: bool,
+    lc_all: Option<&str>,
+    lc_ctype: Option<&str>,
+    lang: Option<&str>,
+) -> BorderStyle {
+    if !stdout_is_terminal {
+        return BorderStyle::Ascii;
+    }
+
+    let locale = lc_all
+        .filter(|value| !value.is_empty())
+        .or(lc_ctype.filter(|value| !value.is_empty()))
+        .or(lang.filter(|value| !value.is_empty()))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if locale.contains("utf-8") || locale.contains("utf8") {
+        BorderStyle::Unicode
+    } else {
+        BorderStyle::Ascii
+    }
+}
+
+/// Decide whether styled output should be enabled.
+fn detect_table_style_for(
+    stdout_is_terminal: bool,
+    term: Option<&str>,
+    colorterm: Option<&str>,
+    no_color: bool,
+) -> TableStyle {
+    if no_color || !stdout_is_terminal {
+        return TableStyle::Plain;
+    }
+
+    let term = term.unwrap_or_default();
+    if term.is_empty() || term == "dumb" {
+        return TableStyle::Plain;
+    }
+
+    let colorterm = colorterm.unwrap_or_default();
+    if term.contains("256color")
+        || colorterm.eq_ignore_ascii_case("truecolor")
+        || colorterm.eq_ignore_ascii_case("24bit")
+    {
+        TableStyle::Ansi256
+    } else {
+        TableStyle::Plain
+    }
+}
+
+/// Build display rows for a daily report.
+fn daily_display_rows(rows: &[DailyRow]) -> Vec<DisplayRow> {
+    let mut display_rows = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            display_rows.push(DisplayRow {
+                cells: Vec::new(),
+                kind: DisplayRowKind::Spacer,
+            });
+        }
+        display_rows.push(DisplayRow {
+            cells: vec![
+                row.date.clone(),
+                "TOTAL".to_string(),
+                format_u64(row.input_tokens),
+                format_u64(row.cached_input_tokens),
+                format_u64(row.output_tokens),
+                format_u64(row.reasoning_output_tokens),
+                format_u64(row.total_tokens),
+                format_currency(row.cost_usd),
+            ],
+            kind: DisplayRowKind::Subtotal,
+        });
+        append_model_display_rows(&mut display_rows, 1, false, &row.models);
+    }
+    display_rows
+}
+
+/// Build display rows for a monthly report.
+fn monthly_display_rows(rows: &[MonthlyRow]) -> Vec<DisplayRow> {
+    let mut display_rows = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            display_rows.push(DisplayRow {
+                cells: Vec::new(),
+                kind: DisplayRowKind::Spacer,
+            });
+        }
+        display_rows.push(DisplayRow {
+            cells: vec![
+                row.month.clone(),
+                "TOTAL".to_string(),
+                format_u64(row.input_tokens),
+                format_u64(row.cached_input_tokens),
+                format_u64(row.output_tokens),
+                format_u64(row.reasoning_output_tokens),
+                format_u64(row.total_tokens),
+                format_currency(row.cost_usd),
+            ],
+            kind: DisplayRowKind::Subtotal,
+        });
+        append_model_display_rows(&mut display_rows, 1, false, &row.models);
+    }
+    display_rows
+}
+
+/// Build display rows for a session report.
+fn session_display_rows(rows: &[SessionRow]) -> Vec<DisplayRow> {
+    let mut display_rows = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            display_rows.push(DisplayRow {
+                cells: Vec::new(),
+                kind: DisplayRowKind::Spacer,
+            });
+        }
+        display_rows.push(DisplayRow {
+            cells: vec![
                 if row.directory.is_empty() {
                     "-".to_string()
                 } else {
                     row.directory.clone()
                 },
                 row.session_file.clone(),
+                "TOTAL".to_string(),
                 format_u64(row.input_tokens),
                 format_u64(row.cached_input_tokens),
                 format_u64(row.output_tokens),
@@ -947,37 +1169,149 @@ fn render_session_report(rows: &[SessionRow], totals: &Totals, locale: &str) -> 
                 format_u64(row.total_tokens),
                 format_currency(row.cost_usd),
                 row.last_activity.clone(),
-            ]
-        }),
-        totals,
-    )
+            ],
+            kind: DisplayRowKind::Subtotal,
+        });
+        append_model_display_rows(&mut display_rows, 2, true, &row.models);
+    }
+    display_rows
 }
 
-/// Render a rectangular table with a totals row.
-fn render_usage_table<I>(
-    title: &str,
-    _locale: &str,
-    headers: &[&str],
-    rows: I,
-    totals: &Totals,
-) -> String
-where
-    I: Iterator<Item = Vec<String>>,
-{
-    let mut all_rows = rows.collect::<Vec<_>>();
-    let mut widths = headers
-        .iter()
-        .map(|header| header.len())
-        .collect::<Vec<_>>();
-    for row in &all_rows {
-        for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.len());
+/// Append child rows for every model in a group.
+fn append_model_display_rows(
+    display_rows: &mut Vec<DisplayRow>,
+    columns_before_model: usize,
+    include_last_activity_column: bool,
+    models: &BTreeMap<String, ModelBreakdown>,
+) {
+    for (model, breakdown) in models {
+        let explicit_usage = explicit_usage(breakdown);
+        if explicit_usage.has_usage() {
+            display_rows.push(model_display_row(
+                columns_before_model,
+                include_last_activity_column,
+                model,
+                &explicit_usage,
+                breakdown.cost_usd,
+            ));
+        }
+
+        if breakdown.fallback_usage.has_usage() {
+            display_rows.push(model_display_row(
+                columns_before_model,
+                include_last_activity_column,
+                &format!("{model} (fallback)"),
+                &breakdown.fallback_usage,
+                breakdown.fallback_cost_usd,
+            ));
         }
     }
-    let totals_row = if headers.first() == Some(&"Directory") {
+}
+
+/// Build one child row for a model breakdown.
+fn model_display_row(
+    columns_before_model: usize,
+    include_last_activity_column: bool,
+    model_label: &str,
+    usage: &UsageTotals,
+    cost_usd: f64,
+) -> DisplayRow {
+    let mut cells = vec![String::new(); columns_before_model];
+    cells.push(format!("  {model_label}"));
+    cells.extend_from_slice(&[
+        format_u64(usage.input),
+        format_u64(usage.cached_input),
+        format_u64(usage.output),
+        format_u64(usage.reasoning_output),
+        format_u64(usage.total),
+        format_currency(cost_usd),
+    ]);
+    if include_last_activity_column {
+        cells.push(String::new());
+    }
+
+    DisplayRow {
+        cells,
+        kind: DisplayRowKind::Detail,
+    }
+}
+
+/// Return the explicit portion of a mixed model breakdown.
+fn explicit_usage(breakdown: &ModelBreakdown) -> UsageTotals {
+    UsageTotals {
+        input: breakdown
+            .input_tokens
+            .saturating_sub(breakdown.fallback_usage.input),
+        cached_input: breakdown
+            .cached_input_tokens
+            .saturating_sub(breakdown.fallback_usage.cached_input),
+        output: breakdown
+            .output_tokens
+            .saturating_sub(breakdown.fallback_usage.output),
+        reasoning_output: breakdown
+            .reasoning_output_tokens
+            .saturating_sub(breakdown.fallback_usage.reasoning_output),
+        total: breakdown
+            .total_tokens
+            .saturating_sub(breakdown.fallback_usage.total),
+    }
+}
+
+/// Render a rectangular table with grouped rows and a totals row.
+fn render_usage_table(
+    title: &str,
+    style: TableStyle,
+    borders: BorderStyle,
+    _locale: &str,
+    headers: &[&str],
+    rows: Vec<DisplayRow>,
+    totals: &Totals,
+) -> String {
+    let mut all_rows = rows;
+    let grand_total_row = grand_total_row(headers, totals);
+    let widths = column_widths(headers, &all_rows, &grand_total_row);
+    all_rows.push(grand_total_row);
+
+    let mut output = String::new();
+    write_table_title(&mut output, style, title);
+    let _ = writeln!(&mut output);
+    write_table_header(&mut output, style, borders, headers, &widths);
+    for row in all_rows {
+        if row.kind == DisplayRowKind::Spacer {
+            write_table_rule(
+                &mut output,
+                style,
+                table_rule_element(TableRuleKind::GroupSeparator),
+                &table_rule(TableRuleKind::GroupSeparator, borders, &widths),
+            );
+            continue;
+        }
+        write_table_row(
+            &mut output,
+            style,
+            borders,
+            headers,
+            &widths,
+            &row.cells,
+            row_table_element(row.kind),
+        );
+    }
+    write_table_rule(
+        &mut output,
+        style,
+        table_rule_element(TableRuleKind::Bottom),
+        &table_rule(TableRuleKind::Bottom, borders, &widths),
+    );
+    output
+}
+
+/// Build the final grand total row for a table.
+fn grand_total_row(headers: &[&str], totals: &Totals) -> DisplayRow {
+    let cells = if headers.first() == Some(&"Directory") {
         vec![
             String::new(),
-            "TOTAL".to_string(),
+            String::new(),
+            "GRAND TOTAL".to_string(),
             format_u64(totals.input_tokens),
             format_u64(totals.cached_input_tokens),
             format_u64(totals.output_tokens),
@@ -988,7 +1322,8 @@ where
         ]
     } else {
         vec![
-            "TOTAL".to_string(),
+            String::new(),
+            "GRAND TOTAL".to_string(),
             format_u64(totals.input_tokens),
             format_u64(totals.cached_input_tokens),
             format_u64(totals.output_tokens),
@@ -997,47 +1332,298 @@ where
             format_currency(totals.cost_usd),
         ]
     };
-    for (index, cell) in totals_row.iter().enumerate() {
-        widths[index] = widths[index].max(cell.len());
-    }
-    all_rows.push(totals_row);
 
-    let mut output = String::new();
-    let _ = writeln!(&mut output, "{title} Codex Usage Report");
-    let _ = writeln!(&mut output);
-    let header_line = headers
+    DisplayRow {
+        cells,
+        kind: DisplayRowKind::GrandTotal,
+    }
+}
+
+/// Compute the display width of every column.
+fn column_widths(
+    headers: &[&str],
+    rows: &[DisplayRow],
+    grand_total_row: &DisplayRow,
+) -> Vec<usize> {
+    let mut widths = headers
+        .iter()
+        .map(|header| header.len())
+        .collect::<Vec<_>>();
+    for row in rows.iter().chain(std::iter::once(grand_total_row)) {
+        for (index, cell) in row.cells.iter().enumerate() {
+            widths[index] = widths[index].max(cell.len());
+        }
+    }
+    widths
+}
+
+/// Write the table title.
+fn write_table_title(output: &mut String, style: TableStyle, title: &str) {
+    let _ = writeln!(
+        output,
+        "{}",
+        paint(
+            style,
+            TableElement::Title,
+            &format!("{title} Codex Usage Report")
+        )
+    );
+}
+
+/// Write the table header and separator.
+fn write_table_header(
+    output: &mut String,
+    style: TableStyle,
+    borders: BorderStyle,
+    headers: &[&str],
+    widths: &[usize],
+) {
+    write_table_rule(
+        output,
+        style,
+        table_rule_element(TableRuleKind::Top),
+        &table_rule(TableRuleKind::Top, borders, widths),
+    );
+    let header_cells = headers
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>();
+    write_table_row(
+        output,
+        style,
+        borders,
+        headers,
+        widths,
+        &header_cells,
+        TableElement::Header,
+    );
+    write_table_rule(
+        output,
+        style,
+        table_rule_element(TableRuleKind::HeaderSeparator),
+        &table_rule(TableRuleKind::HeaderSeparator, borders, widths),
+    );
+}
+
+/// Format one data row with aligned cells.
+#[cfg(test)]
+fn format_data_row(
+    headers: &[&str],
+    borders: BorderStyle,
+    widths: &[usize],
+    cells: &[String],
+) -> String {
+    let theme = border_theme(borders);
+    let body = format_aligned_cells(headers, widths, cells).join(&theme.vertical.to_string());
+    format!("{}{}{}", theme.vertical, body, theme.vertical)
+}
+
+/// Render one row with border segments styled independently from the cell text.
+fn write_table_row(
+    output: &mut String,
+    style: TableStyle,
+    borders: BorderStyle,
+    headers: &[&str],
+    widths: &[usize],
+    cells: &[String],
+    cell_element: TableElement,
+) {
+    let theme = border_theme(borders);
+    let border = paint(style, TableElement::Border, &theme.vertical.to_string());
+    let separator = paint(style, TableElement::Border, &theme.vertical.to_string());
+    let styled_cells = format_aligned_cells(headers, widths, cells)
+        .into_iter()
+        .map(|cell| paint(style, cell_element, &cell))
+        .collect::<Vec<_>>();
+    let _ = writeln!(
+        output,
+        "{}{}{}",
+        border,
+        styled_cells.join(&separator),
+        border
+    );
+}
+
+/// Align row cells before borders or colors are applied.
+fn format_aligned_cells(headers: &[&str], widths: &[usize], cells: &[String]) -> Vec<String> {
+    cells
         .iter()
         .enumerate()
-        .map(|(index, header)| format!("{header:width$}", width = widths[index]))
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let separator = widths
-        .iter()
-        .map(|width| "-".repeat(*width))
-        .collect::<Vec<_>>()
-        .join("-+-");
-    let _ = writeln!(&mut output, "{header_line}");
-    let _ = writeln!(&mut output, "{separator}");
-    for row in all_rows {
-        let line = row
-            .iter()
-            .enumerate()
-            .map(|(index, cell)| {
-                if index == 0
-                    || headers[index] == "Directory"
-                    || headers[index] == "Session"
-                    || headers[index] == "Last Activity"
-                {
-                    format!("{cell:width$}", width = widths[index])
-                } else {
-                    format!("{cell:>width$}", width = widths[index])
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let _ = writeln!(&mut output, "{line}");
+        .map(|(index, cell)| {
+            let formatted = if index <= text_column_limit(headers)
+                || headers[index] == "Directory"
+                || headers[index] == "Session"
+                || headers[index] == "Model"
+                || headers[index] == "Last Activity"
+            {
+                format!("{cell:width$}", width = widths[index])
+            } else {
+                format!("{cell:>width$}", width = widths[index])
+            };
+            format!(" {formatted} ")
+        })
+        .collect()
+}
+
+/// One row-rule kind for the table frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TableRuleKind {
+    /// Top border.
+    Top,
+    /// Header separator.
+    HeaderSeparator,
+    /// Group separator between report sections.
+    GroupSeparator,
+    /// Bottom border.
+    Bottom,
+}
+
+/// Static characters used to draw a table.
+#[derive(Clone, Copy, Debug)]
+struct BorderTheme {
+    /// Horizontal line segment.
+    horizontal: char,
+    /// Outer vertical border.
+    vertical: char,
+    /// Left corner/junction.
+    left: char,
+    /// Inner junction.
+    middle: char,
+    /// Right corner/junction.
+    right: char,
+}
+
+/// Return the concrete drawing theme for one border style.
+fn border_theme(style: BorderStyle) -> BorderTheme {
+    match style {
+        BorderStyle::Ascii => BorderTheme {
+            horizontal: '-',
+            vertical: '|',
+            left: '+',
+            middle: '+',
+            right: '+',
+        },
+        BorderStyle::Unicode => BorderTheme {
+            horizontal: '─',
+            vertical: '│',
+            left: '┌',
+            middle: '┬',
+            right: '┐',
+        },
     }
-    output
+}
+
+/// Return the concrete drawing theme for one border rule.
+fn rule_theme(kind: TableRuleKind, style: BorderStyle) -> BorderTheme {
+    match (style, kind) {
+        (BorderStyle::Ascii, _) => border_theme(style),
+        (BorderStyle::Unicode, TableRuleKind::Top) => BorderTheme {
+            horizontal: '─',
+            vertical: '│',
+            left: '┌',
+            middle: '┬',
+            right: '┐',
+        },
+        (BorderStyle::Unicode, TableRuleKind::HeaderSeparator | TableRuleKind::GroupSeparator) => {
+            BorderTheme {
+                horizontal: '─',
+                vertical: '│',
+                left: '├',
+                middle: '┼',
+                right: '┤',
+            }
+        }
+        (BorderStyle::Unicode, TableRuleKind::Bottom) => BorderTheme {
+            horizontal: '─',
+            vertical: '│',
+            left: '└',
+            middle: '┴',
+            right: '┘',
+        },
+    }
+}
+
+/// Build one table border rule line.
+fn table_rule(kind: TableRuleKind, borders: BorderStyle, widths: &[usize]) -> String {
+    let theme = rule_theme(kind, borders);
+    let segments = widths
+        .iter()
+        .map(|width| theme.horizontal.to_string().repeat(width + 2))
+        .collect::<Vec<_>>();
+    format!(
+        "{}{}{}",
+        theme.left,
+        segments.join(&theme.middle.to_string()),
+        theme.right
+    )
+}
+
+/// Write one border rule with styling.
+fn write_table_rule(output: &mut String, style: TableStyle, element: TableElement, line: &str) {
+    let _ = writeln!(output, "{}", paint(style, element, line));
+}
+
+/// How many leading columns should left-align in this table.
+fn text_column_limit(headers: &[&str]) -> usize {
+    if headers.first() == Some(&"Directory") {
+        2
+    } else {
+        1
+    }
+}
+
+/// One styleable table element.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TableElement {
+    /// Report title.
+    Title,
+    /// Header row.
+    Header,
+    /// Separator row.
+    Border,
+    /// Group subtotal row.
+    Subtotal,
+    /// Model detail row.
+    Detail,
+    /// Grand total row.
+    GrandTotal,
+}
+
+/// Map one display row kind to its table element style.
+fn row_table_element(kind: DisplayRowKind) -> TableElement {
+    match kind {
+        DisplayRowKind::Subtotal => TableElement::Subtotal,
+        DisplayRowKind::Spacer | DisplayRowKind::Detail => TableElement::Detail,
+        DisplayRowKind::GrandTotal => TableElement::GrandTotal,
+    }
+}
+
+/// Map one rule kind to the border styling bucket.
+fn table_rule_element(kind: TableRuleKind) -> TableElement {
+    match kind {
+        TableRuleKind::Top
+        | TableRuleKind::HeaderSeparator
+        | TableRuleKind::GroupSeparator
+        | TableRuleKind::Bottom => TableElement::Border,
+    }
+}
+
+/// Apply ANSI styling when enabled.
+fn paint(style: TableStyle, element: TableElement, text: &str) -> String {
+    match style {
+        TableStyle::Plain => text.to_string(),
+        TableStyle::Ansi256 => {
+            let sequence = match element {
+                TableElement::Title => "\u{1b}[1;38;5;81m",
+                TableElement::Header => "\u{1b}[1;38;5;45m",
+                TableElement::Border => "\u{1b}[38;5;24m",
+                TableElement::Subtotal => "\u{1b}[1;38;5;117m",
+                TableElement::Detail => "\u{1b}[38;5;153m",
+                TableElement::GrandTotal => "\u{1b}[1;38;5;39m",
+            };
+            format!("{sequence}{text}\u{1b}[0m")
+        }
+    }
 }
 
 /// Format an integer with group separators.
@@ -1376,11 +1962,29 @@ fn subtract_usage(current: RawUsage, previous: Option<RawUsage>) -> RawUsage {
     reason = "Codex token counters are orders of magnitude below f64 precision limits"
 )]
 fn calculate_cost(usage: &ModelBreakdown, pricing: &Pricing) -> f64 {
-    let cached_input = usage.cached_input_tokens.min(usage.input_tokens);
-    let non_cached_input = usage.input_tokens.saturating_sub(cached_input);
+    calculate_cost_from_usage(
+        &UsageTotals {
+            input: usage.input_tokens,
+            cached_input: usage.cached_input_tokens,
+            output: usage.output_tokens,
+            reasoning_output: usage.reasoning_output_tokens,
+            total: usage.total_tokens,
+        },
+        pricing,
+    )
+}
+
+/// Price one usage total entry.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Codex token counters are orders of magnitude below f64 precision limits"
+)]
+fn calculate_cost_from_usage(usage: &UsageTotals, pricing: &Pricing) -> f64 {
+    let cached_input = usage.cached_input.min(usage.input);
+    let non_cached_input = usage.input.saturating_sub(cached_input);
     let input_cost = (non_cached_input as f64 / MILLION) * pricing.input_cost_per_mtoken;
     let cached_cost = (cached_input as f64 / MILLION) * pricing.cached_input_cost_per_mtoken;
-    let output_cost = (usage.output_tokens as f64 / MILLION) * pricing.output_cost_per_mtoken;
+    let output_cost = (usage.output as f64 / MILLION) * pricing.output_cost_per_mtoken;
     input_cost + cached_cost + output_cost
 }
 
@@ -1541,7 +2145,9 @@ mod tests {
             output_tokens: 500,
             reasoning_output_tokens: 0,
             total_tokens: 1_500,
+            cost_usd: 0.0,
             is_fallback: false,
+            ..ModelBreakdown::default()
         };
         let pricing = Pricing {
             input_cost_per_mtoken: 1.25,
@@ -1566,7 +2172,34 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 150,
                 cost_usd: 0.25,
-                models: BTreeMap::new(),
+                models: BTreeMap::from([
+                    (
+                        "gpt-5".to_string(),
+                        ModelBreakdown {
+                            input_tokens: 60,
+                            cached_input_tokens: 5,
+                            output_tokens: 25,
+                            reasoning_output_tokens: 0,
+                            total_tokens: 85,
+                            cost_usd: 0.0,
+                            is_fallback: false,
+                            ..ModelBreakdown::default()
+                        },
+                    ),
+                    (
+                        "gpt-5-codex".to_string(),
+                        ModelBreakdown {
+                            input_tokens: 40,
+                            cached_input_tokens: 5,
+                            output_tokens: 25,
+                            reasoning_output_tokens: 0,
+                            total_tokens: 65,
+                            cost_usd: 0.0,
+                            is_fallback: false,
+                            ..ModelBreakdown::default()
+                        },
+                    ),
+                ]),
             }],
             totals: Totals {
                 input_tokens: 100,
@@ -1590,7 +2223,19 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 150,
                 cost_usd: 0.25,
-                models: BTreeMap::new(),
+                models: BTreeMap::from([(
+                    "gpt-5".to_string(),
+                    ModelBreakdown {
+                        input_tokens: 100,
+                        cached_input_tokens: 10,
+                        output_tokens: 50,
+                        reasoning_output_tokens: 0,
+                        total_tokens: 150,
+                        cost_usd: 0.0,
+                        is_fallback: false,
+                        ..ModelBreakdown::default()
+                    },
+                )]),
             }],
             totals: Totals {
                 input_tokens: 100,
@@ -1607,7 +2252,10 @@ mod tests {
         let session_render = render_report(&session, "en-US");
         assert!(daily_render.contains("TOTAL"));
         assert!(daily_render.contains("2025-09-11"));
+        assert!(daily_render.contains("Model"));
+        assert!(daily_render.contains("gpt-5-codex"));
         assert!(session_render.contains("session"));
+        assert!(session_render.contains("gpt-5"));
         assert!(session_render.contains("Last Activity"));
     }
 
@@ -1638,6 +2286,301 @@ mod tests {
         let rendered = render_report(&monthly, "en-US");
         assert!(rendered.contains("Monthly Codex Usage Report"));
         assert!(rendered.contains("2025-09"));
+    }
+
+    #[test]
+    fn render_report_groups_model_rows_under_daily_subtotal() {
+        let daily = ReportOutput::Daily {
+            rows: vec![DailyRow {
+                date: "2025-09-11".to_string(),
+                input_tokens: 120,
+                cached_input_tokens: 20,
+                output_tokens: 80,
+                reasoning_output_tokens: 10,
+                total_tokens: 200,
+                cost_usd: 0.75,
+                models: BTreeMap::from([
+                    (
+                        "gpt-5".to_string(),
+                        ModelBreakdown {
+                            input_tokens: 70,
+                            cached_input_tokens: 10,
+                            output_tokens: 40,
+                            reasoning_output_tokens: 5,
+                            total_tokens: 110,
+                            cost_usd: 0.0,
+                            is_fallback: false,
+                            ..ModelBreakdown::default()
+                        },
+                    ),
+                    (
+                        "gpt-5-codex".to_string(),
+                        ModelBreakdown {
+                            input_tokens: 50,
+                            cached_input_tokens: 10,
+                            output_tokens: 40,
+                            reasoning_output_tokens: 5,
+                            total_tokens: 90,
+                            cost_usd: 0.0,
+                            is_fallback: false,
+                            ..ModelBreakdown::default()
+                        },
+                    ),
+                ]),
+            }],
+            totals: Totals {
+                input_tokens: 120,
+                cached_input_tokens: 20,
+                output_tokens: 80,
+                reasoning_output_tokens: 10,
+                total_tokens: 200,
+                cost_usd: 0.75,
+            },
+            missing_directories: Vec::new(),
+        };
+
+        let rendered = render_report(&daily, "en-US");
+        let subtotal = rendered
+            .lines()
+            .find(|line| line.contains("2025-09-11") && line.contains("TOTAL"))
+            .expect("subtotal row");
+        let gpt5 = rendered
+            .lines()
+            .find(|line| line.contains("gpt-5") && !line.contains("TOTAL"))
+            .expect("gpt-5 row");
+        let codex = rendered
+            .lines()
+            .find(|line| line.contains("gpt-5-codex"))
+            .expect("gpt-5-codex row");
+
+        assert!(subtotal.contains("120"));
+        assert!(!gpt5.contains("2025-09-11"));
+        assert!(gpt5.contains("70"));
+        assert!(codex.contains("50"));
+    }
+
+    #[test]
+    fn render_report_keeps_last_activity_on_session_subtotal_only() {
+        let session = ReportOutput::Session {
+            rows: vec![SessionRow {
+                session_id: "team/session".to_string(),
+                directory: "team".to_string(),
+                session_file: "session".to_string(),
+                last_activity: "2025-09-11T18:00:00.000Z".to_string(),
+                input_tokens: 100,
+                cached_input_tokens: 10,
+                output_tokens: 50,
+                reasoning_output_tokens: 0,
+                total_tokens: 150,
+                cost_usd: 0.25,
+                models: BTreeMap::from([(
+                    "gpt-5".to_string(),
+                    ModelBreakdown {
+                        input_tokens: 100,
+                        cached_input_tokens: 10,
+                        output_tokens: 50,
+                        reasoning_output_tokens: 0,
+                        total_tokens: 150,
+                        cost_usd: 0.0,
+                        is_fallback: false,
+                        ..ModelBreakdown::default()
+                    },
+                )]),
+            }],
+            totals: Totals {
+                input_tokens: 100,
+                cached_input_tokens: 10,
+                output_tokens: 50,
+                reasoning_output_tokens: 0,
+                total_tokens: 150,
+                cost_usd: 0.25,
+            },
+            missing_directories: Vec::new(),
+        };
+
+        let rendered = render_report(&session, "en-US");
+        let subtotal = rendered
+            .lines()
+            .find(|line| line.contains("session") && line.contains("TOTAL"))
+            .expect("subtotal row");
+        let model_row = rendered
+            .lines()
+            .find(|line| line.contains("gpt-5"))
+            .expect("model row");
+
+        assert!(subtotal.contains("2025-09-11T18:00:00.000Z"));
+        assert!(!model_row.contains("2025-09-11T18:00:00.000Z"));
+    }
+
+    #[test]
+    fn render_report_splits_mixed_fallback_and_explicit_usage_for_same_model() {
+        let report = ReportOutput::Daily {
+            rows: vec![DailyRow {
+                date: "2025-09-11".to_string(),
+                input_tokens: 100,
+                cached_input_tokens: 10,
+                output_tokens: 50,
+                reasoning_output_tokens: 0,
+                total_tokens: 150,
+                cost_usd: 0.25,
+                models: BTreeMap::from([(
+                    "gpt-5".to_string(),
+                    ModelBreakdown {
+                        input_tokens: 100,
+                        cached_input_tokens: 10,
+                        output_tokens: 50,
+                        reasoning_output_tokens: 0,
+                        total_tokens: 150,
+                        cost_usd: 0.20,
+                        fallback_usage: UsageTotals {
+                            input: 20,
+                            cached_input: 0,
+                            output: 10,
+                            reasoning_output: 0,
+                            total: 30,
+                        },
+                        fallback_cost_usd: 0.05,
+                        is_fallback: true,
+                    },
+                )]),
+            }],
+            totals: Totals {
+                input_tokens: 100,
+                cached_input_tokens: 10,
+                output_tokens: 50,
+                reasoning_output_tokens: 0,
+                total_tokens: 150,
+                cost_usd: 0.25,
+            },
+            missing_directories: Vec::new(),
+        };
+
+        let rendered = render_report(&report, "en-US");
+        let explicit_row = rendered
+            .lines()
+            .find(|line| line.contains("  gpt-5") && !line.contains("(fallback)"))
+            .expect("explicit row");
+        let fallback_row = rendered
+            .lines()
+            .find(|line| line.contains("  gpt-5 (fallback)"))
+            .expect("fallback row");
+
+        assert!(explicit_row.contains("80"));
+        assert!(explicit_row.contains("$0.20"));
+        assert!(fallback_row.contains("20"));
+        assert!(fallback_row.contains("$0.05"));
+    }
+
+    #[test]
+    fn detect_table_style_requires_tty_and_256_color_support() {
+        assert_eq!(
+            detect_table_style_for(true, Some("xterm-256color"), None, false),
+            TableStyle::Ansi256
+        );
+        assert_eq!(
+            detect_table_style_for(true, Some("xterm-256color"), None, true),
+            TableStyle::Plain
+        );
+        assert_eq!(
+            detect_table_style_for(false, Some("xterm-256color"), None, false),
+            TableStyle::Plain
+        );
+        assert_eq!(
+            detect_table_style_for(true, Some("xterm"), Some("truecolor"), false),
+            TableStyle::Ansi256
+        );
+    }
+
+    #[test]
+    fn detect_border_style_requires_tty_and_utf8_locale() {
+        assert_eq!(
+            detect_border_style_for(true, Some("en_US.UTF-8"), None, None),
+            BorderStyle::Unicode
+        );
+        assert_eq!(
+            detect_border_style_for(true, None, Some("pl_PL.utf8"), None),
+            BorderStyle::Unicode
+        );
+        assert_eq!(
+            detect_border_style_for(true, Some("C"), None, None),
+            BorderStyle::Ascii
+        );
+        assert_eq!(
+            detect_border_style_for(false, Some("en_US.UTF-8"), None, None),
+            BorderStyle::Ascii
+        );
+    }
+
+    #[test]
+    fn unicode_border_helpers_emit_box_drawing_characters() {
+        let headers = ["Date", "Model"];
+        let widths = vec![10, 8];
+        let row = format_data_row(
+            &headers,
+            BorderStyle::Unicode,
+            &widths,
+            &["2025-09-11".to_string(), "TOTAL".to_string()],
+        );
+
+        assert_eq!(
+            table_rule(TableRuleKind::Top, BorderStyle::Unicode, &widths),
+            "┌────────────┬──────────┐"
+        );
+        assert!(row.starts_with('│'));
+        assert!(row.contains(" │ "));
+        assert!(row.ends_with('│'));
+    }
+
+    #[test]
+    fn ascii_border_helpers_preserve_ascii_fallback() {
+        let headers = ["Date", "Model"];
+        let widths = vec![10, 8];
+        let row = format_data_row(
+            &headers,
+            BorderStyle::Ascii,
+            &widths,
+            &["2025-09-11".to_string(), "TOTAL".to_string()],
+        );
+
+        assert_eq!(
+            table_rule(TableRuleKind::Top, BorderStyle::Ascii, &widths),
+            "+------------+----------+"
+        );
+        assert!(row.starts_with('|'));
+        assert!(row.contains(" | "));
+        assert!(row.ends_with('|'));
+    }
+
+    #[test]
+    fn paint_only_emits_ansi_sequences_when_enabled() {
+        let plain = paint(TableStyle::Plain, TableElement::Header, "Header");
+        let styled = paint(TableStyle::Ansi256, TableElement::Header, "Header");
+
+        assert_eq!(plain, "Header");
+        assert!(styled.starts_with("\u{1b}["));
+        assert!(styled.ends_with("\u{1b}[0m"));
+    }
+
+    #[test]
+    fn styled_rows_keep_border_color_separate_from_row_color() {
+        let mut output = String::new();
+        let headers = ["Date", "Model"];
+        let widths = vec![10, 8];
+        let cells = vec!["2025-09-11".to_string(), "TOTAL".to_string()];
+
+        write_table_row(
+            &mut output,
+            TableStyle::Ansi256,
+            BorderStyle::Unicode,
+            &headers,
+            &widths,
+            &cells,
+            TableElement::Subtotal,
+        );
+
+        assert!(output.contains("\u{1b}[38;5;24m│\u{1b}[0m"));
+        assert!(output.contains("\u{1b}[1;38;5;117m 2025-09-11 \u{1b}[0m"));
+        assert!(!output.contains("\u{1b}[1;38;5;117m│"));
     }
 
     #[test]
