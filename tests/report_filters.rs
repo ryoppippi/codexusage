@@ -1,8 +1,8 @@
 use codexusage::app::{
     NumberFormat, ReportKind, ReportOptions, ReportOutput, ScannerParallelism, build_report,
 };
-use std::num::NonZeroUsize;
 use std::fs;
+use std::num::NonZeroUsize;
 use tempfile::TempDir;
 
 fn write_session(temp: &TempDir, relative_path: &str, contents: &str) {
@@ -130,7 +130,8 @@ fn last_days_is_rejected_for_non_daily_reports() {
 
     let mut report_options = options(&temp.path().join("sessions"));
     report_options.last_days = Some(NonZeroUsize::new(2).expect("non-zero"));
-    let error = build_report(ReportKind::Monthly, &report_options).expect_err("monthly should reject last_days");
+    let error = build_report(ReportKind::Monthly, &report_options)
+        .expect_err("monthly should reject last_days");
 
     let rendered = error.to_string();
     assert!(rendered.contains("last_days"));

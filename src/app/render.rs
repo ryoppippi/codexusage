@@ -1,6 +1,6 @@
 use super::{
     DailyRow, ModelBreakdown, MonthlyRow, NumberFormat, ReportOutput, SessionRow, Totals,
-    UsageTotals,
+    UsageTotals, WatchSnapshot,
 };
 use std::collections::BTreeMap;
 use std::env;
@@ -50,6 +50,94 @@ pub(super) fn render_report(
     }
 
     output
+}
+
+/// Render one live watch snapshot.
+pub(super) fn render_watch_screen(
+    snapshot: &WatchSnapshot,
+    _locale: &str,
+    number_format: NumberFormat,
+) -> String {
+    let render_config = TableRenderConfig {
+        style: detect_table_style(),
+        borders: detect_border_style(),
+        number_format,
+    };
+    let mut output = String::new();
+    let _ = writeln!(
+        &mut output,
+        "{}",
+        paint(
+            render_config.style,
+            TableElement::Title,
+            "Current Day Codex Usage Watch"
+        )
+    );
+    let _ = writeln!(
+        &mut output,
+        "Date: {}  Window: {} minutes",
+        snapshot.date, snapshot.burn_rate.window_minutes
+    );
+    let _ = writeln!(&mut output);
+    write_watch_table(&mut output, render_config, snapshot, number_format);
+
+    if !snapshot.missing_directories.is_empty() {
+        let mut warning = String::from("Warning: missing session directories\n");
+        for directory in &snapshot.missing_directories {
+            let _ = writeln!(&mut warning, "- {directory}");
+        }
+        warning.push('\n');
+        warning.push_str(&output);
+        return warning;
+    }
+
+    output
+}
+
+/// Render the watch metrics table.
+fn write_watch_table(
+    output: &mut String,
+    render_config: TableRenderConfig,
+    snapshot: &WatchSnapshot,
+    number_format: NumberFormat,
+) {
+    let headers = ["Metric", "Today", "Burn Rate (/h)"];
+    let rows = watch_rows(snapshot, number_format);
+    let updated_row = DisplayRow {
+        cells: vec![
+            "Updated".to_string(),
+            snapshot.date.clone(),
+            snapshot.updated_time.clone(),
+        ],
+        kind: DisplayRowKind::GrandTotal,
+    };
+    let widths = column_widths(&headers, &rows, &updated_row, number_format);
+
+    write_table_header(output, render_config, &headers, &widths);
+    for row in rows {
+        write_table_row(
+            output,
+            render_config,
+            &headers,
+            &widths,
+            &row.cells,
+            row_table_element(row.kind),
+        );
+    }
+    write_table_row(
+        output,
+        render_config,
+        &headers,
+        &widths,
+        &updated_row.cells,
+        row_table_element(updated_row.kind),
+    );
+    write_table_rule(
+        output,
+        render_config.style,
+        table_rule_element(TableRuleKind::Bottom),
+        &table_rule(TableRuleKind::Bottom, render_config.borders, &widths),
+    );
 }
 
 /// Render the daily report body.
@@ -423,6 +511,56 @@ fn model_display_row(
         cells,
         kind: DisplayRowKind::Detail,
     }
+}
+
+/// Build one metric row for watch mode.
+fn watch_metric_row(metric: &str, today: String, burn_rate: String) -> DisplayRow {
+    DisplayRow {
+        cells: vec![metric.to_string(), today, burn_rate],
+        kind: DisplayRowKind::Subtotal,
+    }
+}
+
+/// Build all metric rows for watch mode.
+fn watch_rows(snapshot: &WatchSnapshot, number_format: NumberFormat) -> Vec<DisplayRow> {
+    vec![
+        watch_metric_row(
+            "Input",
+            format_u64_with(snapshot.totals.input_tokens, number_format),
+            format_u64_with(snapshot.burn_rate.input_tokens_per_hour, number_format),
+        ),
+        watch_metric_row(
+            "Cache",
+            format_u64_with(snapshot.totals.cached_input_tokens, number_format),
+            format_u64_with(
+                snapshot.burn_rate.cached_input_tokens_per_hour,
+                number_format,
+            ),
+        ),
+        watch_metric_row(
+            "Output",
+            format_u64_with(snapshot.totals.output_tokens, number_format),
+            format_u64_with(snapshot.burn_rate.output_tokens_per_hour, number_format),
+        ),
+        watch_metric_row(
+            "Reasoning",
+            format_u64_with(snapshot.totals.reasoning_output_tokens, number_format),
+            format_u64_with(
+                snapshot.burn_rate.reasoning_output_tokens_per_hour,
+                number_format,
+            ),
+        ),
+        watch_metric_row(
+            "Total",
+            format_u64_with(snapshot.totals.total_tokens, number_format),
+            format_u64_with(snapshot.burn_rate.total_tokens_per_hour, number_format),
+        ),
+        watch_metric_row(
+            "Cost",
+            format_currency(snapshot.totals.cost_usd),
+            format_currency(snapshot.burn_rate.cost_usd_per_hour),
+        ),
+    ]
 }
 
 /// Return the explicit portion of a mixed model breakdown.

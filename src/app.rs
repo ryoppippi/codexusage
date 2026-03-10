@@ -1,27 +1,36 @@
 //! CLI orchestration and report building.
 
-use crate::pricing::{Pricing, PricingCatalog, PricingLoadOptions, load_pricing_catalog};
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use crate::pricing::{
+    CacheDecision, Pricing, PricingCatalog, PricingLoadOptions, decide_cache_action,
+    default_cache_path, load_pricing_catalog,
+};
+use chrono::{DateTime, Days, LocalResult, NaiveDate, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 use clap::{Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, eyre};
+use notify::{
+    Config as NotifyConfig, Event as NotifyEvent, EventKind as NotifyEventKind, PollWatcher,
+    RecommendedWatcher, RecursiveMode, Watcher,
+    event::{DataChange, ModifyKind},
+};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, IsTerminal, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Human-readable table rendering helpers.
 #[path = "app/render.rs"]
 mod render;
 
-use render::{explicit_usage, render_report};
+use render::{explicit_usage, render_report, render_watch_screen};
 
 #[cfg(test)]
 use render::{
@@ -207,6 +216,66 @@ pub struct Totals {
     pub cost_usd: f64,
 }
 
+/// Watch-only CLI-free options.
+#[derive(Clone, Debug)]
+struct WatchOptions {
+    /// IANA timezone name.
+    timezone: String,
+    /// Output locale hint.
+    locale: String,
+    /// Human-readable number formatting mode.
+    number_format: NumberFormat,
+    /// Disable network pricing refreshes.
+    offline: bool,
+    /// Force pricing refresh even when cache is fresh.
+    refresh_pricing: bool,
+    /// Session directories to scan.
+    session_dirs: Vec<PathBuf>,
+    /// Scanner worker configuration.
+    parallelism: ScannerParallelism,
+    /// Refresh interval for the live screen.
+    interval: Duration,
+}
+
+/// Rolling burn-rate metrics for watch mode.
+#[derive(Clone, Debug, PartialEq)]
+struct BurnRateSnapshot {
+    /// Effective rolling window width after current-day clamping.
+    window_minutes: u64,
+    /// Input tokens per hour.
+    input_tokens_per_hour: u64,
+    /// Cached input tokens per hour.
+    cached_input_tokens_per_hour: u64,
+    /// Output tokens per hour.
+    output_tokens_per_hour: u64,
+    /// Reasoning output tokens per hour.
+    reasoning_output_tokens_per_hour: u64,
+    /// Total billable tokens per hour.
+    total_tokens_per_hour: u64,
+    /// Cost in USD per hour.
+    cost_usd_per_hour: f64,
+}
+
+/// One rendered watch snapshot.
+#[derive(Clone, Debug, PartialEq)]
+struct WatchSnapshot {
+    /// Current day in the selected timezone.
+    date: String,
+    /// Current-day cumulative totals.
+    totals: Totals,
+    /// Rolling burn-rate summary.
+    burn_rate: BurnRateSnapshot,
+    /// Missing directories encountered during scan.
+    missing_directories: Vec<String>,
+    /// Last refresh time in the selected timezone.
+    updated_time: String,
+}
+
+/// How often watch mode should rediscover new or renamed session files.
+const WATCH_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+/// Polling cadence used when native filesystem notifications are unavailable.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Result of a report command.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -266,6 +335,434 @@ pub fn build_report(kind: ReportKind, options: &ReportOptions) -> Result<ReportO
     builder.finish(&pricing, missing_directories)
 }
 
+/// Build one watch snapshot at a fixed logical time.
+#[cfg(test)]
+fn build_watch_snapshot_at(
+    options: &WatchOptions,
+    now_utc: DateTime<Utc>,
+) -> Result<WatchSnapshot> {
+    let pricing = load_pricing_catalog(&PricingLoadOptions {
+        offline: options.offline,
+        force_refresh: options.refresh_pricing,
+    })?;
+    build_watch_snapshot_with_pricing_at(options, now_utc, &pricing)
+}
+
+/// Build one watch snapshot with an already loaded pricing catalog.
+#[cfg(test)]
+fn build_watch_snapshot_with_pricing_at(
+    options: &WatchOptions,
+    now_utc: DateTime<Utc>,
+    pricing: &PricingCatalog,
+) -> Result<WatchSnapshot> {
+    let timezone = parse_timezone(&options.timezone)?;
+    let session_dirs = resolve_session_dirs(&options.session_dirs);
+    let (missing_directories, selected_files) = collect_session_scan_targets(&session_dirs)?;
+    let builder = scan_watch_targets(&selected_files, options.parallelism, timezone, now_utc)?;
+    Ok(builder.finish(pricing, missing_directories))
+}
+
+/// Validate global flags that conflict with the watch contract.
+fn validate_watch_flags(
+    json: bool,
+    since: Option<&str>,
+    until: Option<&str>,
+    last_days: Option<NonZeroUsize>,
+) -> Result<()> {
+    if json {
+        return Err(eyre!("watch mode does not support --json"));
+    }
+    if since.is_some() || until.is_some() || last_days.is_some() {
+        return Err(eyre!(
+            "watch mode only supports the current day and cannot be combined with --since, --until, or --last-days"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Pending filesystem changes observed by the watch backend.
+#[derive(Default)]
+struct WatchChangeSet {
+    /// Stable session identifiers that need to be refreshed and how aggressively to refresh them.
+    dirty_sessions: HashMap<String, WatchDirtyKind>,
+    /// Whether the full session tree should be rediscovered.
+    discovery_due: bool,
+}
+
+/// Refresh policy selected for one dirty watched session.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum WatchDirtyKind {
+    /// The file only grew, so the parser checkpoint can resume from the prior EOF.
+    AppendOnly,
+    /// The file may have been rewritten, renamed, created, or deleted; rebuild it from scratch.
+    FullRebuild,
+}
+
+impl WatchChangeSet {
+    /// Mark the provided session identifiers dirty, keeping the most conservative refresh mode.
+    fn mark_dirty_sessions(
+        &mut self,
+        session_ids: impl IntoIterator<Item = String>,
+        dirty_kind: WatchDirtyKind,
+    ) {
+        for session_id in session_ids {
+            self.dirty_sessions
+                .entry(session_id)
+                .and_modify(|existing| *existing = (*existing).max(dirty_kind))
+                .or_insert(dirty_kind);
+        }
+    }
+}
+
+/// Concrete filesystem watcher kept alive for the duration of watch mode.
+enum ActiveWatchWatcher {
+    /// Native watcher provided by `notify`.
+    Recommended(RecommendedWatcher),
+    /// Polling fallback when native notifications are unavailable.
+    Poll(PollWatcher),
+}
+
+impl ActiveWatchWatcher {
+    /// Register one root for recursive monitoring.
+    fn watch(&mut self, path: &Path) -> notify::Result<()> {
+        match self {
+            Self::Recommended(watcher) => watcher.watch(path, RecursiveMode::Recursive),
+            Self::Poll(watcher) => watcher.watch(path, RecursiveMode::Recursive),
+        }
+    }
+
+    /// Remove one root from recursive monitoring.
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        match self {
+            Self::Recommended(watcher) => watcher.unwatch(path),
+            Self::Poll(watcher) => watcher.unwatch(path),
+        }
+    }
+}
+
+/// Filesystem event source that marks dirty sessions between watch refreshes.
+struct WatchEventSource {
+    /// Active watcher backend.
+    watcher: ActiveWatchWatcher,
+    /// Cross-thread notification channel fed by `notify`.
+    receiver: mpsc::Receiver<notify::Result<NotifyEvent>>,
+    /// Roots currently registered with the watcher.
+    watched_roots: HashSet<PathBuf>,
+}
+
+impl WatchEventSource {
+    /// Build the watcher backend and register all existing session roots.
+    fn new(session_dirs: &[PathBuf]) -> Result<Self> {
+        if let Some(source) = Self::new_recommended(session_dirs) {
+            return Ok(source);
+        }
+
+        Self::new_polling(session_dirs)
+    }
+
+    /// Try to build a native watcher and register all existing session roots.
+    fn new_recommended(session_dirs: &[PathBuf]) -> Option<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let watcher = match RecommendedWatcher::new(
+            move |event| {
+                let _ = sender.send(event);
+            },
+            NotifyConfig::default(),
+        ) {
+            Ok(watcher) => watcher,
+            Err(_error) => return None,
+        };
+
+        let mut source = Self {
+            watcher: ActiveWatchWatcher::Recommended(watcher),
+            receiver,
+            watched_roots: HashSet::new(),
+        };
+        match source.sync_session_dirs(session_dirs) {
+            Ok(_discovered_new_root) => Some(source),
+            Err(_error) => None,
+        }
+    }
+
+    /// Build the polling fallback watcher and register all existing session roots.
+    fn new_polling(session_dirs: &[PathBuf]) -> Result<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let watcher = PollWatcher::new(
+            move |event| {
+                let _ = sender.send(event);
+            },
+            NotifyConfig::default().with_poll_interval(WATCH_POLL_INTERVAL),
+        )?;
+        let mut source = Self {
+            watcher: ActiveWatchWatcher::Poll(watcher),
+            receiver,
+            watched_roots: HashSet::new(),
+        };
+        let _ = source.sync_session_dirs(session_dirs)?;
+        Ok(source)
+    }
+
+    /// Keep the registered watcher roots aligned with the configured session directories.
+    fn sync_session_dirs(&mut self, session_dirs: &[PathBuf]) -> Result<bool> {
+        let mut desired_roots = HashSet::new();
+        let mut discovered_new_root = false;
+        for directory in session_dirs {
+            match fs::metadata(directory) {
+                Ok(metadata) if metadata.is_dir() => {
+                    desired_roots.insert(directory.clone());
+                    if self.watched_roots.insert(directory.clone()) {
+                        discovered_new_root = true;
+                        self.watcher.watch(directory).wrap_err_with(|| {
+                            format!("failed to watch session directory {}", directory.display())
+                        })?;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!("failed to access session directory {}", directory.display())
+                    });
+                }
+            }
+        }
+
+        let stale_roots = self
+            .watched_roots
+            .iter()
+            .filter(|path| !desired_roots.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for stale_root in stale_roots {
+            let _ = self.watcher.unwatch(&stale_root);
+            self.watched_roots.remove(&stale_root);
+        }
+
+        Ok(discovered_new_root)
+    }
+
+    /// Drain all pending watcher notifications into the current refresh batch.
+    fn drain_changes(&mut self, session_dirs: &[PathBuf]) -> WatchChangeSet {
+        let mut changes = WatchChangeSet::default();
+        while let Ok(event) = self.receiver.try_recv() {
+            match event {
+                Ok(event) => Self::apply_event(session_dirs, &event, &mut changes),
+                Err(_error) => changes.discovery_due = true,
+            }
+        }
+        changes
+    }
+
+    /// Translate one `notify` event into dirty session identifiers.
+    fn apply_event(session_dirs: &[PathBuf], event: &NotifyEvent, changes: &mut WatchChangeSet) {
+        if matches!(event.kind, NotifyEventKind::Access(_)) {
+            return;
+        }
+
+        let dirty_kind = watch_dirty_kind(event.kind);
+        if event.paths.len() > 1 {
+            changes.discovery_due = true;
+        }
+
+        for path in &event.paths {
+            let session_ids = watch_event_session_ids(session_dirs, path);
+            if !session_ids.is_empty() {
+                changes.mark_dirty_sessions(session_ids, dirty_kind);
+            } else if path_is_under_roots(session_dirs, path) {
+                changes.discovery_due = true;
+            }
+        }
+    }
+}
+
+/// Map a filesystem event to the safest incremental refresh mode.
+fn watch_dirty_kind(event_kind: NotifyEventKind) -> WatchDirtyKind {
+    match event_kind {
+        NotifyEventKind::Modify(ModifyKind::Data(DataChange::Size)) => WatchDirtyKind::AppendOnly,
+        _ => WatchDirtyKind::FullRebuild,
+    }
+}
+
+/// Return whether the path falls under one of the configured session roots.
+fn path_is_under_roots(session_dirs: &[PathBuf], path: &Path) -> bool {
+    session_dirs.iter().any(|root| path.starts_with(root))
+}
+
+/// Resolve every stable session identifier that a watcher event path can map to.
+fn watch_event_session_ids(session_dirs: &[PathBuf], path: &Path) -> Vec<String> {
+    if !path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+    {
+        return Vec::new();
+    }
+
+    session_dirs
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .map(|root| session_file_id(root, path))
+        .collect()
+}
+
+/// Run the live watch loop until interrupted.
+fn run_watch_loop(options: &WatchOptions) -> Result<()> {
+    if !std::io::stdout().is_terminal() {
+        return Err(eyre!("watch mode requires a terminal stdout"));
+    }
+
+    let pricing_cache_path = default_cache_path();
+    let now = SystemTime::now();
+    let startup_refresh_attempted = if options.offline {
+        false
+    } else if options.refresh_pricing {
+        true
+    } else {
+        decide_cache_action(
+            &pricing_cache_path,
+            now,
+            Duration::from_hours(24),
+            options.offline,
+            false,
+        )? == CacheDecision::Refresh
+    };
+    let mut pricing = load_pricing_catalog(&PricingLoadOptions {
+        offline: options.offline,
+        force_refresh: options.refresh_pricing,
+    })?;
+    let timezone = parse_timezone(&options.timezone)?;
+    let session_dirs = resolve_session_dirs(&options.session_dirs);
+    let mut watch_events = WatchEventSource::new(&session_dirs)?;
+    let mut runtime =
+        WatchRuntimeState::load(&session_dirs, options.parallelism, timezone, Utc::now())?;
+    let mut last_pricing_refresh_attempt_at = startup_refresh_attempted.then_some(now);
+    let should_clear = supports_watch_screen_clear(std::env::var("TERM").ok().as_deref());
+    if !should_clear {
+        return Err(eyre!(
+            "watch mode requires a terminal with ANSI screen-clearing support"
+        ));
+    }
+    let mut stdout = std::io::stdout().lock();
+    loop {
+        let loop_started_at = Instant::now();
+        let now = SystemTime::now();
+        let snapshot_now = Utc::now();
+        let discovered_new_root = watch_events.sync_session_dirs(&session_dirs)?;
+        if watch_pricing_refresh_due(
+            &pricing_cache_path,
+            now,
+            options.offline,
+            last_pricing_refresh_attempt_at,
+        )? {
+            pricing = load_pricing_catalog(&PricingLoadOptions {
+                offline: options.offline,
+                force_refresh: false,
+            })?;
+            last_pricing_refresh_attempt_at = Some(now);
+        }
+        let mut changes = watch_events.drain_changes(&session_dirs);
+        changes.discovery_due |= discovered_new_root;
+        runtime.refresh(
+            &session_dirs,
+            options.parallelism,
+            timezone,
+            snapshot_now,
+            changes,
+        )?;
+        let snapshot = runtime.snapshot(&pricing, snapshot_now)?;
+        stdout.write_all(b"\x1b[2J\x1b[H")?;
+        stdout.write_all(
+            render_watch_screen(&snapshot, &options.locale, options.number_format).as_bytes(),
+        )?;
+        stdout.flush()?;
+        thread::sleep(remaining_watch_sleep(
+            options.interval,
+            loop_started_at.elapsed(),
+        ));
+    }
+}
+
+/// Decide whether the terminal should receive ANSI clear-screen sequences.
+fn supports_watch_screen_clear(term: Option<&str>) -> bool {
+    supports_watch_screen_clear_with_platform(term, cfg!(windows), windows_stdout_supports_ansi())
+}
+
+/// Decide whether the terminal should receive ANSI clear-screen sequences.
+fn supports_watch_screen_clear_with_platform(
+    term: Option<&str>,
+    is_windows: bool,
+    windows_stdout_supports_ansi: bool,
+) -> bool {
+    if term == Some("dumb") {
+        return false;
+    }
+
+    if !is_windows {
+        return true;
+    }
+
+    term.is_some() || windows_stdout_supports_ansi
+}
+
+/// Check whether the active Windows stdout console supports ANSI clear-screen sequences.
+#[cfg(windows)]
+fn windows_stdout_supports_ansi() -> bool {
+    type Bool = i32;
+    type Dword = u32;
+    type Handle = *mut std::ffi::c_void;
+
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: Dword = 0x0004;
+    const STD_OUTPUT_HANDLE: Dword = (-11_i32) as Dword;
+
+    unsafe extern "system" {
+        fn GetStdHandle(n_std_handle: Dword) -> Handle;
+        fn GetConsoleMode(handle: Handle, mode: *mut Dword) -> Bool;
+        fn SetConsoleMode(handle: Handle, mode: Dword) -> Bool;
+    }
+
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() || handle as isize == -1 {
+            return false;
+        }
+
+        let mut mode = 0;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return false;
+        }
+        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+            return true;
+        }
+
+        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
+/// Non-Windows platforms rely on TERM and TTY detection instead of console probing.
+#[cfg(not(windows))]
+fn windows_stdout_supports_ansi() -> bool {
+    false
+}
+
+/// Decide whether watch mode should refresh pricing before the next redraw.
+fn watch_pricing_refresh_due(
+    cache_path: &Path,
+    now: SystemTime,
+    offline: bool,
+    last_refresh_attempt_at: Option<SystemTime>,
+) -> Result<bool> {
+    let decision = decide_cache_action(cache_path, now, Duration::from_hours(24), offline, false)?;
+    if decision != CacheDecision::Refresh {
+        return Ok(false);
+    }
+
+    Ok(last_refresh_attempt_at.is_none_or(|attempted_at| {
+        now.duration_since(attempted_at)
+            .is_ok_and(|elapsed| elapsed >= Duration::from_mins(5))
+    }))
+}
+
 /// Run the CLI.
 ///
 /// # Errors
@@ -275,34 +772,66 @@ pub fn run<I>(args: I) -> Result<()>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let cli = Cli::parse_from(args);
-    let command = cli.command.unwrap_or_default();
-    let kind = ReportKind::from(&command);
-    let options = ReportOptions {
-        since: cli.since,
-        until: cli.until,
-        last_days: cli.last_days,
-        timezone: cli.timezone.unwrap_or_else(default_timezone_name),
-        locale: cli.locale,
-        number_format: cli.number_format,
-        json: cli.json,
-        offline: cli.offline,
-        refresh_pricing: cli.refresh_pricing,
-        session_dirs: cli.session_dir,
-        parallelism: cli
-            .threads
-            .map_or(ScannerParallelism::Auto, ScannerParallelism::Fixed),
-    };
-    let output = build_report(kind, &options)?;
-    if cli.json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        println!(
-            "{}",
-            render_report(&output, &options.locale, options.number_format)
-        );
+    let Cli {
+        json,
+        since,
+        until,
+        last_days,
+        timezone,
+        locale,
+        number_format,
+        offline,
+        refresh_pricing,
+        session_dir,
+        threads,
+        command,
+    } = Cli::parse_from(args);
+    let timezone = timezone.unwrap_or_else(default_timezone_name);
+    let parallelism = threads.map_or(ScannerParallelism::Auto, ScannerParallelism::Fixed);
+
+    match command {
+        Some(Command::Watch { interval }) => {
+            validate_watch_flags(json, since.as_deref(), until.as_deref(), last_days)?;
+            run_watch_loop(&WatchOptions {
+                timezone,
+                locale,
+                number_format,
+                offline,
+                refresh_pricing,
+                session_dirs: session_dir,
+                parallelism,
+                interval,
+            })
+        }
+        command => {
+            let kind = command
+                .as_ref()
+                .map_or(ReportKind::Daily, ReportKind::from_command);
+            let options = ReportOptions {
+                since,
+                until,
+                last_days,
+                timezone,
+                locale,
+                number_format,
+                json,
+                offline,
+                refresh_pricing,
+                session_dirs: session_dir,
+                parallelism,
+            };
+            let output = build_report(kind, &options)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!(
+                    "{}",
+                    render_report(&output, &options.locale, options.number_format)
+                );
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Command-line interface for the binary.
@@ -368,16 +897,36 @@ enum Command {
     Monthly,
     /// Group usage by session.
     Session,
+    /// Continuously monitor current-day usage and a rolling burn rate.
+    Watch {
+        /// Refresh interval in seconds.
+        #[arg(long, value_name = "SECONDS", default_value = "5", value_parser = parse_interval_seconds)]
+        interval: Duration,
+    },
 }
 
-impl From<&Command> for ReportKind {
-    fn from(value: &Command) -> Self {
+impl ReportKind {
+    /// Convert a report-bearing command into its output kind.
+    fn from_command(value: &Command) -> Self {
         match value {
             Command::Daily => Self::Daily,
             Command::Monthly => Self::Monthly,
             Command::Session => Self::Session,
+            Command::Watch { .. } => unreachable!("watch mode does not map to ReportKind"),
         }
     }
+}
+
+/// Parse a positive refresh interval in seconds.
+fn parse_interval_seconds(value: &str) -> std::result::Result<Duration, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid interval {value}; expected a positive integer"))?;
+    if seconds == 0 {
+        return Err("interval must be greater than 0 seconds".to_string());
+    }
+
+    Ok(Duration::from_secs(seconds))
 }
 
 /// Whether a bool is false.
@@ -610,6 +1159,15 @@ impl UsageTotals {
         self.output += other.output;
         self.reasoning_output += other.reasoning_output;
         self.total += other.total;
+    }
+
+    /// Remove one event.
+    fn subtract(&mut self, other: &UsageTotals) {
+        self.input = self.input.saturating_sub(other.input);
+        self.cached_input = self.cached_input.saturating_sub(other.cached_input);
+        self.output = self.output.saturating_sub(other.output);
+        self.reasoning_output = self.reasoning_output.saturating_sub(other.reasoning_output);
+        self.total = self.total.saturating_sub(other.total);
     }
 
     /// Return whether this usage bucket contains any billable activity.
@@ -1458,6 +2016,809 @@ impl ReportBuilder {
     }
 }
 
+/// Shared metadata needed to render one watch snapshot.
+struct WatchSnapshotContext {
+    /// Grouping timezone.
+    timezone: Tz,
+    /// Current day in the selected timezone.
+    current_day: NaiveDate,
+    /// Inclusive UTC upper bound for the rolling window.
+    now_utc: DateTime<Utc>,
+    /// Effective rolling window duration after clamping to the current day.
+    window_duration: Duration,
+}
+
+impl WatchSnapshotContext {
+    /// Build the snapshot context for one logical watch timestamp.
+    fn new(timezone: Tz, now_utc: DateTime<Utc>) -> Result<Self> {
+        let current_day = now_utc.with_timezone(&timezone).date_naive();
+        let window_duration = now_utc
+            .signed_duration_since(watch_window_start_utc(timezone, now_utc)?)
+            .to_std()
+            .unwrap_or_default();
+
+        Ok(Self {
+            timezone,
+            current_day,
+            now_utc,
+            window_duration,
+        })
+    }
+
+    /// Build one rendered snapshot from already aggregated summaries.
+    fn finish(
+        &self,
+        current_day_summary: &GroupSummary,
+        burn_window_summary: &GroupSummary,
+        pricing: &PricingCatalog,
+        missing_directories: Vec<String>,
+    ) -> WatchSnapshot {
+        let current_day_cost = calculate_summary_cost(&current_day_summary.models, pricing);
+        let burn_cost = calculate_summary_cost(&burn_window_summary.models, pricing);
+        let totals = Totals {
+            input_tokens: current_day_summary.totals.input,
+            cached_input_tokens: current_day_summary.totals.cached_input,
+            output_tokens: current_day_summary.totals.output,
+            reasoning_output_tokens: current_day_summary.totals.reasoning_output,
+            total_tokens: current_day_summary.totals.total,
+            cost_usd: current_day_cost,
+        };
+
+        WatchSnapshot {
+            date: self.current_day.format("%Y-%m-%d").to_string(),
+            totals,
+            burn_rate: BurnRateSnapshot {
+                window_minutes: display_window_minutes(self.window_duration),
+                input_tokens_per_hour: scale_usage_per_hour(
+                    burn_window_summary.totals.input,
+                    self.window_duration,
+                ),
+                cached_input_tokens_per_hour: scale_usage_per_hour(
+                    burn_window_summary.totals.cached_input,
+                    self.window_duration,
+                ),
+                output_tokens_per_hour: scale_usage_per_hour(
+                    burn_window_summary.totals.output,
+                    self.window_duration,
+                ),
+                reasoning_output_tokens_per_hour: scale_usage_per_hour(
+                    burn_window_summary.totals.reasoning_output,
+                    self.window_duration,
+                ),
+                total_tokens_per_hour: scale_usage_per_hour(
+                    burn_window_summary.totals.total,
+                    self.window_duration,
+                ),
+                cost_usd_per_hour: scale_cost_per_hour(burn_cost, self.window_duration),
+            },
+            missing_directories,
+            updated_time: self
+                .now_utc
+                .with_timezone(&self.timezone)
+                .format("%H:%M:%S")
+                .to_string(),
+        }
+    }
+}
+
+/// Builder for one live watch snapshot.
+#[cfg(test)]
+struct WatchBuilder {
+    /// Shared snapshot rendering context.
+    snapshot_context: WatchSnapshotContext,
+    /// Inclusive UTC lower bound for the rolling window.
+    window_start_utc: DateTime<Utc>,
+    /// Current-day cumulative usage.
+    current_day_summary: GroupSummary,
+    /// Bounded rolling-window usage.
+    burn_window_summary: GroupSummary,
+}
+
+#[cfg(test)]
+impl WatchBuilder {
+    /// Create a new builder.
+    fn new(timezone: Tz, now_utc: DateTime<Utc>) -> Result<Self> {
+        Ok(Self {
+            snapshot_context: WatchSnapshotContext::new(timezone, now_utc)?,
+            window_start_utc: watch_window_start_utc(timezone, now_utc)?,
+            current_day_summary: GroupSummary::default(),
+            burn_window_summary: GroupSummary::default(),
+        })
+    }
+
+    /// Observe one event.
+    fn observe(&mut self, event: &TokenUsageEvent<'_, '_>) {
+        if event.timestamp_utc > self.snapshot_context.now_utc {
+            return;
+        }
+
+        let local = event
+            .timestamp_utc
+            .with_timezone(&self.snapshot_context.timezone);
+        if local.date_naive() != self.snapshot_context.current_day {
+            return;
+        }
+
+        push_event_into_summary(&mut self.current_day_summary, event);
+        if event.timestamp_utc >= self.window_start_utc {
+            push_event_into_summary(&mut self.burn_window_summary, event);
+        }
+    }
+
+    /// Merge another watch builder into this one.
+    fn merge(&mut self, other: Self) {
+        debug_assert_eq!(
+            self.snapshot_context.timezone, other.snapshot_context.timezone,
+            "parallel scan chunks must preserve watch timezone",
+        );
+        debug_assert_eq!(
+            self.snapshot_context.current_day, other.snapshot_context.current_day,
+            "parallel scan chunks must preserve watch day",
+        );
+        debug_assert_eq!(
+            self.window_start_utc, other.window_start_utc,
+            "parallel scan chunks must preserve watch window start",
+        );
+        debug_assert_eq!(
+            self.snapshot_context.now_utc, other.snapshot_context.now_utc,
+            "parallel scan chunks must preserve watch now",
+        );
+
+        merge_group_summary(&mut self.current_day_summary, other.current_day_summary);
+        merge_group_summary(&mut self.burn_window_summary, other.burn_window_summary);
+    }
+
+    /// Finish the snapshot.
+    fn finish(self, pricing: &PricingCatalog, missing_directories: Vec<String>) -> WatchSnapshot {
+        self.snapshot_context.finish(
+            &self.current_day_summary,
+            &self.burn_window_summary,
+            pricing,
+            missing_directories,
+        )
+    }
+}
+
+/// Resolve the UTC start of the rolling watch window for one logical timestamp.
+fn watch_window_start_utc(timezone: Tz, now_utc: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let current_day = now_utc.with_timezone(&timezone).date_naive();
+    let day_start_utc = resolve_local_midnight_utc(timezone, current_day)?;
+    let hour_ago = now_utc
+        .checked_sub_signed(TimeDelta::hours(1))
+        .ok_or_else(|| eyre!("watch window underflowed the supported timestamp range"))?;
+    Ok(hour_ago.max(day_start_utc))
+}
+
+/// One owned usage event cached for watch-mode refreshes.
+#[derive(Clone, Debug)]
+struct OwnedWatchEvent {
+    /// Event timestamp in UTC.
+    timestamp_utc: DateTime<Utc>,
+    /// Resolved model name.
+    model: String,
+    /// Whether the model was inferred from fallback metadata.
+    is_fallback_model: bool,
+    /// Normalized usage delta.
+    usage: UsageTotals,
+}
+
+/// Incremental parser checkpoint reused when a watch file grows by appending new lines.
+#[derive(Clone, Debug, Default)]
+struct SessionParseCheckpoint {
+    /// Byte offset of the next unread position in the file.
+    offset: u64,
+    /// Previous cumulative usage totals needed to normalize future events.
+    previous_totals: Option<RawUsage>,
+    /// Last resolved model name.
+    current_model: Option<String>,
+    /// Whether the remembered model came from fallback inference.
+    current_model_is_fallback: bool,
+}
+
+/// Cached current-day contribution for one selected session file.
+#[derive(Clone, Debug)]
+struct CachedWatchFile {
+    /// Metadata used to detect whether the file changed since the previous refresh.
+    target: SessionScanTarget,
+    /// Current-day events already parsed from the file.
+    current_day_events: Vec<OwnedWatchEvent>,
+    /// Incremental parser state at the end of the file.
+    parser_checkpoint: SessionParseCheckpoint,
+    /// Number of cached current-day events that are visible at the current watch timestamp.
+    visible_end: usize,
+    /// Index of the first event still inside the rolling burn window.
+    burn_start: usize,
+}
+
+impl CachedWatchFile {
+    /// Build one cached file from a full file scan.
+    fn from_full_scan(
+        target: SessionScanTarget,
+        parser_checkpoint: SessionParseCheckpoint,
+        mut current_day_events: Vec<OwnedWatchEvent>,
+        window_start_utc: DateTime<Utc>,
+        now_utc: DateTime<Utc>,
+    ) -> Self {
+        current_day_events.sort_unstable_by_key(|event| event.timestamp_utc);
+        let mut cached = Self {
+            target,
+            current_day_events,
+            parser_checkpoint,
+            visible_end: 0,
+            burn_start: 0,
+        };
+        cached.recompute_bounds(window_start_utc, now_utc);
+        cached
+    }
+
+    /// Return the current-day events visible at the current watch timestamp.
+    fn visible_events(&self) -> &[OwnedWatchEvent] {
+        &self.current_day_events[..self.visible_end]
+    }
+
+    /// Return only the visible events that still fall inside the rolling watch window.
+    fn burn_events(&self) -> &[OwnedWatchEvent] {
+        &self.current_day_events[self.burn_start..self.visible_end]
+    }
+
+    /// Recompute visibility and burn-window bounds for the provided logical timestamp.
+    fn recompute_bounds(&mut self, window_start_utc: DateTime<Utc>, now_utc: DateTime<Utc>) {
+        self.visible_end = self
+            .current_day_events
+            .partition_point(|event| event.timestamp_utc <= now_utc);
+        self.burn_start = self.current_day_events[..self.visible_end]
+            .partition_point(|event| event.timestamp_utc < window_start_utc);
+    }
+}
+
+/// Cached watch-mode state reused between refreshes.
+struct WatchRuntimeState {
+    /// Grouping timezone.
+    timezone: Tz,
+    /// Current day covered by the cached events.
+    current_day: NaiveDate,
+    /// Missing session roots from the last discovery pass.
+    missing_directories: Vec<String>,
+    /// Selected targets currently tracked by watch mode.
+    selected_targets: HashMap<String, SessionScanTarget>,
+    /// Current-day events keyed by stable session identifier.
+    cached_files: HashMap<String, CachedWatchFile>,
+    /// Current-day totals visible at `last_snapshot_utc`.
+    current_day_summary: GroupSummary,
+    /// Rolling burn-window totals visible at `last_snapshot_utc`.
+    burn_window_summary: GroupSummary,
+    /// Logical timestamp used to build the cached summaries.
+    last_snapshot_utc: Option<DateTime<Utc>>,
+    /// Next time watch mode should rediscover the session tree.
+    next_discovery_at: Option<Instant>,
+}
+
+impl WatchRuntimeState {
+    /// Load the initial runtime state.
+    fn load(
+        session_dirs: &[PathBuf],
+        parallelism: ScannerParallelism,
+        timezone: Tz,
+        now_utc: DateTime<Utc>,
+    ) -> Result<Self> {
+        let mut state = Self {
+            timezone,
+            current_day: now_utc.with_timezone(&timezone).date_naive(),
+            missing_directories: Vec::new(),
+            selected_targets: HashMap::new(),
+            cached_files: HashMap::new(),
+            current_day_summary: GroupSummary::default(),
+            burn_window_summary: GroupSummary::default(),
+            last_snapshot_utc: None,
+            next_discovery_at: None,
+        };
+        state.refresh(
+            session_dirs,
+            parallelism,
+            timezone,
+            now_utc,
+            WatchChangeSet {
+                dirty_sessions: HashMap::new(),
+                discovery_due: true,
+            },
+        )?;
+        Ok(state)
+    }
+
+    /// Refresh cached file data for the current watch tick.
+    fn refresh(
+        &mut self,
+        session_dirs: &[PathBuf],
+        parallelism: ScannerParallelism,
+        timezone: Tz,
+        now_utc: DateTime<Utc>,
+        mut changes: WatchChangeSet,
+    ) -> Result<()> {
+        let current_day = now_utc.with_timezone(&timezone).date_naive();
+        if current_day != self.current_day {
+            self.current_day = current_day;
+            self.selected_targets.clear();
+            self.cached_files.clear();
+            self.current_day_summary = GroupSummary::default();
+            self.burn_window_summary = GroupSummary::default();
+            self.last_snapshot_utc = None;
+            self.next_discovery_at = None;
+            changes.discovery_due = true;
+        }
+
+        self.advance_to(now_utc)?;
+
+        let refresh_started_at = Instant::now();
+        let discovery_due = changes.discovery_due
+            || self
+                .next_discovery_at
+                .is_none_or(|deadline| refresh_started_at >= deadline);
+        if discovery_due {
+            let (missing_directories, selected_files) = collect_session_scan_targets(session_dirs)?;
+            self.missing_directories = missing_directories;
+            self.next_discovery_at = Some(refresh_started_at + WATCH_DISCOVERY_INTERVAL);
+            self.refresh_discovered_targets(
+                parallelism,
+                timezone,
+                now_utc,
+                selected_files,
+                &changes.dirty_sessions,
+            )?;
+        } else {
+            self.missing_directories = collect_missing_session_dirs(session_dirs)?;
+            for (session_id, dirty_kind) in changes.dirty_sessions {
+                let resolved = resolve_session_target_across_roots(session_dirs, &session_id)?;
+                self.refresh_dirty_session(session_id, resolved, dirty_kind, timezone, now_utc)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Advance cached file bounds and aggregate totals to the provided logical timestamp.
+    fn advance_to(&mut self, now_utc: DateTime<Utc>) -> Result<()> {
+        let Some(previous_now_utc) = self.last_snapshot_utc else {
+            self.rebuild_summaries_at(now_utc)?;
+            return Ok(());
+        };
+        if now_utc < previous_now_utc {
+            self.rebuild_summaries_at(now_utc)?;
+            return Ok(());
+        }
+
+        let window_start_utc = watch_window_start_utc(self.timezone, now_utc)?;
+        for cached_file in self.cached_files.values_mut() {
+            let previous_visible_end = cached_file.visible_end;
+            let previous_burn_start = cached_file.burn_start;
+            cached_file.recompute_bounds(window_start_utc, now_utc);
+
+            for event in
+                &cached_file.current_day_events[previous_visible_end..cached_file.visible_end]
+            {
+                push_owned_watch_event_into_summary(&mut self.current_day_summary, event);
+                if event.timestamp_utc >= window_start_utc {
+                    push_owned_watch_event_into_summary(&mut self.burn_window_summary, event);
+                }
+            }
+            for event in
+                &cached_file.current_day_events[previous_burn_start..cached_file.burn_start]
+            {
+                remove_owned_watch_event_from_summary(&mut self.burn_window_summary, event);
+            }
+        }
+        self.last_snapshot_utc = Some(now_utc);
+        Ok(())
+    }
+
+    /// Rebuild aggregate summaries from the cached per-file event lists.
+    fn rebuild_summaries_at(&mut self, now_utc: DateTime<Utc>) -> Result<()> {
+        let window_start_utc = watch_window_start_utc(self.timezone, now_utc)?;
+        self.current_day_summary = GroupSummary::default();
+        self.burn_window_summary = GroupSummary::default();
+        for cached_file in self.cached_files.values_mut() {
+            cached_file.recompute_bounds(window_start_utc, now_utc);
+            for event in cached_file.visible_events() {
+                push_owned_watch_event_into_summary(&mut self.current_day_summary, event);
+            }
+            for event in cached_file.burn_events() {
+                push_owned_watch_event_into_summary(&mut self.burn_window_summary, event);
+            }
+        }
+        self.last_snapshot_utc = Some(now_utc);
+        Ok(())
+    }
+
+    /// Refresh the tracked set of selected files after a full discovery pass.
+    fn refresh_discovered_targets(
+        &mut self,
+        parallelism: ScannerParallelism,
+        timezone: Tz,
+        now_utc: DateTime<Utc>,
+        selected_files: Vec<SessionScanTarget>,
+        dirty_sessions: &HashMap<String, WatchDirtyKind>,
+    ) -> Result<()> {
+        let mut selected_targets = HashMap::with_capacity(selected_files.len());
+        let mut next_cached_files = HashMap::with_capacity(selected_files.len());
+        let mut full_rebuild_targets = Vec::new();
+
+        for target in selected_files {
+            let session_id = target.session_id.clone();
+            selected_targets.insert(session_id.clone(), target.clone());
+            let is_dirty = dirty_sessions.contains_key(&session_id);
+            match self.cached_files.remove(&session_id) {
+                Some(cached) if !is_dirty && same_watch_target(&cached.target, &target) => {
+                    next_cached_files.insert(session_id, cached);
+                }
+                Some(_) | None => {
+                    full_rebuild_targets.push(target);
+                }
+            }
+        }
+
+        for cached_file in load_cached_watch_files(
+            &full_rebuild_targets,
+            parallelism,
+            timezone,
+            self.current_day,
+            now_utc,
+        )? {
+            next_cached_files.insert(cached_file.target.session_id.clone(), cached_file);
+        }
+
+        self.selected_targets = selected_targets;
+        self.cached_files = next_cached_files;
+        self.rebuild_summaries_at(now_utc)
+    }
+
+    /// Refresh one dirty session selected by the watcher.
+    fn refresh_dirty_session(
+        &mut self,
+        session_id: String,
+        target: Option<SessionScanTarget>,
+        dirty_kind: WatchDirtyKind,
+        timezone: Tz,
+        now_utc: DateTime<Utc>,
+    ) -> Result<()> {
+        let window_start_utc = watch_window_start_utc(timezone, now_utc)?;
+        let existing = self.cached_files.remove(&session_id);
+        if let Some(cached) = existing.as_ref() {
+            remove_cached_watch_file_from_runtime(self, cached);
+        }
+
+        match (existing, target, dirty_kind) {
+            (Some(mut cached), Some(target), WatchDirtyKind::AppendOnly)
+                if cached.target.path == target.path
+                    && target.bytes > cached.target.bytes
+                    && cached.parser_checkpoint.offset == cached.target.bytes =>
+            {
+                append_cached_watch_file(
+                    &mut cached,
+                    target,
+                    timezone,
+                    self.current_day,
+                    window_start_utc,
+                    now_utc,
+                )?;
+                add_cached_watch_file_to_runtime(self, &cached);
+                self.selected_targets
+                    .insert(session_id, cached.target.clone());
+                self.cached_files
+                    .insert(cached.target.session_id.clone(), cached);
+            }
+            (_existing, Some(target), _) => {
+                let cached = build_cached_watch_file(&target, timezone, self.current_day, now_utc)?;
+                add_cached_watch_file_to_runtime(self, &cached);
+                self.selected_targets.insert(session_id, target);
+                self.cached_files
+                    .insert(cached.target.session_id.clone(), cached);
+            }
+            (_existing, None, _) => {
+                self.selected_targets.remove(&session_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Build one watch snapshot from the cached aggregate summaries.
+    fn snapshot(&self, pricing: &PricingCatalog, now_utc: DateTime<Utc>) -> Result<WatchSnapshot> {
+        let snapshot_context = WatchSnapshotContext::new(self.timezone, now_utc)?;
+        Ok(snapshot_context.finish(
+            &self.current_day_summary,
+            &self.burn_window_summary,
+            pricing,
+            self.missing_directories.clone(),
+        ))
+    }
+}
+
+/// Return whether two selected watch targets represent the same unchanged file.
+fn same_watch_target(left: &SessionScanTarget, right: &SessionScanTarget) -> bool {
+    left.path == right.path && left.bytes == right.bytes && left.modified == right.modified
+}
+
+/// Parse all current-day events from one session file for watch-mode caching.
+fn scan_watch_file_delta(
+    file: &Path,
+    session_id: &str,
+    timezone: Tz,
+    current_day: NaiveDate,
+    checkpoint: &SessionParseCheckpoint,
+) -> Result<(SessionParseCheckpoint, Vec<OwnedWatchEvent>)> {
+    let mut events = Vec::new();
+    let checkpoint = scan_session_file_from_checkpoint(file, session_id, checkpoint, |event| {
+        if event.timestamp_utc.with_timezone(&timezone).date_naive() != current_day {
+            return;
+        }
+        events.push(OwnedWatchEvent {
+            timestamp_utc: event.timestamp_utc,
+            model: event.model.to_string(),
+            is_fallback_model: event.is_fallback_model,
+            usage: event.usage.clone(),
+        });
+    })?;
+    Ok((checkpoint, events))
+}
+
+/// Build one cached watch file from the current file contents.
+fn build_cached_watch_file(
+    target: &SessionScanTarget,
+    timezone: Tz,
+    current_day: NaiveDate,
+    now_utc: DateTime<Utc>,
+) -> Result<CachedWatchFile> {
+    let (checkpoint, current_day_events) = scan_watch_file_delta(
+        &target.path,
+        &target.session_id,
+        timezone,
+        current_day,
+        &SessionParseCheckpoint::default(),
+    )?;
+    Ok(CachedWatchFile::from_full_scan(
+        target.clone(),
+        checkpoint,
+        current_day_events,
+        watch_window_start_utc(timezone, now_utc)?,
+        now_utc,
+    ))
+}
+
+/// Refresh one cached watch file by parsing only the appended suffix.
+fn append_cached_watch_file(
+    cached: &mut CachedWatchFile,
+    target: SessionScanTarget,
+    timezone: Tz,
+    current_day: NaiveDate,
+    window_start_utc: DateTime<Utc>,
+    now_utc: DateTime<Utc>,
+) -> Result<()> {
+    let (checkpoint, appended_events) = scan_watch_file_delta(
+        &target.path,
+        &target.session_id,
+        timezone,
+        current_day,
+        &cached.parser_checkpoint,
+    )?;
+    cached.target = target;
+    cached.parser_checkpoint = checkpoint;
+    cached.current_day_events.extend(appended_events);
+    cached
+        .current_day_events
+        .sort_unstable_by_key(|event| event.timestamp_utc);
+    cached.recompute_bounds(window_start_utc, now_utc);
+    Ok(())
+}
+
+/// Add one cached file's visible contributions into the runtime aggregates.
+fn add_cached_watch_file_to_runtime(runtime: &mut WatchRuntimeState, cached: &CachedWatchFile) {
+    for event in cached.visible_events() {
+        push_owned_watch_event_into_summary(&mut runtime.current_day_summary, event);
+    }
+    for event in cached.burn_events() {
+        push_owned_watch_event_into_summary(&mut runtime.burn_window_summary, event);
+    }
+}
+
+/// Remove one cached file's visible contributions from the runtime aggregates.
+fn remove_cached_watch_file_from_runtime(
+    runtime: &mut WatchRuntimeState,
+    cached: &CachedWatchFile,
+) {
+    for event in cached.visible_events() {
+        remove_owned_watch_event_from_summary(&mut runtime.current_day_summary, event);
+    }
+    for event in cached.burn_events() {
+        remove_owned_watch_event_from_summary(&mut runtime.burn_window_summary, event);
+    }
+}
+
+/// Load current-day watch data for the provided changed targets.
+fn load_cached_watch_files(
+    selected_files: &[SessionScanTarget],
+    parallelism: ScannerParallelism,
+    timezone: Tz,
+    current_day: NaiveDate,
+    now_utc: DateTime<Utc>,
+) -> Result<Vec<CachedWatchFile>> {
+    if selected_files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = resolve_scan_worker_count(parallelism, selected_files.len());
+    if worker_count == 1 {
+        return scan_watch_file_chunk(selected_files, timezone, current_day, now_utc);
+    }
+
+    let chunk_size = selected_files.len().div_ceil(worker_count);
+    thread::scope(|scope| -> Result<Vec<CachedWatchFile>> {
+        let mut chunks = selected_files.chunks(chunk_size);
+        let first_chunk = chunks
+            .next()
+            .ok_or_else(|| eyre!("missing initial watch file chunk"))?;
+        let handles = chunks
+            .map(|chunk| {
+                scope.spawn(move || scan_watch_file_chunk(chunk, timezone, current_day, now_utc))
+            })
+            .collect::<Vec<_>>();
+
+        let mut cached_files = scan_watch_file_chunk(first_chunk, timezone, current_day, now_utc)?;
+        for handle in handles {
+            cached_files.extend(
+                handle
+                    .join()
+                    .map_err(|_| eyre!("watch file worker panicked"))??,
+            );
+        }
+        Ok(cached_files)
+    })
+}
+
+/// Parse one worker chunk of changed watch files.
+fn scan_watch_file_chunk(
+    selected_files: &[SessionScanTarget],
+    timezone: Tz,
+    current_day: NaiveDate,
+    now_utc: DateTime<Utc>,
+) -> Result<Vec<CachedWatchFile>> {
+    selected_files
+        .iter()
+        .map(|target| build_cached_watch_file(target, timezone, current_day, now_utc))
+        .collect()
+}
+
+/// Resolve the preferred file for one stable session identifier across all session roots.
+fn resolve_session_target_across_roots(
+    session_dirs: &[PathBuf],
+    session_id: &str,
+) -> Result<Option<SessionScanTarget>> {
+    let mut selected = None;
+    for directory in session_dirs {
+        let path = session_file_path(directory, session_id);
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                let candidate = SessionScanTarget {
+                    session_id: session_id.to_string(),
+                    path,
+                    bytes: metadata.len(),
+                    modified: metadata.modified().ok(),
+                };
+                if selected
+                    .as_ref()
+                    .is_none_or(|existing| candidate.is_preferred_over(existing))
+                {
+                    selected = Some(candidate);
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).wrap_err_with(|| {
+                    format!("failed to refresh session target {}", path.display())
+                });
+            }
+        }
+    }
+    Ok(selected)
+}
+
+/// Build the JSONL path for one stable session identifier under a specific root.
+fn session_file_path(root: &Path, session_id: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    if let Some((parent, file_name)) = session_id.rsplit_once('/') {
+        for component in parent.split('/') {
+            path.push(component);
+        }
+        path.push(format!("{file_name}.jsonl"));
+        return path;
+    }
+
+    for component in session_id.split('/') {
+        path.push(component);
+    }
+    path.set_file_name(format!("{session_id}.jsonl"));
+    path
+}
+
+/// Collect only missing root directories without recursively walking the session tree.
+fn collect_missing_session_dirs(session_dirs: &[PathBuf]) -> Result<Vec<String>> {
+    let mut missing_directories = Vec::new();
+    for directory in session_dirs {
+        match fs::metadata(directory) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => missing_directories.push(directory.display().to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_directories.push(directory.display().to_string());
+            }
+            Err(error) => {
+                return Err(error).wrap_err_with(|| {
+                    format!("failed to access session directory {}", directory.display())
+                });
+            }
+        }
+    }
+    Ok(missing_directories)
+}
+
+/// Convert the effective window duration into a human-readable minute count.
+fn display_window_minutes(window_duration: Duration) -> u64 {
+    let seconds = window_duration.as_secs();
+    if seconds == 0 {
+        return 0;
+    }
+
+    seconds.div_ceil(60)
+}
+
+/// Compute how long watch mode should sleep after one refresh cycle.
+fn remaining_watch_sleep(interval: Duration, elapsed: Duration) -> Duration {
+    interval.saturating_sub(elapsed)
+}
+
+/// Resolve local midnight for one day into UTC.
+fn resolve_local_midnight_utc(timezone: Tz, day: NaiveDate) -> Result<DateTime<Utc>> {
+    let midnight = day
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| eyre!("failed to build midnight timestamp for {day}"))?;
+    let local = first_valid_local_timestamp(timezone, midnight)
+        .ok_or_else(|| eyre!("failed to resolve the start of {day} in timezone {timezone}"))?;
+
+    Ok(local.with_timezone(&Utc))
+}
+
+/// Resolve the earliest valid local timestamp at or after the provided naive datetime.
+fn first_valid_local_timestamp(timezone: Tz, start: chrono::NaiveDateTime) -> Option<DateTime<Tz>> {
+    for minute_offset in 0_i64..=(24_i64 * 60) {
+        let candidate = start.checked_add_signed(TimeDelta::minutes(minute_offset))?;
+        match timezone.from_local_datetime(&candidate) {
+            LocalResult::Single(timestamp) => return Some(timestamp),
+            LocalResult::Ambiguous(first, second) => return Some(first.min(second)),
+            LocalResult::None => {}
+        }
+    }
+
+    None
+}
+
+/// Convert one usage total into a per-hour burn rate.
+fn scale_usage_per_hour(value: u64, window_duration: Duration) -> u64 {
+    if value == 0 || window_duration.is_zero() {
+        return 0;
+    }
+
+    let nanos = window_duration.as_nanos();
+    let numerator = u128::from(value) * 3_600_000_000_000 + (nanos / 2);
+    let scaled = numerator / nanos;
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+/// Convert one cost total into a per-hour burn rate.
+fn scale_cost_per_hour(value: f64, window_duration: Duration) -> f64 {
+    if value == 0.0 || window_duration.is_zero() {
+        return 0.0;
+    }
+
+    (value * 3600.0) / window_duration.as_secs_f64()
+}
+
 /// Sort session entries deterministically for stable CLI output.
 fn sort_session_entries(entries: &mut [(String, SessionSummary)]) {
     entries.sort_by(|(left_key, left_summary), (right_key, right_summary)| {
@@ -1481,6 +2842,23 @@ fn push_event_into_summary(summary: &mut GroupSummary, event: &TokenUsageEvent<'
     if event.is_fallback_model {
         breakdown.is_fallback = true;
     }
+}
+
+/// Push one cached watch event into a grouped summary.
+fn push_owned_watch_event_into_summary(summary: &mut GroupSummary, event: &OwnedWatchEvent) {
+    summary.totals.add(&event.usage);
+    let breakdown = ensure_model_breakdown(&mut summary.models, &event.model);
+    push_usage_into_breakdown(breakdown, &event.usage, event.is_fallback_model);
+    if event.is_fallback_model {
+        breakdown.is_fallback = true;
+    }
+}
+
+/// Remove one cached watch event from a grouped summary.
+fn remove_owned_watch_event_from_summary(summary: &mut GroupSummary, event: &OwnedWatchEvent) {
+    summary.totals.subtract(&event.usage);
+    let breakdown = ensure_model_breakdown(&mut summary.models, &event.model);
+    remove_usage_from_breakdown(breakdown, &event.usage, event.is_fallback_model);
 }
 
 /// Push event data into a session summary.
@@ -1520,6 +2898,26 @@ fn push_usage_into_breakdown(
     target.total_tokens += usage.total;
     if is_fallback_model {
         target.fallback_usage.add(usage);
+    }
+}
+
+/// Remove usage from a public model breakdown.
+fn remove_usage_from_breakdown(
+    target: &mut ModelBreakdown,
+    usage: &UsageTotals,
+    is_fallback_model: bool,
+) {
+    target.input_tokens = target.input_tokens.saturating_sub(usage.input);
+    target.cached_input_tokens = target
+        .cached_input_tokens
+        .saturating_sub(usage.cached_input);
+    target.output_tokens = target.output_tokens.saturating_sub(usage.output);
+    target.reasoning_output_tokens = target
+        .reasoning_output_tokens
+        .saturating_sub(usage.reasoning_output);
+    target.total_tokens = target.total_tokens.saturating_sub(usage.total);
+    if is_fallback_model {
+        target.fallback_usage.subtract(usage);
     }
 }
 
@@ -1671,6 +3069,44 @@ fn scan_selected_session_targets(
     })
 }
 
+/// Scan all selected targets for watch mode, optionally across worker threads.
+#[cfg(test)]
+fn scan_watch_targets(
+    selected_files: &[SessionScanTarget],
+    parallelism: ScannerParallelism,
+    timezone: Tz,
+    now_utc: DateTime<Utc>,
+) -> Result<WatchBuilder> {
+    if selected_files.is_empty() {
+        return WatchBuilder::new(timezone, now_utc);
+    }
+
+    let worker_count = resolve_scan_worker_count(parallelism, selected_files.len());
+    if worker_count == 1 {
+        return scan_watch_chunk(selected_files, timezone, now_utc);
+    }
+
+    let chunk_size = selected_files.len().div_ceil(worker_count);
+    thread::scope(|scope| -> Result<WatchBuilder> {
+        let mut chunks = selected_files.chunks(chunk_size);
+        let first_chunk = chunks
+            .next()
+            .ok_or_else(|| eyre!("missing initial watch scan chunk"))?;
+        let handles = chunks
+            .map(|chunk| scope.spawn(move || scan_watch_chunk(chunk, timezone, now_utc)))
+            .collect::<Vec<_>>();
+
+        let mut merged = scan_watch_chunk(first_chunk, timezone, now_utc)?;
+        for handle in handles {
+            let partial = handle
+                .join()
+                .map_err(|_| eyre!("watch scan worker panicked"))??;
+            merged.merge(partial);
+        }
+        Ok(merged)
+    })
+}
+
 /// Scan one worker chunk of selected session files.
 fn scan_selected_session_chunk(
     selected_files: &[SessionScanTarget],
@@ -1682,6 +3118,22 @@ fn scan_selected_session_chunk(
     let mut builder = ReportBuilder::new(kind, timezone, since, until);
     for target in selected_files {
         scan_session_file(&target.path, &target.session_id, &mut builder)?;
+    }
+    Ok(builder)
+}
+
+/// Scan one worker chunk of selected session files for watch mode.
+#[cfg(test)]
+fn scan_watch_chunk(
+    selected_files: &[SessionScanTarget],
+    timezone: Tz,
+    now_utc: DateTime<Utc>,
+) -> Result<WatchBuilder> {
+    let mut builder = WatchBuilder::new(timezone, now_utc)?;
+    for target in selected_files {
+        scan_session_file_with(&target.path, &target.session_id, |event| {
+            builder.observe(event);
+        })?;
     }
     Ok(builder)
 }
@@ -1736,12 +3188,13 @@ fn register_session_target(
 ) -> Result<()> {
     let path = entry.path();
     let metadata = entry.metadata()?;
+    let modified = metadata.modified().ok();
     let session_id = session_file_id(root, &path);
     let candidate = SessionScanTarget {
         session_id: session_id.clone(),
         path,
         bytes: metadata.len(),
-        modified: metadata.modified().ok(),
+        modified,
     };
     let should_replace = selected_files
         .get(&session_id)
@@ -1807,23 +3260,59 @@ fn merge_model_breakdowns(
 
 /// Scan one JSONL session file.
 fn scan_session_file(file: &Path, session_id: &str, builder: &mut ReportBuilder) -> Result<()> {
-    let reader = BufReader::new(File::open(file)?);
+    scan_session_file_with(file, session_id, |event| builder.observe(event))
+}
+
+/// Scan one JSONL session file and feed every parsed event into the provided callback.
+fn scan_session_file_with(
+    file: &Path,
+    session_id: &str,
+    mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
+) -> Result<()> {
+    let _ = scan_session_file_from_checkpoint(
+        file,
+        session_id,
+        &SessionParseCheckpoint::default(),
+        |event| on_event(event),
+    )?;
+    Ok(())
+}
+
+/// Scan one JSONL session file from a stored parser checkpoint.
+fn scan_session_file_from_checkpoint(
+    file: &Path,
+    session_id: &str,
+    checkpoint: &SessionParseCheckpoint,
+    mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
+) -> Result<SessionParseCheckpoint> {
+    let mut file = File::open(file)?;
+    file.seek(SeekFrom::Start(checkpoint.offset))?;
+    let reader = BufReader::new(file);
     let mut line = String::new();
-    let mut previous_totals: Option<RawUsage> = None;
-    let mut current_model: Option<String> = None;
-    let mut current_model_is_fallback = false;
+    let mut previous_totals = checkpoint.previous_totals;
+    let mut current_model = checkpoint.current_model.clone();
+    let mut current_model_is_fallback = checkpoint.current_model_is_fallback;
     let mut reader = reader;
+    let mut offset = checkpoint.offset;
     loop {
         line.clear();
+        let line_start_offset = offset;
         let bytes_read = reader.read_line(&mut line)?;
         if bytes_read == 0 {
             break;
         }
+        let next_offset = offset.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            offset = next_offset;
             continue;
         }
+        if !line.ends_with('\n') && serde_json::from_str::<SessionLogEntry<'_>>(trimmed).is_err() {
+            offset = line_start_offset;
+            break;
+        }
         if !line_might_affect_usage(trimmed) {
+            offset = next_offset;
             continue;
         }
         if let Some(event) = parse_token_usage_line(
@@ -1834,10 +3323,16 @@ fn scan_session_file(file: &Path, session_id: &str, builder: &mut ReportBuilder)
             &mut current_model,
             &mut current_model_is_fallback,
         )? {
-            builder.observe(&event);
+            on_event(&event);
         }
+        offset = next_offset;
     }
-    Ok(())
+    Ok(SessionParseCheckpoint {
+        offset,
+        previous_totals,
+        current_model,
+        current_model_is_fallback,
+    })
 }
 
 /// Return whether one JSONL line might affect usage aggregation.
@@ -1848,10 +3343,12 @@ fn line_might_affect_usage(line: &str) -> bool {
 
 /// Derive the stable session identifier from a JSONL path.
 fn session_file_id(root: &Path, file: &Path) -> String {
-    file.strip_prefix(root)
-        .unwrap_or(file)
+    let mut relative = file.strip_prefix(root).unwrap_or(file).to_path_buf();
+    if relative.extension() == Some(std::ffi::OsStr::new("jsonl")) {
+        relative.set_extension("");
+    }
+    relative
         .to_string_lossy()
-        .trim_end_matches(".jsonl")
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
@@ -2088,6 +3585,8 @@ fn calculate_cost_from_usage(usage: &UsageTotals, pricing: &Pricing) -> f64 {
 #[allow(clippy::missing_docs_in_private_items)]
 mod tests {
     use super::*;
+    use filetime::FileTime;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
@@ -2209,6 +3708,17 @@ mod tests {
         let (directory, session) = split_session_id("team/project/session-1");
         assert_eq!(directory, "team/project");
         assert_eq!(session, "session-1");
+    }
+
+    #[test]
+    fn session_file_round_trip_preserves_dotted_leaf_names() {
+        let root = Path::new("/logs");
+        let session_id = "team/session.v2";
+
+        let rebuilt = session_file_path(root, session_id);
+
+        assert_eq!(rebuilt, PathBuf::from("/logs/team/session.v2.jsonl"));
+        assert_eq!(session_file_id(root, &rebuilt), session_id);
     }
 
     #[test]
@@ -3163,6 +4673,713 @@ mod tests {
             }
             other => panic!("unexpected report: {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_watch_snapshot_tracks_current_day_totals_and_bounded_hourly_burn() {
+        let temp = TempDir::new().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        let session_file = sessions.join("project").join("session.jsonl");
+        fs::create_dir_all(session_file.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &session_file,
+            [
+                r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+                r#"{"timestamp":"2026-01-01T23:40:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110}}}}"#,
+                r#"{"timestamp":"2026-01-02T00:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"cached_input_tokens":5,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":23}}}}"#,
+                r#"{"timestamp":"2026-01-02T00:20:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":7,"reasoning_output_tokens":2,"total_tokens":37}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write session");
+
+        let now = DateTime::parse_from_rfc3339("2026-01-02T00:30:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let snapshot = build_watch_snapshot_at(
+            &WatchOptions {
+                timezone: "UTC".to_string(),
+                locale: "en-US".to_string(),
+                number_format: NumberFormat::Short,
+                offline: true,
+                refresh_pricing: false,
+                session_dirs: vec![sessions],
+                parallelism: ScannerParallelism::Auto,
+                interval: Duration::from_secs(5),
+            },
+            now,
+        )
+        .expect("watch snapshot");
+
+        assert_eq!(snapshot.date, "2026-01-02");
+        assert_eq!(snapshot.totals.input_tokens, 50);
+        assert_eq!(snapshot.totals.cached_input_tokens, 15);
+        assert_eq!(snapshot.totals.output_tokens, 10);
+        assert_eq!(snapshot.totals.reasoning_output_tokens, 3);
+        assert_eq!(snapshot.totals.total_tokens, 60);
+        assert_eq!(snapshot.burn_rate.window_minutes, 30);
+        assert_eq!(snapshot.burn_rate.input_tokens_per_hour, 100);
+        assert_eq!(snapshot.burn_rate.cached_input_tokens_per_hour, 30);
+        assert_eq!(snapshot.burn_rate.output_tokens_per_hour, 20);
+        assert_eq!(snapshot.burn_rate.reasoning_output_tokens_per_hour, 6);
+        assert_eq!(snapshot.burn_rate.total_tokens_per_hour, 120);
+        assert_eq!(snapshot.updated_time, "00:30:00");
+    }
+
+    #[test]
+    fn watch_runtime_refresh_reuses_unchanged_file_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        let session_file = sessions.join("today").join("session.jsonl");
+        fs::create_dir_all(session_file.parent().expect("parent")).expect("mkdir");
+        let valid_payload = concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n"
+        );
+        fs::write(&session_file, valid_payload).expect("write valid file");
+        let original_metadata = fs::metadata(&session_file).expect("metadata");
+        let original_mtime = original_metadata.modified().expect("modified time");
+
+        let now = DateTime::parse_from_rfc3339("2026-01-02T00:30:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let timezone = chrono_tz::UTC;
+        let mut runtime = WatchRuntimeState::load(
+            std::slice::from_ref(&sessions),
+            ScannerParallelism::Auto,
+            timezone,
+            now,
+        )
+        .expect("runtime");
+        let initial_snapshot = runtime
+            .snapshot(&PricingCatalog::default(), now)
+            .expect("initial snapshot");
+        assert_eq!(initial_snapshot.totals.total_tokens, 23);
+
+        let mut invalid_payload = String::from(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n\
+             {\"timestamp\":\"bad-timestamp\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}\n",
+        );
+        invalid_payload.push_str(&" ".repeat(valid_payload.len() - invalid_payload.len()));
+        fs::write(&session_file, invalid_payload).expect("write invalid file");
+        filetime::set_file_mtime(&session_file, FileTime::from_system_time(original_mtime))
+            .expect("restore mtime");
+
+        runtime
+            .refresh(
+                &[sessions],
+                ScannerParallelism::Auto,
+                timezone,
+                now,
+                WatchChangeSet::default(),
+            )
+            .expect("refresh");
+        let refreshed_snapshot = runtime
+            .snapshot(&PricingCatalog::default(), now)
+            .expect("refreshed snapshot");
+        assert_eq!(refreshed_snapshot.totals.input_tokens, 20);
+        assert_eq!(refreshed_snapshot.totals.output_tokens, 3);
+        assert_eq!(refreshed_snapshot.totals.total_tokens, 23);
+    }
+
+    #[test]
+    fn watch_runtime_snapshot_ignores_future_dated_events_until_time_advances() {
+        let temp = TempDir::new().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        let session_file = sessions.join("today").join("session.jsonl");
+        fs::create_dir_all(session_file.parent().expect("parent")).expect("mkdir");
+        let payload = concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n",
+            "{\"timestamp\":\"2026-01-02T00:45:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":5,\"output_tokens\":1,\"total_tokens\":6}}}}\n"
+        );
+        fs::write(&session_file, payload).expect("write session");
+
+        let timezone = chrono_tz::UTC;
+        let loaded_at = DateTime::parse_from_rfc3339("2026-01-02T00:30:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let runtime = WatchRuntimeState::load(
+            std::slice::from_ref(&sessions),
+            ScannerParallelism::Auto,
+            timezone,
+            loaded_at,
+        )
+        .expect("runtime");
+
+        let early_snapshot = runtime
+            .snapshot(&PricingCatalog::default(), loaded_at)
+            .expect("early snapshot");
+        assert_eq!(early_snapshot.totals.total_tokens, 23);
+        assert_eq!(early_snapshot.burn_rate.total_tokens_per_hour, 46);
+
+        let later_now = DateTime::parse_from_rfc3339("2026-01-02T00:50:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let mut runtime = runtime;
+        runtime
+            .refresh(
+                std::slice::from_ref(&sessions),
+                ScannerParallelism::Auto,
+                timezone,
+                later_now,
+                WatchChangeSet::default(),
+            )
+            .expect("advance runtime");
+        let later_snapshot = runtime
+            .snapshot(&PricingCatalog::default(), later_now)
+            .expect("later snapshot");
+        assert_eq!(later_snapshot.totals.total_tokens, 29);
+        assert_eq!(later_snapshot.burn_rate.total_tokens_per_hour, 35);
+    }
+
+    #[test]
+    fn watch_runtime_refreshes_dirty_session_after_append() {
+        let temp = TempDir::new().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        let session_file = sessions.join("today").join("session.jsonl");
+        fs::create_dir_all(session_file.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &session_file,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+                "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n"
+            ),
+        )
+        .expect("write session");
+
+        let timezone = chrono_tz::UTC;
+        let now = DateTime::parse_from_rfc3339("2026-01-02T00:30:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let mut runtime = WatchRuntimeState::load(
+            std::slice::from_ref(&sessions),
+            ScannerParallelism::Auto,
+            timezone,
+            now,
+        )
+        .expect("runtime");
+
+        fs::write(
+            &session_file,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+                "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n",
+                "{\"timestamp\":\"2026-01-02T00:20:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":5,\"output_tokens\":1,\"total_tokens\":6}}}}\n"
+            ),
+        )
+        .expect("append session");
+
+        runtime
+            .refresh(
+                std::slice::from_ref(&sessions),
+                ScannerParallelism::Auto,
+                timezone,
+                now,
+                WatchChangeSet {
+                    dirty_sessions: HashMap::from([(
+                        "today/session".to_string(),
+                        WatchDirtyKind::AppendOnly,
+                    )]),
+                    discovery_due: false,
+                },
+            )
+            .expect("refresh dirty session");
+        let snapshot = runtime
+            .snapshot(&PricingCatalog::default(), now)
+            .expect("snapshot");
+
+        assert_eq!(snapshot.totals.total_tokens, 29);
+        assert_eq!(snapshot.totals.input_tokens, 25);
+        assert_eq!(snapshot.totals.output_tokens, 4);
+    }
+
+    #[test]
+    fn watch_runtime_rebuilds_longer_rewritten_file_instead_of_appending() {
+        let temp = TempDir::new().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        let session_file = sessions.join("today").join("session.jsonl");
+        fs::create_dir_all(session_file.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &session_file,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+                "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n"
+            ),
+        )
+        .expect("write session");
+
+        let timezone = chrono_tz::UTC;
+        let now = DateTime::parse_from_rfc3339("2026-01-02T00:30:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let mut runtime = WatchRuntimeState::load(
+            std::slice::from_ref(&sessions),
+            ScannerParallelism::Auto,
+            timezone,
+            now,
+        )
+        .expect("runtime");
+
+        fs::write(
+            &session_file,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+                "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":50,\"output_tokens\":10,\"total_tokens\":60}}}}\n",
+                "{\"timestamp\":\"2026-01-02T00:20:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}\n"
+            ),
+        )
+        .expect("rewrite longer session");
+
+        runtime
+            .refresh(
+                std::slice::from_ref(&sessions),
+                ScannerParallelism::Auto,
+                timezone,
+                now,
+                WatchChangeSet {
+                    dirty_sessions: HashMap::from([(
+                        "today/session".to_string(),
+                        WatchDirtyKind::FullRebuild,
+                    )]),
+                    discovery_due: false,
+                },
+            )
+            .expect("refresh rewritten session");
+        let snapshot = runtime
+            .snapshot(&PricingCatalog::default(), now)
+            .expect("snapshot");
+
+        assert_eq!(snapshot.totals.total_tokens, 62);
+        assert_eq!(snapshot.totals.input_tokens, 51);
+        assert_eq!(snapshot.totals.output_tokens, 11);
+    }
+
+    #[test]
+    fn resolve_session_target_across_roots_re_resolves_duplicates() {
+        let first = TempDir::new().expect("first");
+        let second = TempDir::new().expect("second");
+        let first_sessions = first.path().join("sessions");
+        let second_sessions = second.path().join("sessions");
+        let selected_file = first_sessions.join("project").join("session.jsonl");
+        let duplicate_file = second_sessions.join("project").join("session.jsonl");
+        let removed_file = first_sessions.join("gone").join("session.jsonl");
+        fs::create_dir_all(selected_file.parent().expect("selected parent")).expect("mkdir first");
+        fs::create_dir_all(duplicate_file.parent().expect("duplicate parent"))
+            .expect("mkdir second");
+        fs::create_dir_all(removed_file.parent().expect("removed parent")).expect("mkdir gone");
+        fs::write(&selected_file, "first version in preferred root").expect("write selected");
+        fs::write(&duplicate_file, "backup").expect("write duplicate");
+        fs::write(&removed_file, "gone").expect("write removed");
+
+        let session_dirs = vec![first_sessions.clone(), second_sessions.clone()];
+        let original = resolve_session_target_across_roots(&session_dirs, "project/session")
+            .expect("resolve selected")
+            .expect("selected target");
+        assert_eq!(original.path, selected_file);
+
+        fs::remove_file(&selected_file).expect("remove selected");
+        fs::remove_file(&removed_file).expect("remove file");
+
+        let refreshed = resolve_session_target_across_roots(&session_dirs, "project/session")
+            .expect("refresh")
+            .expect("fallback target");
+        assert_eq!(refreshed.session_id, "project/session");
+        assert_eq!(refreshed.path, duplicate_file);
+        assert_eq!(refreshed.bytes, 6);
+        assert!(
+            resolve_session_target_across_roots(&session_dirs, "gone/session")
+                .expect("missing session")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn watch_event_session_ids_cover_all_matching_roots() {
+        let roots = vec![PathBuf::from("/logs"), PathBuf::from("/logs/project")];
+        let path = PathBuf::from("/logs/project/a.jsonl");
+        let mut session_ids = watch_event_session_ids(&roots, &path);
+        session_ids.sort();
+
+        assert_eq!(session_ids, vec!["a".to_string(), "project/a".to_string()]);
+    }
+
+    #[test]
+    fn watch_event_source_marks_newly_available_root_for_rediscovery() {
+        let temp = TempDir::new().expect("tempdir");
+        let late_root = temp.path().join("late-root");
+        let mut source =
+            WatchEventSource::new_polling(std::slice::from_ref(&late_root)).expect("watch source");
+
+        assert!(!source.watched_roots.contains(&late_root));
+
+        fs::create_dir_all(&late_root).expect("create late root");
+
+        assert!(
+            source
+                .sync_session_dirs(std::slice::from_ref(&late_root))
+                .expect("sync session dirs"),
+            "late root should trigger immediate rediscovery",
+        );
+        assert!(source.watched_roots.contains(&late_root));
+    }
+
+    #[test]
+    fn scan_session_file_from_checkpoint_reads_only_appended_suffix() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_file = temp.path().join("session.jsonl");
+        fs::write(
+            &session_file,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+                "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n"
+            ),
+        )
+        .expect("write session");
+
+        let mut initial_events = Vec::new();
+        let checkpoint = scan_session_file_from_checkpoint(
+            &session_file,
+            "project/session",
+            &SessionParseCheckpoint::default(),
+            |event| initial_events.push(event.usage.total),
+        )
+        .expect("initial scan");
+        assert_eq!(initial_events, vec![23]);
+
+        fs::write(
+            &session_file,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+                "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n",
+                "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":5,\"output_tokens\":1,\"total_tokens\":6}}}}\n"
+            ),
+        )
+        .expect("append session");
+
+        let mut appended_events = Vec::new();
+        let updated = scan_session_file_from_checkpoint(
+            &session_file,
+            "project/session",
+            &checkpoint,
+            |event| appended_events.push((event.model.to_string(), event.usage.total)),
+        )
+        .expect("incremental scan");
+        assert_eq!(appended_events, vec![("gpt-5".to_string(), 6)]);
+        assert!(updated.offset > checkpoint.offset);
+    }
+
+    #[test]
+    fn scan_session_file_from_checkpoint_retries_unterminated_jsonl_record() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_file = temp.path().join("session.jsonl");
+        fs::write(
+            &session_file,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+                "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n",
+                "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"type\":\"event_msg\""
+            ),
+        )
+        .expect("write partial session");
+
+        let checkpoint = scan_session_file_from_checkpoint(
+            &session_file,
+            "project/session",
+            &SessionParseCheckpoint::default(),
+            |_| {},
+        )
+        .expect("scan with partial line");
+        assert_eq!(
+            checkpoint.offset,
+            u64::try_from(
+                concat!(
+                    "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+                    "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n"
+                )
+                .len()
+            )
+            .expect("offset fits")
+        );
+
+        fs::write(
+            &session_file,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+                "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n",
+                "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":5,\"output_tokens\":1,\"total_tokens\":6}}}}\n"
+            ),
+        )
+        .expect("finish session");
+
+        let mut appended_totals = Vec::new();
+        let updated = scan_session_file_from_checkpoint(
+            &session_file,
+            "project/session",
+            &checkpoint,
+            |event| appended_totals.push(event.usage.total),
+        )
+        .expect("rescan completed line");
+
+        assert_eq!(appended_totals, vec![6]);
+        assert!(updated.offset > checkpoint.offset);
+    }
+
+    #[test]
+    fn cached_watch_file_burn_events_skip_older_history() {
+        let event = |timestamp: &str, total: u64| OwnedWatchEvent {
+            timestamp_utc: DateTime::parse_from_rfc3339(timestamp)
+                .expect("timestamp")
+                .with_timezone(&Utc),
+            model: "gpt-5".to_string(),
+            is_fallback_model: false,
+            usage: UsageTotals {
+                input: total,
+                cached_input: 0,
+                output: 0,
+                reasoning_output: 0,
+                total,
+            },
+        };
+        let cached = CachedWatchFile {
+            target: SessionScanTarget {
+                path: PathBuf::from("/tmp/session.jsonl"),
+                session_id: "project/session".to_string(),
+                bytes: 0,
+                modified: None,
+            },
+            parser_checkpoint: SessionParseCheckpoint::default(),
+            current_day_events: vec![
+                event("2026-01-02T00:05:00Z", 5),
+                event("2026-01-02T00:30:00Z", 7),
+                event("2026-01-02T00:45:00Z", 11),
+            ],
+            visible_end: 0,
+            burn_start: 0,
+        };
+
+        let window_start = DateTime::parse_from_rfc3339("2026-01-02T00:30:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let window_end = DateTime::parse_from_rfc3339("2026-01-02T00:59:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let mut cached = cached;
+        cached.recompute_bounds(window_start, window_end);
+        let suffix = cached.burn_events();
+
+        assert_eq!(suffix.len(), 2);
+        assert_eq!(suffix[0].usage.total, 7);
+        assert_eq!(suffix[1].usage.total, 11);
+    }
+
+    #[test]
+    fn render_watch_screen_includes_totals_and_burn_rate_columns() {
+        let rendered = render_watch_screen(
+            &WatchSnapshot {
+                date: "2026-01-02".to_string(),
+                totals: Totals {
+                    input_tokens: 50,
+                    cached_input_tokens: 15,
+                    output_tokens: 10,
+                    reasoning_output_tokens: 3,
+                    total_tokens: 60,
+                    cost_usd: 1.25,
+                },
+                burn_rate: BurnRateSnapshot {
+                    window_minutes: 30,
+                    input_tokens_per_hour: 100,
+                    cached_input_tokens_per_hour: 30,
+                    output_tokens_per_hour: 20,
+                    reasoning_output_tokens_per_hour: 6,
+                    total_tokens_per_hour: 120,
+                    cost_usd_per_hour: 2.5,
+                },
+                missing_directories: vec!["/tmp/missing".to_string()],
+                updated_time: "00:30:00".to_string(),
+            },
+            "en-US",
+            NumberFormat::Short,
+        );
+
+        assert!(rendered.contains("Current Day Codex Usage Watch"));
+        assert!(rendered.contains("Burn Rate (/h)"));
+        assert!(rendered.contains("2026-01-02"));
+        assert!(rendered.contains("Updated"));
+        assert!(rendered.contains("00:30:00"));
+        assert!(rendered.contains("Input"));
+        assert!(rendered.contains("$2.50"));
+        assert!(rendered.contains("/tmp/missing"));
+    }
+
+    #[test]
+    fn render_watch_screen_honors_number_format() {
+        let snapshot = WatchSnapshot {
+            date: "2026-01-02".to_string(),
+            totals: Totals {
+                input_tokens: 100_000,
+                cached_input_tokens: 2_000,
+                output_tokens: 3_000,
+                reasoning_output_tokens: 4_000,
+                total_tokens: 107_000,
+                cost_usd: 12.5,
+            },
+            burn_rate: BurnRateSnapshot {
+                window_minutes: 60,
+                input_tokens_per_hour: 100_000,
+                cached_input_tokens_per_hour: 2_000,
+                output_tokens_per_hour: 3_000,
+                reasoning_output_tokens_per_hour: 4_000,
+                total_tokens_per_hour: 107_000,
+                cost_usd_per_hour: 12.5,
+            },
+            missing_directories: Vec::new(),
+            updated_time: "00:30:00".to_string(),
+        };
+
+        let short = render_watch_screen(&snapshot, "en-US", NumberFormat::Short);
+        let full = render_watch_screen(&snapshot, "en-US", NumberFormat::Full);
+
+        assert!(short.contains("100K"));
+        assert!(!short.contains("100,000"));
+        assert!(full.contains("100,000"));
+    }
+
+    #[test]
+    fn supports_watch_screen_clear_rejects_dumb_term() {
+        assert!(supports_watch_screen_clear_with_platform(
+            Some("xterm-256color"),
+            false,
+            false
+        ));
+        assert!(!supports_watch_screen_clear_with_platform(
+            Some("dumb"),
+            false,
+            false
+        ));
+        assert!(supports_watch_screen_clear_with_platform(
+            None, false, false
+        ));
+    }
+
+    #[test]
+    fn supports_watch_screen_clear_accepts_windows_console_probe() {
+        assert!(!supports_watch_screen_clear_with_platform(
+            None, true, false
+        ));
+        assert!(supports_watch_screen_clear_with_platform(
+            Some("xterm-256color"),
+            true,
+            false
+        ));
+        assert!(supports_watch_screen_clear_with_platform(None, true, true));
+    }
+
+    #[test]
+    fn display_window_minutes_rounds_up_partial_minutes() {
+        assert_eq!(display_window_minutes(Duration::from_secs(0)), 0);
+        assert_eq!(display_window_minutes(Duration::from_secs(1)), 1);
+        assert_eq!(display_window_minutes(Duration::from_secs(59)), 1);
+        assert_eq!(display_window_minutes(Duration::from_secs(61)), 2);
+    }
+
+    #[test]
+    fn remaining_watch_sleep_subtracts_elapsed_work() {
+        assert_eq!(
+            remaining_watch_sleep(Duration::from_secs(5), Duration::from_secs(2)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            remaining_watch_sleep(Duration::from_secs(5), Duration::from_secs(7)),
+            Duration::from_secs(0)
+        );
+    }
+
+    #[test]
+    fn scale_usage_per_hour_preserves_partial_second_windows() {
+        assert_eq!(scale_usage_per_hour(2, Duration::from_millis(500)), 14_400);
+        assert_eq!(scale_usage_per_hour(1, Duration::from_millis(250)), 14_400);
+    }
+
+    #[test]
+    fn watch_pricing_refresh_due_uses_cache_age_and_retry_backoff() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache_path = temp.path().join("pricing-cache.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_hours(100);
+        let fresh_refreshed_at =
+            i64::try_from(Duration::from_hours(77).as_secs()).expect("fresh timestamp fits");
+        fs::write(
+            &cache_path,
+            format!("{{\"refreshed_at_epoch_seconds\":{fresh_refreshed_at},\"models\":{{}}}}"),
+        )
+        .expect("write fresh cache");
+
+        assert!(!watch_pricing_refresh_due(&cache_path, now, false, None).expect("fresh decision"));
+
+        let stale_refreshed_at =
+            i64::try_from(Duration::from_hours(75).as_secs()).expect("stale timestamp fits");
+        fs::write(
+            &cache_path,
+            format!("{{\"refreshed_at_epoch_seconds\":{stale_refreshed_at},\"models\":{{}}}}"),
+        )
+        .expect("write stale cache");
+
+        assert!(watch_pricing_refresh_due(&cache_path, now, false, None).expect("stale decision"));
+        assert!(
+            !watch_pricing_refresh_due(
+                &cache_path,
+                now,
+                false,
+                Some(now - Duration::from_mins(4)),
+            )
+            .expect("backoff decision")
+        );
+    }
+
+    #[test]
+    fn resolve_local_midnight_utc_handles_midnight_dst_skip() {
+        let day = NaiveDate::from_ymd_opt(2024, 4, 26).expect("day");
+        let resolved = resolve_local_midnight_utc(chrono_tz::Africa::Cairo, day).expect("start");
+
+        assert_eq!(
+            resolved,
+            DateTime::parse_from_rfc3339("2024-04-25T22:00:00Z")
+                .expect("timestamp")
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn cli_accepts_watch_interval_flag() {
+        let cli = Cli::try_parse_from(["codexusage", "watch", "--interval", "15"]).expect("cli");
+
+        let Some(Command::Watch { interval }) = cli.command else {
+            panic!("expected watch command");
+        };
+        assert_eq!(interval, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn run_rejects_watch_json_output() {
+        let error = run(["codexusage", "--json", "watch"]
+            .into_iter()
+            .map(OsString::from))
+        .expect_err("watch json should fail");
+
+        assert!(error.to_string().contains("watch"));
+        assert!(error.to_string().contains("--json"));
+    }
+
+    #[test]
+    fn run_rejects_watch_date_filters() {
+        let error = run(["codexusage", "--since", "2026-01-01", "watch"]
+            .into_iter()
+            .map(OsString::from))
+        .expect_err("watch with date filters should fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("watch"));
+        assert!(rendered.contains("--since"));
     }
 
     #[test]
