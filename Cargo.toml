@@ -24,21 +24,21 @@ lto = true
 codegen-units = 1
 
 [dependencies]
-clap = { version = "4.5.32", features = ["derive"] }
-chrono = { version = "0.4.40", default-features = false, features = ["clock", "serde", "std"] }
-chrono-tz = "0.10.1"
-color-eyre = "0.6.3"
+clap = { version = "4.5.60", features = ["derive"] }
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "serde", "std"] }
+chrono-tz = "0.10.4"
+color-eyre = "0.6.5"
 dirs = "6.0.0"
 eyre = "0.6.12"
 notify = "8.2.0"
-reqwest = { version = "0.12.14", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "rustls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 
 [dev-dependencies]
-criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
-filetime = "0.2.25"
-tempfile = "3.18.0"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+filetime = "0.2.27"
+tempfile = "3.27.0"
 
 [[bench]]
 name = "scan"

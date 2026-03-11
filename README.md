@@ -127,6 +127,8 @@ Daily Codex Usage Report
 
 Pricing data is cached locally and refreshed automatically when stale. Use `--offline` to skip network access entirely, or `--refresh-pricing` to force an update.
 
+Live pricing refreshes use the system CA store through `reqwest`'s Rustls backend. Minimal containers or stripped-down CI images may need a CA bundle such as `ca-certificates` installed for refreshes to succeed.
+
 ## Performance
 
 `codexusage` was built because `@ccusage/codex` became unusably slow on large session directories. The table below shows a side-by-side comparison on the same dataset.
@@ -150,6 +152,8 @@ Build from source:
 ```bash
 cargo build --release
 ```
+
+Source builds require a working C toolchain and `cmake` because the `reqwest` TLS stack pulls in `aws-lc-rs`.
 
 Quality commands:
 

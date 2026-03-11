@@ -5,6 +5,6 @@ edition = "2024"
 publish = false
 
 [dependencies]
-clap = { version = "4.5.32", features = ["derive"] }
-color-eyre = "0.6.3"
+clap = { version = "4.5.60", features = ["derive"] }
+color-eyre = "0.6.5"
 eyre = "0.6.12"
