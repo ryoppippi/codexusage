@@ -2,7 +2,7 @@
 
 See how much your OpenAI Codex sessions cost - broken down by day, month, or session - right from your terminal.
 
-Inspired by [`@ccusage/codex`](https://github.com/kevinlu1248/ccusage), `codexusage` is a ground-up Rust rewrite built for users who need a significantly faster and lighter alternative to scan large session histories.
+Inspired by [`@ccusage/codex`](https://github.com/ryoppippi/ccusage), `codexusage` is a ground-up Rust rewrite built for users who need a significantly faster and lighter alternative to scan large session histories.
 
 ## Install
 
