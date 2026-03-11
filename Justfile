@@ -22,9 +22,7 @@ doc:
 	cargo run -p xtask -- doc
 
 publish:
-	cargo run -p xtask -- ci
-	cargo publish --dry-run
-	cargo publish
+	cargo run -p xtask -- publish
 
 run:
 	cargo run -- --
