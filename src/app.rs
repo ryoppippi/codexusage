@@ -622,7 +622,7 @@ fn run_watch_loop(options: &WatchOptions) -> Result<()> {
         decide_cache_action(
             &pricing_cache_path,
             now,
-            Duration::from_hours(24),
+            Duration::from_secs(24 * 60 * 60),
             options.offline,
             false,
         )? == CacheDecision::Refresh
@@ -752,14 +752,20 @@ fn watch_pricing_refresh_due(
     offline: bool,
     last_refresh_attempt_at: Option<SystemTime>,
 ) -> Result<bool> {
-    let decision = decide_cache_action(cache_path, now, Duration::from_hours(24), offline, false)?;
+    let decision = decide_cache_action(
+        cache_path,
+        now,
+        Duration::from_secs(24 * 60 * 60),
+        offline,
+        false,
+    )?;
     if decision != CacheDecision::Refresh {
         return Ok(false);
     }
 
     Ok(last_refresh_attempt_at.is_none_or(|attempted_at| {
         now.duration_since(attempted_at)
-            .is_ok_and(|elapsed| elapsed >= Duration::from_mins(5))
+            .is_ok_and(|elapsed| elapsed >= Duration::from_secs(5 * 60))
     }))
 }
 
@@ -3623,15 +3629,13 @@ mod tests {
         let mut output = String::with_capacity(value.len());
         let mut characters = value.chars();
         while let Some(character) = characters.next() {
-            if character == '\u{1b}' {
-                if matches!(characters.next(), Some('[')) {
-                    for next in characters.by_ref() {
-                        if matches!(next, 'A'..='Z' | 'a'..='z') {
-                            break;
-                        }
+            if character == '\u{1b}' && matches!(characters.next(), Some('[')) {
+                for next in characters.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
                     }
-                    continue;
                 }
+                continue;
             }
             output.push(character);
         }

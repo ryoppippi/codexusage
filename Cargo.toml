@@ -2,6 +2,15 @@
 name = "codexusage"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Fast CLI reports for OpenAI Codex session usage and cost"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Szpadel/codexusage"
+homepage = "https://github.com/Szpadel/codexusage"
+documentation = "https://docs.rs/codexusage"
+keywords = ["codex", "openai", "cli", "usage", "jsonl"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace]
 resolver = "2"

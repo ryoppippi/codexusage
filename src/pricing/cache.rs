@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Default time-to-live for the local pricing cache.
-pub(super) const CACHE_TTL: Duration = Duration::from_hours(24);
+pub(super) const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// `LiteLLM` model pricing dataset used for refreshes.
 const LITELLM_PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
