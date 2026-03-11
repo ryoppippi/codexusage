@@ -60,6 +60,12 @@ Custom refresh interval (default 5 seconds):
 codexusage watch --interval 10
 ```
 
+Opt in to per-model burn-rate columns inside the watch table:
+
+```bash
+codexusage watch --per-model-burn-rate
+```
+
 Sample output:
 
 ```text
@@ -80,6 +86,7 @@ Date: 2026-03-11  Window: 60 minutes
 ```
 
 Watch mode does not support `--json`, `--since`, `--until`, or `--last-days`.
+Use `--per-model-burn-rate` to append one burn-rate column per active model, with aggregate `Burn Rate (/h)` kept as the rightmost column.
 
 ## Options
 
@@ -101,6 +108,7 @@ Flags:
 - `--session-dir` - override session directory (repeatable)
 - `--threads N` - scanner worker count
 - `--number-format full` - show full token counts instead of K/M/B/T
+- `watch --per-model-burn-rate` - show per-model burn-rate columns in the live watch table
 
 `--last-days` cannot be combined with `--since` or `--until`.
 

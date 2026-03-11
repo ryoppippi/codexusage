@@ -235,11 +235,15 @@ struct WatchOptions {
     parallelism: ScannerParallelism,
     /// Refresh interval for the live screen.
     interval: Duration,
+    /// Show per-model detail rows in the watch table.
+    show_model_burn_rate: bool,
 }
 
 /// Rolling burn-rate metrics for watch mode.
 #[derive(Clone, Debug, PartialEq)]
 struct BurnRateSnapshot {
+    /// Exact rolling window duration.
+    window_duration: Duration,
     /// Effective rolling window width after current-day clamping.
     window_minutes: u64,
     /// Input tokens per hour.
@@ -265,6 +269,8 @@ struct WatchSnapshot {
     totals: Totals,
     /// Rolling burn-rate summary.
     burn_rate: BurnRateSnapshot,
+    /// Per-model rolling burn-window detail.
+    per_model: BTreeMap<String, ModelBreakdown>,
     /// Missing directories encountered during scan.
     missing_directories: Vec<String>,
     /// Last refresh time in the selected timezone.
@@ -359,7 +365,7 @@ fn build_watch_snapshot_with_pricing_at(
     let session_dirs = resolve_session_dirs(&options.session_dirs);
     let (missing_directories, selected_files) = collect_session_scan_targets(&session_dirs)?;
     let builder = scan_watch_targets(&selected_files, options.parallelism, timezone, now_utc)?;
-    Ok(builder.finish(pricing, missing_directories))
+    Ok(builder.finish(pricing, missing_directories, options.show_model_burn_rate))
 }
 
 /// Validate global flags that conflict with the watch contract.
@@ -670,10 +676,16 @@ fn run_watch_loop(options: &WatchOptions) -> Result<()> {
             snapshot_now,
             changes,
         )?;
-        let snapshot = runtime.snapshot(&pricing, snapshot_now)?;
+        let snapshot = runtime.snapshot(&pricing, snapshot_now, options.show_model_burn_rate)?;
         stdout.write_all(b"\x1b[2J\x1b[H")?;
         stdout.write_all(
-            render_watch_screen(&snapshot, &options.locale, options.number_format).as_bytes(),
+            render_watch_screen(
+                &snapshot,
+                &options.locale,
+                options.number_format,
+                options.show_model_burn_rate,
+            )
+            .as_bytes(),
         )?;
         stdout.flush()?;
         thread::sleep(remaining_watch_sleep(
@@ -796,7 +808,10 @@ where
     let parallelism = threads.map_or(ScannerParallelism::Auto, ScannerParallelism::Fixed);
 
     match command {
-        Some(Command::Watch { interval }) => {
+        Some(Command::Watch {
+            interval,
+            per_model_burn_rate,
+        }) => {
             validate_watch_flags(json, since.as_deref(), until.as_deref(), last_days)?;
             run_watch_loop(&WatchOptions {
                 timezone,
@@ -807,6 +822,7 @@ where
                 session_dirs: session_dir,
                 parallelism,
                 interval,
+                show_model_burn_rate: per_model_burn_rate,
             })
         }
         command => {
@@ -908,6 +924,9 @@ enum Command {
         /// Refresh interval in seconds.
         #[arg(long, value_name = "SECONDS", default_value = "5", value_parser = parse_interval_seconds)]
         interval: Duration,
+        /// Show per-model detail rows for every watch metric.
+        #[arg(long)]
+        per_model_burn_rate: bool,
     },
 }
 
@@ -2058,6 +2077,7 @@ impl WatchSnapshotContext {
         burn_window_summary: &GroupSummary,
         pricing: &PricingCatalog,
         missing_directories: Vec<String>,
+        include_per_model: bool,
     ) -> WatchSnapshot {
         let current_day_cost = calculate_summary_cost(&current_day_summary.models, pricing);
         let burn_cost = calculate_summary_cost(&burn_window_summary.models, pricing);
@@ -2069,11 +2089,17 @@ impl WatchSnapshotContext {
             total_tokens: current_day_summary.totals.total,
             cost_usd: current_day_cost,
         };
+        let per_model = if include_per_model {
+            to_sorted_models(&burn_window_summary.models, pricing)
+        } else {
+            BTreeMap::new()
+        };
 
         WatchSnapshot {
             date: self.current_day.format("%Y-%m-%d").to_string(),
             totals,
             burn_rate: BurnRateSnapshot {
+                window_duration: self.window_duration,
                 window_minutes: display_window_minutes(self.window_duration),
                 input_tokens_per_hour: scale_usage_per_hour(
                     burn_window_summary.totals.input,
@@ -2097,6 +2123,7 @@ impl WatchSnapshotContext {
                 ),
                 cost_usd_per_hour: scale_cost_per_hour(burn_cost, self.window_duration),
             },
+            per_model,
             missing_directories,
             updated_time: self
                 .now_utc
@@ -2175,12 +2202,18 @@ impl WatchBuilder {
     }
 
     /// Finish the snapshot.
-    fn finish(self, pricing: &PricingCatalog, missing_directories: Vec<String>) -> WatchSnapshot {
+    fn finish(
+        self,
+        pricing: &PricingCatalog,
+        missing_directories: Vec<String>,
+        include_per_model: bool,
+    ) -> WatchSnapshot {
         self.snapshot_context.finish(
             &self.current_day_summary,
             &self.burn_window_summary,
             pricing,
             missing_directories,
+            include_per_model,
         )
     }
 }
@@ -2526,13 +2559,19 @@ impl WatchRuntimeState {
     }
 
     /// Build one watch snapshot from the cached aggregate summaries.
-    fn snapshot(&self, pricing: &PricingCatalog, now_utc: DateTime<Utc>) -> Result<WatchSnapshot> {
+    fn snapshot(
+        &self,
+        pricing: &PricingCatalog,
+        now_utc: DateTime<Utc>,
+        include_per_model: bool,
+    ) -> Result<WatchSnapshot> {
         let snapshot_context = WatchSnapshotContext::new(self.timezone, now_utc)?;
         Ok(snapshot_context.finish(
             &self.current_day_summary,
             &self.burn_window_summary,
             pricing,
             self.missing_directories.clone(),
+            include_per_model,
         ))
     }
 }
@@ -4970,6 +5009,7 @@ mod tests {
                 session_dirs: vec![sessions],
                 parallelism: ScannerParallelism::Auto,
                 interval: Duration::from_secs(5),
+                show_model_burn_rate: true,
             },
             now,
         )
@@ -4988,6 +5028,10 @@ mod tests {
         assert_eq!(snapshot.burn_rate.reasoning_output_tokens_per_hour, 6);
         assert_eq!(snapshot.burn_rate.total_tokens_per_hour, 120);
         assert_eq!(snapshot.updated_time, "00:30:00");
+        let gpt5 = snapshot.per_model.get("gpt-5").expect("gpt-5 model");
+        assert_eq!(gpt5.input_tokens, 50);
+        assert_eq!(gpt5.cached_input_tokens, 15);
+        assert_eq!(gpt5.total_tokens, 60);
     }
 
     #[test]
@@ -5016,7 +5060,7 @@ mod tests {
         )
         .expect("runtime");
         let initial_snapshot = runtime
-            .snapshot(&PricingCatalog::default(), now)
+            .snapshot(&PricingCatalog::default(), now, false)
             .expect("initial snapshot");
         assert_eq!(initial_snapshot.totals.total_tokens, 23);
 
@@ -5039,7 +5083,7 @@ mod tests {
             )
             .expect("refresh");
         let refreshed_snapshot = runtime
-            .snapshot(&PricingCatalog::default(), now)
+            .snapshot(&PricingCatalog::default(), now, false)
             .expect("refreshed snapshot");
         assert_eq!(refreshed_snapshot.totals.input_tokens, 20);
         assert_eq!(refreshed_snapshot.totals.output_tokens, 3);
@@ -5072,7 +5116,7 @@ mod tests {
         .expect("runtime");
 
         let early_snapshot = runtime
-            .snapshot(&PricingCatalog::default(), loaded_at)
+            .snapshot(&PricingCatalog::default(), loaded_at, false)
             .expect("early snapshot");
         assert_eq!(early_snapshot.totals.total_tokens, 23);
         assert_eq!(early_snapshot.burn_rate.total_tokens_per_hour, 46);
@@ -5091,7 +5135,7 @@ mod tests {
             )
             .expect("advance runtime");
         let later_snapshot = runtime
-            .snapshot(&PricingCatalog::default(), later_now)
+            .snapshot(&PricingCatalog::default(), later_now, false)
             .expect("later snapshot");
         assert_eq!(later_snapshot.totals.total_tokens, 29);
         assert_eq!(later_snapshot.burn_rate.total_tokens_per_hour, 35);
@@ -5150,7 +5194,7 @@ mod tests {
             )
             .expect("refresh dirty session");
         let snapshot = runtime
-            .snapshot(&PricingCatalog::default(), now)
+            .snapshot(&PricingCatalog::default(), now, false)
             .expect("snapshot");
 
         assert_eq!(snapshot.totals.total_tokens, 29);
@@ -5211,7 +5255,7 @@ mod tests {
             )
             .expect("refresh rewritten session");
         let snapshot = runtime
-            .snapshot(&PricingCatalog::default(), now)
+            .snapshot(&PricingCatalog::default(), now, false)
             .expect("snapshot");
 
         assert_eq!(snapshot.totals.total_tokens, 62);
@@ -5451,6 +5495,7 @@ mod tests {
                     cost_usd: 1.25,
                 },
                 burn_rate: BurnRateSnapshot {
+                    window_duration: Duration::from_secs(30 * 60),
                     window_minutes: 30,
                     input_tokens_per_hour: 100,
                     cached_input_tokens_per_hour: 30,
@@ -5459,11 +5504,13 @@ mod tests {
                     total_tokens_per_hour: 120,
                     cost_usd_per_hour: 2.5,
                 },
+                per_model: BTreeMap::new(),
                 missing_directories: vec!["/tmp/missing".to_string()],
                 updated_time: "00:30:00".to_string(),
             },
             "en-US",
             NumberFormat::Short,
+            false,
         );
 
         assert!(rendered.contains("Current Day Codex Usage Watch"));
@@ -5489,6 +5536,7 @@ mod tests {
                 cost_usd: 12.5,
             },
             burn_rate: BurnRateSnapshot {
+                window_duration: Duration::from_secs(60 * 60),
                 window_minutes: 60,
                 input_tokens_per_hour: 100_000,
                 cached_input_tokens_per_hour: 2_000,
@@ -5497,16 +5545,148 @@ mod tests {
                 total_tokens_per_hour: 107_000,
                 cost_usd_per_hour: 12.5,
             },
+            per_model: BTreeMap::new(),
             missing_directories: Vec::new(),
             updated_time: "00:30:00".to_string(),
         };
 
-        let short = render_watch_screen(&snapshot, "en-US", NumberFormat::Short);
-        let full = render_watch_screen(&snapshot, "en-US", NumberFormat::Full);
+        let short = render_watch_screen(&snapshot, "en-US", NumberFormat::Short, false);
+        let full = render_watch_screen(&snapshot, "en-US", NumberFormat::Full, false);
 
         assert!(short.contains("100K"));
         assert!(!short.contains("100,000"));
         assert!(full.contains("100,000"));
+    }
+
+    #[test]
+    fn render_watch_screen_omits_per_model_columns_when_flag_is_disabled() {
+        let rendered = render_watch_screen(
+            &WatchSnapshot {
+                date: "2026-01-02".to_string(),
+                totals: Totals {
+                    input_tokens: 50,
+                    cached_input_tokens: 15,
+                    output_tokens: 10,
+                    reasoning_output_tokens: 3,
+                    total_tokens: 60,
+                    cost_usd: 1.25,
+                },
+                burn_rate: BurnRateSnapshot {
+                    window_duration: Duration::from_secs(30 * 60),
+                    window_minutes: 30,
+                    input_tokens_per_hour: 100,
+                    cached_input_tokens_per_hour: 30,
+                    output_tokens_per_hour: 20,
+                    reasoning_output_tokens_per_hour: 6,
+                    total_tokens_per_hour: 120,
+                    cost_usd_per_hour: 2.5,
+                },
+                per_model: BTreeMap::from([(
+                    "gpt-5".to_string(),
+                    ModelBreakdown {
+                        input_tokens: 20,
+                        cached_input_tokens: 5,
+                        output_tokens: 4,
+                        reasoning_output_tokens: 1,
+                        total_tokens: 24,
+                        cost_usd: 0.5,
+                        fallback_usage: UsageTotals::default(),
+                        fallback_cost_usd: 0.0,
+                        is_fallback: false,
+                    },
+                )]),
+                missing_directories: Vec::new(),
+                updated_time: "00:30:00".to_string(),
+            },
+            "en-US",
+            NumberFormat::Short,
+            false,
+        );
+
+        assert!(!rendered.contains("| gpt-5 "));
+    }
+
+    #[test]
+    fn render_watch_screen_includes_per_model_columns_and_skips_zero_usage_models() {
+        let rendered = render_watch_screen(
+            &WatchSnapshot {
+                date: "2026-01-02".to_string(),
+                totals: Totals {
+                    input_tokens: 50,
+                    cached_input_tokens: 15,
+                    output_tokens: 10,
+                    reasoning_output_tokens: 3,
+                    total_tokens: 60,
+                    cost_usd: 1.25,
+                },
+                burn_rate: BurnRateSnapshot {
+                    window_duration: Duration::from_secs(30 * 60),
+                    window_minutes: 30,
+                    input_tokens_per_hour: 100,
+                    cached_input_tokens_per_hour: 30,
+                    output_tokens_per_hour: 20,
+                    reasoning_output_tokens_per_hour: 6,
+                    total_tokens_per_hour: 120,
+                    cost_usd_per_hour: 2.5,
+                },
+                per_model: BTreeMap::from([
+                    (
+                        "gpt-5".to_string(),
+                        ModelBreakdown {
+                            input_tokens: 20,
+                            cached_input_tokens: 5,
+                            output_tokens: 4,
+                            reasoning_output_tokens: 1,
+                            total_tokens: 24,
+                            cost_usd: 0.5,
+                            fallback_usage: UsageTotals::default(),
+                            fallback_cost_usd: 0.0,
+                            is_fallback: false,
+                        },
+                    ),
+                    (
+                        "gpt-5-codex".to_string(),
+                        ModelBreakdown {
+                            input_tokens: 30,
+                            cached_input_tokens: 10,
+                            output_tokens: 6,
+                            reasoning_output_tokens: 2,
+                            total_tokens: 36,
+                            cost_usd: 0.75,
+                            fallback_usage: UsageTotals::default(),
+                            fallback_cost_usd: 0.0,
+                            is_fallback: false,
+                        },
+                    ),
+                    (
+                        "zero-model".to_string(),
+                        ModelBreakdown {
+                            input_tokens: 0,
+                            cached_input_tokens: 0,
+                            output_tokens: 0,
+                            reasoning_output_tokens: 0,
+                            total_tokens: 0,
+                            cost_usd: 0.0,
+                            fallback_usage: UsageTotals::default(),
+                            fallback_cost_usd: 0.0,
+                            is_fallback: false,
+                        },
+                    ),
+                ]),
+                missing_directories: Vec::new(),
+                updated_time: "00:30:00".to_string(),
+            },
+            "en-US",
+            NumberFormat::Short,
+            true,
+        );
+
+        assert!(rendered.contains("gpt-5"));
+        assert!(rendered.contains("gpt-5-codex"));
+        assert!(!rendered.contains("zero-model"));
+        assert!(rendered.contains("Burn Rate (/h)"));
+        assert!(rendered.contains("$1.00"));
+        assert!(rendered.contains("$1.50"));
     }
 
     #[test]
@@ -5566,6 +5746,204 @@ mod tests {
     }
 
     #[test]
+    fn render_watch_screen_places_burn_rate_column_last() {
+        let rendered = render_watch_screen(
+            &WatchSnapshot {
+                date: "2026-01-02".to_string(),
+                totals: Totals {
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    output_tokens: 2,
+                    reasoning_output_tokens: 1,
+                    total_tokens: 12,
+                    cost_usd: 0.25,
+                },
+                burn_rate: BurnRateSnapshot {
+                    window_duration: Duration::from_secs(30 * 60),
+                    window_minutes: 30,
+                    input_tokens_per_hour: 20,
+                    cached_input_tokens_per_hour: 0,
+                    output_tokens_per_hour: 4,
+                    reasoning_output_tokens_per_hour: 2,
+                    total_tokens_per_hour: 24,
+                    cost_usd_per_hour: 0.5,
+                },
+                per_model: BTreeMap::from([(
+                    "gpt-5".to_string(),
+                    ModelBreakdown {
+                        input_tokens: 10,
+                        cached_input_tokens: 0,
+                        output_tokens: 2,
+                        reasoning_output_tokens: 1,
+                        total_tokens: 12,
+                        cost_usd: 0.25,
+                        fallback_usage: UsageTotals::default(),
+                        fallback_cost_usd: 0.0,
+                        is_fallback: false,
+                    },
+                )]),
+                missing_directories: Vec::new(),
+                updated_time: "00:30:00".to_string(),
+            },
+            "en-US",
+            NumberFormat::Full,
+            true,
+        );
+
+        let header = rendered
+            .lines()
+            .find(|line| line.contains("Metric") && line.contains("Burn Rate (/h)"))
+            .expect("header");
+        assert!(header.contains("Metric"));
+        assert!(header.contains("Today"));
+        assert!(header.contains("gpt-5 /h"));
+        assert!(header.ends_with("Burn Rate (/h) |"));
+    }
+
+    #[test]
+    fn render_watch_screen_scales_each_model_burn_column_independently() {
+        let rendered = render_watch_screen(
+            &WatchSnapshot {
+                date: "2026-01-02".to_string(),
+                totals: Totals {
+                    input_tokens: 2,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 2,
+                    cost_usd: 0.02,
+                },
+                burn_rate: BurnRateSnapshot {
+                    window_duration: Duration::from_secs(59 * 60),
+                    window_minutes: 59,
+                    input_tokens_per_hour: 2,
+                    cached_input_tokens_per_hour: 0,
+                    output_tokens_per_hour: 0,
+                    reasoning_output_tokens_per_hour: 0,
+                    total_tokens_per_hour: 2,
+                    cost_usd_per_hour: 0.02,
+                },
+                per_model: BTreeMap::from([
+                    (
+                        "gpt-5".to_string(),
+                        ModelBreakdown {
+                            input_tokens: 1,
+                            cached_input_tokens: 0,
+                            output_tokens: 0,
+                            reasoning_output_tokens: 0,
+                            total_tokens: 1,
+                            cost_usd: 0.01,
+                            fallback_usage: UsageTotals::default(),
+                            fallback_cost_usd: 0.0,
+                            is_fallback: false,
+                        },
+                    ),
+                    (
+                        "gpt-5-codex".to_string(),
+                        ModelBreakdown {
+                            input_tokens: 1,
+                            cached_input_tokens: 0,
+                            output_tokens: 0,
+                            reasoning_output_tokens: 0,
+                            total_tokens: 1,
+                            cost_usd: 0.01,
+                            fallback_usage: UsageTotals::default(),
+                            fallback_cost_usd: 0.0,
+                            is_fallback: false,
+                        },
+                    ),
+                ]),
+                missing_directories: Vec::new(),
+                updated_time: "00:30:00".to_string(),
+            },
+            "en-US",
+            NumberFormat::Full,
+            true,
+        );
+
+        let input_row = rendered
+            .lines()
+            .find(|line| line.contains("| Input "))
+            .expect("input row");
+        let cells = input_row
+            .split('|')
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(cells, vec!["Input", "2", "1", "1", "2"]);
+    }
+
+    #[test]
+    fn render_watch_screen_includes_fallback_model_columns() {
+        let rendered = render_watch_screen(
+            &WatchSnapshot {
+                date: "2026-01-02".to_string(),
+                totals: Totals {
+                    input_tokens: 2,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 2,
+                    cost_usd: 0.02,
+                },
+                burn_rate: BurnRateSnapshot {
+                    window_duration: Duration::from_secs(30 * 60),
+                    window_minutes: 30,
+                    input_tokens_per_hour: 4,
+                    cached_input_tokens_per_hour: 0,
+                    output_tokens_per_hour: 0,
+                    reasoning_output_tokens_per_hour: 0,
+                    total_tokens_per_hour: 4,
+                    cost_usd_per_hour: 0.04,
+                },
+                per_model: BTreeMap::from([(
+                    "gpt-5".to_string(),
+                    ModelBreakdown {
+                        input_tokens: 2,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        reasoning_output_tokens: 0,
+                        total_tokens: 2,
+                        cost_usd: 0.01,
+                        fallback_usage: UsageTotals {
+                            input: 1,
+                            cached_input: 0,
+                            output: 0,
+                            reasoning_output: 0,
+                            total: 1,
+                        },
+                        fallback_cost_usd: 0.01,
+                        is_fallback: true,
+                    },
+                )]),
+                missing_directories: Vec::new(),
+                updated_time: "00:30:00".to_string(),
+            },
+            "en-US",
+            NumberFormat::Full,
+            true,
+        );
+
+        let header = rendered
+            .lines()
+            .find(|line| line.contains("Metric") && line.contains("Burn Rate (/h)"))
+            .expect("header");
+        assert!(header.contains("gpt-5 /h"));
+        assert!(header.contains("gpt-5 (fallback) /h"));
+
+        let input_row = rendered
+            .lines()
+            .find(|line| line.contains("| Input "))
+            .expect("input row");
+        let cells = input_row
+            .split('|')
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(cells, vec!["Input", "2", "2", "2", "4"]);
+    }
+
+    #[test]
     fn watch_pricing_refresh_due_uses_cache_age_and_retry_backoff() {
         let temp = TempDir::new().expect("tempdir");
         let cache_path = temp.path().join("pricing-cache.json");
@@ -5617,10 +5995,31 @@ mod tests {
     fn cli_accepts_watch_interval_flag() {
         let cli = Cli::try_parse_from(["codexusage", "watch", "--interval", "15"]).expect("cli");
 
-        let Some(Command::Watch { interval }) = cli.command else {
+        let Some(Command::Watch {
+            interval,
+            per_model_burn_rate,
+        }) = cli.command
+        else {
             panic!("expected watch command");
         };
         assert_eq!(interval, Duration::from_secs(15));
+        assert!(!per_model_burn_rate);
+    }
+
+    #[test]
+    fn cli_accepts_watch_per_model_burn_rate_flag() {
+        let cli =
+            Cli::try_parse_from(["codexusage", "watch", "--per-model-burn-rate"]).expect("cli");
+
+        let Some(Command::Watch {
+            interval,
+            per_model_burn_rate,
+        }) = cli.command
+        else {
+            panic!("expected watch command");
+        };
+        assert_eq!(interval, Duration::from_secs(5));
+        assert!(per_model_burn_rate);
     }
 
     #[test]

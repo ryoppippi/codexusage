@@ -1,6 +1,6 @@
 use super::{
     DailyRow, ModelBreakdown, MonthlyRow, NumberFormat, ReportOutput, SessionRow, Totals,
-    UsageTotals, WatchSnapshot,
+    UsageTotals, WatchSnapshot, scale_cost_per_hour, scale_usage_per_hour,
 };
 use std::collections::BTreeMap;
 use std::env;
@@ -57,6 +57,7 @@ pub(super) fn render_watch_screen(
     snapshot: &WatchSnapshot,
     _locale: &str,
     number_format: NumberFormat,
+    show_model_burn_rate: bool,
 ) -> String {
     let render_config = TableRenderConfig {
         style: detect_table_style(),
@@ -79,7 +80,13 @@ pub(super) fn render_watch_screen(
         snapshot.date, snapshot.burn_rate.window_minutes
     );
     let _ = writeln!(&mut output);
-    write_watch_table(&mut output, render_config, snapshot, number_format);
+    write_watch_table(
+        &mut output,
+        render_config,
+        snapshot,
+        number_format,
+        show_model_burn_rate,
+    );
 
     if !snapshot.missing_directories.is_empty() {
         let mut warning = String::from("Warning: missing session directories\n");
@@ -100,15 +107,26 @@ fn write_watch_table(
     render_config: TableRenderConfig,
     snapshot: &WatchSnapshot,
     number_format: NumberFormat,
+    show_model_burn_rate: bool,
 ) {
-    let headers = ["Metric", "Today", "Burn Rate (/h)"];
-    let rows = watch_rows(snapshot, number_format);
+    let model_columns = if show_model_burn_rate {
+        active_watch_burn_columns(snapshot)
+    } else {
+        Vec::new()
+    };
+    let mut header_strings = vec!["Metric".to_string(), "Today".to_string()];
+    header_strings.extend(model_columns.iter().map(|column| column.label.clone()));
+    header_strings.push("Burn Rate (/h)".to_string());
+    let headers = header_strings
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let rows = watch_rows(snapshot, number_format, &model_columns);
+    let mut updated_cells = vec!["Updated".to_string(), snapshot.date.clone()];
+    updated_cells.extend(vec![String::new(); model_columns.len()]);
+    updated_cells.push(snapshot.updated_time.clone());
     let updated_row = DisplayRow {
-        cells: vec![
-            "Updated".to_string(),
-            snapshot.date.clone(),
-            snapshot.updated_time.clone(),
-        ],
+        cells: updated_cells,
         kind: DisplayRowKind::GrandTotal,
     };
     let widths = column_widths(&headers, &rows, &updated_row, number_format);
@@ -513,25 +531,94 @@ fn model_display_row(
     }
 }
 
-/// Build one metric row for watch mode.
-fn watch_metric_row(metric: &str, today: String, burn_rate: String) -> DisplayRow {
+/// One active per-model burn-rate column in watch mode.
+struct WatchBurnColumn {
+    /// Header label.
+    label: String,
+    /// Raw burn-window usage for this column.
+    usage: UsageTotals,
+    /// Raw burn-window cost for this column.
+    cost_usd: f64,
+}
+
+/// Build one metric row for watch mode with optional per-model burn columns.
+fn watch_metric_row(
+    metric: &str,
+    today: String,
+    per_model: Vec<String>,
+    burn_rate: String,
+) -> DisplayRow {
+    let mut cells = Vec::with_capacity(per_model.len() + 3);
+    cells.push(metric.to_string());
+    cells.push(today);
+    cells.extend(per_model);
+    cells.push(burn_rate);
     DisplayRow {
-        cells: vec![metric.to_string(), today, burn_rate],
+        cells,
         kind: DisplayRowKind::Subtotal,
     }
 }
 
+/// Return the active per-model burn-rate columns.
+fn active_watch_burn_columns(snapshot: &WatchSnapshot) -> Vec<WatchBurnColumn> {
+    let mut columns = Vec::new();
+    for (model, breakdown) in &snapshot.per_model {
+        let explicit = explicit_usage(breakdown);
+        if explicit.has_usage() || breakdown.cost_usd > 0.0 {
+            columns.push(WatchBurnColumn {
+                label: format!("{model} /h"),
+                usage: explicit,
+                cost_usd: breakdown.cost_usd,
+            });
+        }
+
+        if breakdown.fallback_usage.has_usage() || breakdown.fallback_cost_usd > 0.0 {
+            columns.push(WatchBurnColumn {
+                label: format!("{model} (fallback) /h"),
+                usage: breakdown.fallback_usage.clone(),
+                cost_usd: breakdown.fallback_cost_usd,
+            });
+        }
+    }
+    columns
+}
+
 /// Build all metric rows for watch mode.
-fn watch_rows(snapshot: &WatchSnapshot, number_format: NumberFormat) -> Vec<DisplayRow> {
+fn watch_rows(
+    snapshot: &WatchSnapshot,
+    number_format: NumberFormat,
+    model_columns: &[WatchBurnColumn],
+) -> Vec<DisplayRow> {
+    let token_cells = |select: fn(&UsageTotals) -> u64| {
+        model_columns
+            .iter()
+            .map(|column| {
+                scale_usage_per_hour(select(&column.usage), snapshot.burn_rate.window_duration)
+            })
+            .map(|value| format_u64_with(value, number_format))
+            .collect::<Vec<_>>()
+    };
+    let cost_cells = model_columns
+        .iter()
+        .map(|column| {
+            format_currency(scale_cost_per_hour(
+                column.cost_usd,
+                snapshot.burn_rate.window_duration,
+            ))
+        })
+        .collect::<Vec<_>>();
+
     vec![
         watch_metric_row(
             "Input",
             format_u64_with(snapshot.totals.input_tokens, number_format),
+            token_cells(|usage| usage.input),
             format_u64_with(snapshot.burn_rate.input_tokens_per_hour, number_format),
         ),
         watch_metric_row(
             "Cache",
             format_u64_with(snapshot.totals.cached_input_tokens, number_format),
+            token_cells(|usage| usage.cached_input),
             format_u64_with(
                 snapshot.burn_rate.cached_input_tokens_per_hour,
                 number_format,
@@ -540,11 +627,13 @@ fn watch_rows(snapshot: &WatchSnapshot, number_format: NumberFormat) -> Vec<Disp
         watch_metric_row(
             "Output",
             format_u64_with(snapshot.totals.output_tokens, number_format),
+            token_cells(|usage| usage.output),
             format_u64_with(snapshot.burn_rate.output_tokens_per_hour, number_format),
         ),
         watch_metric_row(
             "Reasoning",
             format_u64_with(snapshot.totals.reasoning_output_tokens, number_format),
+            token_cells(|usage| usage.reasoning_output),
             format_u64_with(
                 snapshot.burn_rate.reasoning_output_tokens_per_hour,
                 number_format,
@@ -553,11 +642,13 @@ fn watch_rows(snapshot: &WatchSnapshot, number_format: NumberFormat) -> Vec<Disp
         watch_metric_row(
             "Total",
             format_u64_with(snapshot.totals.total_tokens, number_format),
+            token_cells(|usage| usage.total),
             format_u64_with(snapshot.burn_rate.total_tokens_per_hour, number_format),
         ),
         watch_metric_row(
             "Cost",
             format_currency(snapshot.totals.cost_usd),
+            cost_cells,
             format_currency(snapshot.burn_rate.cost_usd_per_hour),
         ),
     ]
