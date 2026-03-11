@@ -21,5 +21,9 @@ cov:
 doc:
 	cargo run -p xtask -- doc
 
+publish:
+	cargo run -p xtask -- ci
+	cargo publish
+
 run:
 	cargo run -- --
