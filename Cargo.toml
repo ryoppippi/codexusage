@@ -2,7 +2,7 @@
 name = "codexusage"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Fast CLI reports for OpenAI Codex session usage and cost"
 license = "MIT"
 readme = "README.md"
