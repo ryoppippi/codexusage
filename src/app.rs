@@ -3586,8 +3586,38 @@ fn calculate_cost_from_usage(usage: &UsageTotals, pricing: &Pricing) -> f64 {
 mod tests {
     use super::*;
     use filetime::FileTime;
+    use serde_json::json;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct LossyStringField<'a> {
+        #[serde(borrow, deserialize_with = "deserialize_optional_cow_lossy")]
+        value: Option<Cow<'a, str>>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct LossyU64Field {
+        #[serde(deserialize_with = "deserialize_u64_lossy")]
+        value: u64,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct LossyOptionalU64Field {
+        #[serde(deserialize_with = "deserialize_optional_u64_lossy")]
+        value: Option<u64>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct ObjectPayload {
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct LossyObjectField {
+        #[serde(deserialize_with = "deserialize_optional_object_lossy")]
+        value: Option<ObjectPayload>,
+    }
 
     #[test]
     fn normalize_filter_date_accepts_supported_formats() {
@@ -3679,6 +3709,90 @@ mod tests {
     }
 
     #[test]
+    fn lossy_string_deserializer_ignores_non_string_shapes() {
+        assert_eq!(
+            serde_json::from_str::<LossyStringField<'_>>(r#"{"value":"gpt-5"}"#)
+                .expect("string")
+                .value
+                .as_deref(),
+            Some("gpt-5")
+        );
+
+        for input in [
+            r#"{"value":null}"#,
+            r#"{"value":true}"#,
+            r#"{"value":-1}"#,
+            r#"{"value":7}"#,
+            r#"{"value":1.5}"#,
+            r#"{"value":["gpt-5"]}"#,
+            r#"{"value":{"model":"gpt-5"}}"#,
+        ] {
+            let field = serde_json::from_str::<LossyStringField<'_>>(input).expect("field");
+            assert_eq!(field.value, None);
+        }
+    }
+
+    #[test]
+    fn lossy_u64_deserializers_ignore_non_integer_shapes() {
+        assert_eq!(
+            serde_json::from_value::<LossyU64Field>(json!({"value": 7}))
+                .expect("integer")
+                .value,
+            7
+        );
+        assert_eq!(
+            serde_json::from_value::<LossyOptionalU64Field>(json!({"value": 7}))
+                .expect("optional integer")
+                .value,
+            Some(7)
+        );
+
+        for value in [
+            json!(null),
+            json!(true),
+            json!(-1),
+            json!(1.5),
+            json!("7"),
+            json!(["7"]),
+            json!({"value": 7}),
+        ] {
+            let field = serde_json::from_value::<LossyU64Field>(json!({"value": value}))
+                .expect("lossy u64 field");
+            assert_eq!(field.value, 0);
+
+            let optional = serde_json::from_value::<LossyOptionalU64Field>(json!({"value": value}))
+                .expect("lossy optional u64 field");
+            assert_eq!(optional.value, None);
+        }
+    }
+
+    #[test]
+    fn lossy_object_deserializer_ignores_non_object_shapes() {
+        assert_eq!(
+            serde_json::from_value::<LossyObjectField>(json!({"value": {"name": "codex"}}))
+                .expect("object")
+                .value,
+            Some(ObjectPayload {
+                name: "codex".to_string(),
+            })
+        );
+
+        for value in [
+            json!(null),
+            json!(true),
+            json!(-1),
+            json!(7),
+            json!(1.5),
+            json!("codex"),
+            json!(["codex"]),
+        ] {
+            let field =
+                serde_json::from_value::<LossyObjectField>(json!({"value": value})).expect("field");
+            assert_eq!(field.value, None);
+        }
+    }
+
+    #[test]
     fn subtract_usage_saturates_negative_deltas() {
         let delta = subtract_usage(
             RawUsage {
@@ -3741,6 +3855,130 @@ mod tests {
 
         assert_eq!(entries[0].0, "alpha/session");
         assert_eq!(entries[1].0, "zeta/session");
+    }
+
+    #[test]
+    fn mark_dirty_sessions_keeps_the_most_conservative_refresh_kind() {
+        let mut changes = WatchChangeSet::default();
+        changes.mark_dirty_sessions(vec!["session-a".to_string()], WatchDirtyKind::AppendOnly);
+        changes.mark_dirty_sessions(
+            vec!["session-a".to_string(), "session-b".to_string()],
+            WatchDirtyKind::FullRebuild,
+        );
+        changes.mark_dirty_sessions(vec!["session-b".to_string()], WatchDirtyKind::AppendOnly);
+
+        assert_eq!(
+            changes.dirty_sessions.get("session-a"),
+            Some(&WatchDirtyKind::FullRebuild)
+        );
+        assert_eq!(
+            changes.dirty_sessions.get("session-b"),
+            Some(&WatchDirtyKind::FullRebuild)
+        );
+    }
+
+    #[test]
+    fn validate_watch_flags_rejects_json_and_date_filters() {
+        assert!(validate_watch_flags(false, None, None, None).is_ok());
+        assert!(
+            validate_watch_flags(true, None, None, None)
+                .expect_err("json should fail")
+                .to_string()
+                .contains("--json")
+        );
+        assert!(
+            validate_watch_flags(false, Some("2026-01-01"), None, NonZeroUsize::new(1),)
+                .expect_err("date filters should fail")
+                .to_string()
+                .contains("--since")
+        );
+    }
+
+    #[test]
+    fn watch_helpers_classify_dirty_events_and_paths() {
+        let session_root = PathBuf::from("/tmp/codexusage-tests/sessions");
+        let session_path = session_root.join("team").join("session.jsonl");
+        let txt_path = session_root.join("team").join("session.txt");
+
+        assert_eq!(
+            watch_dirty_kind(NotifyEventKind::Modify(ModifyKind::Data(DataChange::Size))),
+            WatchDirtyKind::AppendOnly
+        );
+        assert_eq!(
+            watch_dirty_kind(NotifyEventKind::Create(notify::event::CreateKind::Any)),
+            WatchDirtyKind::FullRebuild
+        );
+        assert!(path_is_under_roots(
+            std::slice::from_ref(&session_root),
+            &session_path
+        ));
+        assert!(!path_is_under_roots(
+            std::slice::from_ref(&session_root),
+            Path::new("/tmp/elsewhere/session.jsonl")
+        ));
+        assert_eq!(
+            watch_event_session_ids(std::slice::from_ref(&session_root), &session_path),
+            vec!["team/session".to_string()]
+        );
+        assert!(watch_event_session_ids(&[session_root], &txt_path).is_empty());
+    }
+
+    #[test]
+    fn parse_interval_and_report_kind_helpers_cover_cli_routing_paths() {
+        assert_eq!(
+            parse_interval_seconds("5").expect("interval"),
+            Duration::from_secs(5)
+        );
+        assert!(
+            parse_interval_seconds("0")
+                .expect_err("zero should fail")
+                .contains("greater than 0")
+        );
+        assert!(
+            parse_interval_seconds("abc")
+                .expect_err("non-integer should fail")
+                .contains("positive integer")
+        );
+        assert_eq!(ReportKind::from_command(&Command::Daily), ReportKind::Daily);
+        assert_eq!(
+            ReportKind::from_command(&Command::Monthly),
+            ReportKind::Monthly
+        );
+        assert_eq!(
+            ReportKind::from_command(&Command::Session),
+            ReportKind::Session
+        );
+        assert!(is_false(&false));
+        assert!(!is_false(&true));
+    }
+
+    #[test]
+    fn supports_watch_screen_clear_wrapper_matches_term_contract() {
+        assert!(!supports_watch_screen_clear(Some("dumb")));
+        assert!(supports_watch_screen_clear(Some("xterm-256color")));
+    }
+
+    #[test]
+    fn run_succeeds_for_json_and_table_reports() {
+        let temp = TempDir::new().expect("tempdir");
+        let missing = temp.path().join("missing-sessions");
+
+        run(vec![
+            OsString::from("codexusage"),
+            OsString::from("--json"),
+            OsString::from("--offline"),
+            OsString::from("--session-dir"),
+            missing.clone().into_os_string(),
+        ])
+        .expect("json run");
+        run(vec![
+            OsString::from("codexusage"),
+            OsString::from("--offline"),
+            OsString::from("--session-dir"),
+            missing.into_os_string(),
+            OsString::from("session"),
+        ])
+        .expect("table run");
     }
 
     #[test]
