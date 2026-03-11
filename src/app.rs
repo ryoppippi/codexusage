@@ -3619,6 +3619,25 @@ mod tests {
         value: Option<ObjectPayload>,
     }
 
+    fn strip_ansi_sequences(value: &str) -> String {
+        let mut output = String::with_capacity(value.len());
+        let mut characters = value.chars();
+        while let Some(character) = characters.next() {
+            if character == '\u{1b}' {
+                if matches!(characters.next(), Some('[')) {
+                    for next in characters.by_ref() {
+                        if matches!(next, 'A'..='Z' | 'a'..='z') {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            output.push(character);
+        }
+        output
+    }
+
     #[test]
     fn normalize_filter_date_accepts_supported_formats() {
         assert_eq!(
@@ -4531,7 +4550,10 @@ mod tests {
         };
 
         let rendered = render_report(&daily, "en-US", NumberFormat::Full);
-        let lines = rendered.lines().collect::<Vec<_>>();
+        let lines = rendered
+            .lines()
+            .map(strip_ansi_sequences)
+            .collect::<Vec<_>>();
         let top = lines
             .iter()
             .find(|line| line.starts_with('+') || line.starts_with('┌'))
