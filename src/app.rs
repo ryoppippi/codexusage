@@ -3681,6 +3681,33 @@ mod tests {
         output
     }
 
+    fn watch_snapshot_with_models(models: BTreeMap<String, ModelBreakdown>) -> WatchSnapshot {
+        WatchSnapshot {
+            date: "2026-01-02".to_string(),
+            totals: Totals {
+                input_tokens: 60,
+                cached_input_tokens: 15,
+                output_tokens: 12,
+                reasoning_output_tokens: 3,
+                total_tokens: 72,
+                cost_usd: 1.80,
+            },
+            burn_rate: BurnRateSnapshot {
+                window_duration: Duration::from_secs(30 * 60),
+                window_minutes: 30,
+                input_tokens_per_hour: 120,
+                cached_input_tokens_per_hour: 30,
+                output_tokens_per_hour: 24,
+                reasoning_output_tokens_per_hour: 6,
+                total_tokens_per_hour: 144,
+                cost_usd_per_hour: 3.60,
+            },
+            per_model: models,
+            missing_directories: Vec::new(),
+            updated_time: "00:30:00".to_string(),
+        }
+    }
+
     #[test]
     fn normalize_filter_date_accepts_supported_formats() {
         assert_eq!(
@@ -5941,6 +5968,151 @@ mod tests {
             .filter(|cell| !cell.is_empty())
             .collect::<Vec<_>>();
         assert_eq!(cells, vec!["Input", "2", "2", "2", "4"]);
+    }
+
+    #[test]
+    fn render_watch_screen_wraps_model_columns_into_stacked_tables() {
+        let snapshot = watch_snapshot_with_models(BTreeMap::from([
+            (
+                "gpt-5".to_string(),
+                ModelBreakdown {
+                    input_tokens: 20,
+                    cached_input_tokens: 5,
+                    output_tokens: 4,
+                    reasoning_output_tokens: 1,
+                    total_tokens: 24,
+                    cost_usd: 0.60,
+                    fallback_usage: UsageTotals::default(),
+                    fallback_cost_usd: 0.0,
+                    is_fallback: false,
+                },
+            ),
+            (
+                "gpt-5-codex".to_string(),
+                ModelBreakdown {
+                    input_tokens: 20,
+                    cached_input_tokens: 5,
+                    output_tokens: 4,
+                    reasoning_output_tokens: 1,
+                    total_tokens: 24,
+                    cost_usd: 0.60,
+                    fallback_usage: UsageTotals::default(),
+                    fallback_cost_usd: 0.0,
+                    is_fallback: false,
+                },
+            ),
+            (
+                "gpt-4.1-mini".to_string(),
+                ModelBreakdown {
+                    input_tokens: 20,
+                    cached_input_tokens: 5,
+                    output_tokens: 4,
+                    reasoning_output_tokens: 1,
+                    total_tokens: 24,
+                    cost_usd: 0.60,
+                    fallback_usage: UsageTotals::default(),
+                    fallback_cost_usd: 0.0,
+                    is_fallback: false,
+                },
+            ),
+        ]));
+
+        let rendered = super::render::render_watch_screen_with_width(
+            &snapshot,
+            "en-US",
+            NumberFormat::Full,
+            true,
+            Some(40),
+        );
+
+        let header_lines = rendered
+            .lines()
+            .filter(|line| line.contains("Metric"))
+            .collect::<Vec<_>>();
+        assert_eq!(header_lines.len(), 3);
+        assert_eq!(
+            header_lines
+                .iter()
+                .filter(|line| line.contains("Today"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            header_lines
+                .iter()
+                .filter(|line| line.contains("Burn Rate (/h)"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.contains("| Input "))
+                .count(),
+            3
+        );
+        assert!(header_lines[0].contains("gpt-4.1-mini /h"));
+        assert!(header_lines[1].contains("gpt-5 /h"));
+        assert!(header_lines[2].contains("gpt-5-codex /h"));
+    }
+
+    #[test]
+    fn render_watch_screen_keeps_single_table_when_width_is_sufficient() {
+        let snapshot = watch_snapshot_with_models(BTreeMap::from([
+            (
+                "gpt-5".to_string(),
+                ModelBreakdown {
+                    input_tokens: 30,
+                    cached_input_tokens: 8,
+                    output_tokens: 5,
+                    reasoning_output_tokens: 2,
+                    total_tokens: 35,
+                    cost_usd: 0.75,
+                    fallback_usage: UsageTotals::default(),
+                    fallback_cost_usd: 0.0,
+                    is_fallback: false,
+                },
+            ),
+            (
+                "gpt-5-codex".to_string(),
+                ModelBreakdown {
+                    input_tokens: 30,
+                    cached_input_tokens: 7,
+                    output_tokens: 7,
+                    reasoning_output_tokens: 1,
+                    total_tokens: 37,
+                    cost_usd: 1.05,
+                    fallback_usage: UsageTotals::default(),
+                    fallback_cost_usd: 0.0,
+                    is_fallback: false,
+                },
+            ),
+        ]));
+
+        let rendered = super::render::render_watch_screen_with_width(
+            &snapshot,
+            "en-US",
+            NumberFormat::Full,
+            true,
+            Some(200),
+        );
+
+        let header_lines = rendered
+            .lines()
+            .filter(|line| line.contains("Metric"))
+            .collect::<Vec<_>>();
+        assert_eq!(header_lines.len(), 1);
+        assert!(header_lines[0].contains("Today"));
+        assert!(header_lines[0].contains("gpt-5 /h"));
+        assert!(header_lines[0].contains("gpt-5-codex /h"));
+        assert!(header_lines[0].contains("Burn Rate (/h)"));
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.contains("| Input "))
+                .count(),
+            1
+        );
     }
 
     #[test]

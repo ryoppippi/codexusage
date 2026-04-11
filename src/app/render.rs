@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::io::IsTerminal;
+use terminal_size::{Width, terminal_size};
 
 /// Render a report as a text table.
 pub(super) fn render_report(
@@ -55,9 +56,26 @@ pub(super) fn render_report(
 /// Render one live watch snapshot.
 pub(super) fn render_watch_screen(
     snapshot: &WatchSnapshot,
+    locale: &str,
+    number_format: NumberFormat,
+    show_model_burn_rate: bool,
+) -> String {
+    render_watch_screen_with_width(
+        snapshot,
+        locale,
+        number_format,
+        show_model_burn_rate,
+        detect_terminal_width(),
+    )
+}
+
+/// Render one live watch snapshot with an explicit terminal width override.
+pub(super) fn render_watch_screen_with_width(
+    snapshot: &WatchSnapshot,
     _locale: &str,
     number_format: NumberFormat,
     show_model_burn_rate: bool,
+    terminal_width: Option<usize>,
 ) -> String {
     let render_config = TableRenderConfig {
         style: detect_table_style(),
@@ -86,6 +104,7 @@ pub(super) fn render_watch_screen(
         snapshot,
         number_format,
         show_model_burn_rate,
+        terminal_width,
     );
 
     if !snapshot.missing_directories.is_empty() {
@@ -101,6 +120,11 @@ pub(super) fn render_watch_screen(
     output
 }
 
+/// Detect the current terminal width for live watch-mode wrapping.
+fn detect_terminal_width() -> Option<usize> {
+    terminal_size().map(|(Width(width), _height)| usize::from(width))
+}
+
 /// Render the watch metrics table.
 fn write_watch_table(
     output: &mut String,
@@ -108,54 +132,63 @@ fn write_watch_table(
     snapshot: &WatchSnapshot,
     number_format: NumberFormat,
     show_model_burn_rate: bool,
+    terminal_width: Option<usize>,
 ) {
     let model_columns = if show_model_burn_rate {
         active_watch_burn_columns(snapshot)
     } else {
         Vec::new()
     };
-    let mut header_strings = vec!["Metric".to_string(), "Today".to_string()];
-    header_strings.extend(model_columns.iter().map(|column| column.label.clone()));
-    header_strings.push("Burn Rate (/h)".to_string());
-    let headers = header_strings
+    let model_headers = model_columns
         .iter()
-        .map(String::as_str)
+        .map(|column| column.label.clone())
         .collect::<Vec<_>>();
     let rows = watch_rows(snapshot, number_format, &model_columns);
-    let mut updated_cells = vec!["Updated".to_string(), snapshot.date.clone()];
-    updated_cells.extend(vec![String::new(); model_columns.len()]);
-    updated_cells.push(snapshot.updated_time.clone());
-    let updated_row = DisplayRow {
-        cells: updated_cells,
-        kind: DisplayRowKind::GrandTotal,
-    };
-    let widths = column_widths(&headers, &rows, &updated_row, number_format);
+    let blocks = watch_table_blocks(
+        &model_headers,
+        &rows,
+        snapshot,
+        render_config,
+        terminal_width,
+    );
 
-    write_table_header(output, render_config, &headers, &widths);
-    for row in rows {
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+
+        let headers = watch_block_headers(&model_headers, block);
+        let header_refs = headers.iter().map(String::as_str).collect::<Vec<_>>();
+        let block_rows = watch_block_rows(&rows, block);
+        let updated_row = watch_updated_row(snapshot, block);
+        let widths = column_widths(&header_refs, &block_rows, &updated_row, number_format);
+
+        write_table_header(output, render_config, &header_refs, &widths);
+        for row in &block_rows {
+            write_table_row(
+                output,
+                render_config,
+                &header_refs,
+                &widths,
+                &row.cells,
+                row_table_element(row.kind),
+            );
+        }
         write_table_row(
             output,
             render_config,
-            &headers,
+            &header_refs,
             &widths,
-            &row.cells,
-            row_table_element(row.kind),
+            &updated_row.cells,
+            row_table_element(updated_row.kind),
+        );
+        write_table_rule(
+            output,
+            render_config.style,
+            table_rule_element(TableRuleKind::Bottom),
+            &table_rule(TableRuleKind::Bottom, render_config.borders, &widths),
         );
     }
-    write_table_row(
-        output,
-        render_config,
-        &headers,
-        &widths,
-        &updated_row.cells,
-        row_table_element(updated_row.kind),
-    );
-    write_table_rule(
-        output,
-        render_config.style,
-        table_rule_element(TableRuleKind::Bottom),
-        &table_rule(TableRuleKind::Bottom, render_config.borders, &widths),
-    );
 }
 
 /// Render the daily report body.
@@ -541,21 +574,51 @@ struct WatchBurnColumn {
     cost_usd: f64,
 }
 
-/// Build one metric row for watch mode with optional per-model burn columns.
-fn watch_metric_row(
-    metric: &str,
+/// One logical metric row in the watch table before block projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WatchMetricRow {
+    /// Left-hand row label repeated in every block.
+    metric: &'static str,
+    /// Current-day aggregate value.
     today: String,
+    /// Per-model burn-rate cells in model order.
     per_model: Vec<String>,
+    /// Aggregate burn-rate value.
     burn_rate: String,
-) -> DisplayRow {
-    let mut cells = Vec::with_capacity(per_model.len() + 3);
-    cells.push(metric.to_string());
-    cells.push(today);
-    cells.extend(per_model);
-    cells.push(burn_rate);
-    DisplayRow {
-        cells,
-        kind: DisplayRowKind::Subtotal,
+}
+
+/// One stacked watch-table block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WatchTableBlock {
+    /// Whether this block includes the `Today` aggregate column.
+    include_today: bool,
+    /// Start offset inside the per-model column list.
+    model_start: usize,
+    /// Exclusive end offset inside the per-model column list.
+    model_end: usize,
+    /// Whether this block includes the aggregate burn-rate column.
+    include_burn_rate: bool,
+}
+
+impl WatchTableBlock {
+    /// Build one block descriptor over a contiguous model column range.
+    const fn new(
+        include_today: bool,
+        model_start: usize,
+        model_end: usize,
+        include_burn_rate: bool,
+    ) -> Self {
+        Self {
+            include_today,
+            model_start,
+            model_end,
+            include_burn_rate,
+        }
+    }
+
+    /// Return how many model columns are projected into this block.
+    const fn model_count(self) -> usize {
+        self.model_end.saturating_sub(self.model_start)
     }
 }
 
@@ -588,7 +651,7 @@ fn watch_rows(
     snapshot: &WatchSnapshot,
     number_format: NumberFormat,
     model_columns: &[WatchBurnColumn],
-) -> Vec<DisplayRow> {
+) -> Vec<WatchMetricRow> {
     let token_cells = |select: fn(&UsageTotals) -> u64| {
         model_columns
             .iter()
@@ -609,49 +672,228 @@ fn watch_rows(
         .collect::<Vec<_>>();
 
     vec![
-        watch_metric_row(
-            "Input",
-            format_u64_with(snapshot.totals.input_tokens, number_format),
-            token_cells(|usage| usage.input),
-            format_u64_with(snapshot.burn_rate.input_tokens_per_hour, number_format),
-        ),
-        watch_metric_row(
-            "Cache",
-            format_u64_with(snapshot.totals.cached_input_tokens, number_format),
-            token_cells(|usage| usage.cached_input),
-            format_u64_with(
+        WatchMetricRow {
+            metric: "Input",
+            today: format_u64_with(snapshot.totals.input_tokens, number_format),
+            per_model: token_cells(|usage| usage.input),
+            burn_rate: format_u64_with(snapshot.burn_rate.input_tokens_per_hour, number_format),
+        },
+        WatchMetricRow {
+            metric: "Cache",
+            today: format_u64_with(snapshot.totals.cached_input_tokens, number_format),
+            per_model: token_cells(|usage| usage.cached_input),
+            burn_rate: format_u64_with(
                 snapshot.burn_rate.cached_input_tokens_per_hour,
                 number_format,
             ),
-        ),
-        watch_metric_row(
-            "Output",
-            format_u64_with(snapshot.totals.output_tokens, number_format),
-            token_cells(|usage| usage.output),
-            format_u64_with(snapshot.burn_rate.output_tokens_per_hour, number_format),
-        ),
-        watch_metric_row(
-            "Reasoning",
-            format_u64_with(snapshot.totals.reasoning_output_tokens, number_format),
-            token_cells(|usage| usage.reasoning_output),
-            format_u64_with(
+        },
+        WatchMetricRow {
+            metric: "Output",
+            today: format_u64_with(snapshot.totals.output_tokens, number_format),
+            per_model: token_cells(|usage| usage.output),
+            burn_rate: format_u64_with(snapshot.burn_rate.output_tokens_per_hour, number_format),
+        },
+        WatchMetricRow {
+            metric: "Reasoning",
+            today: format_u64_with(snapshot.totals.reasoning_output_tokens, number_format),
+            per_model: token_cells(|usage| usage.reasoning_output),
+            burn_rate: format_u64_with(
                 snapshot.burn_rate.reasoning_output_tokens_per_hour,
                 number_format,
             ),
-        ),
-        watch_metric_row(
-            "Total",
-            format_u64_with(snapshot.totals.total_tokens, number_format),
-            token_cells(|usage| usage.total),
-            format_u64_with(snapshot.burn_rate.total_tokens_per_hour, number_format),
-        ),
-        watch_metric_row(
-            "Cost",
-            format_currency(snapshot.totals.cost_usd),
-            cost_cells,
-            format_currency(snapshot.burn_rate.cost_usd_per_hour),
-        ),
+        },
+        WatchMetricRow {
+            metric: "Total",
+            today: format_u64_with(snapshot.totals.total_tokens, number_format),
+            per_model: token_cells(|usage| usage.total),
+            burn_rate: format_u64_with(snapshot.burn_rate.total_tokens_per_hour, number_format),
+        },
+        WatchMetricRow {
+            metric: "Cost",
+            today: format_currency(snapshot.totals.cost_usd),
+            per_model: cost_cells,
+            burn_rate: format_currency(snapshot.burn_rate.cost_usd_per_hour),
+        },
     ]
+}
+
+/// Shared inputs for stacked watch-table layout decisions.
+struct WatchBlockLayoutContext<'a> {
+    /// Ordered per-model header labels.
+    model_headers: &'a [String],
+    /// Logical watch rows projected into blocks during layout.
+    rows: &'a [WatchMetricRow],
+    /// Snapshot metadata used by the repeated `Updated` row.
+    snapshot: &'a WatchSnapshot,
+    /// Shared table rendering configuration.
+    render_config: TableRenderConfig,
+    /// Maximum width available for one rendered table block.
+    terminal_width: usize,
+}
+
+impl WatchBlockLayoutContext<'_> {
+    /// Pick the minimal stacked block layout from one model-column offset.
+    fn best_layout_from(
+        &self,
+        model_start: usize,
+        include_today: bool,
+        best_tails: &[Option<Vec<WatchTableBlock>>],
+    ) -> Option<Vec<WatchTableBlock>> {
+        let mut best_layout = None;
+        for model_end in (model_start + 1..=self.model_headers.len()).rev() {
+            let block = WatchTableBlock::new(
+                include_today,
+                model_start,
+                model_end,
+                model_end == self.model_headers.len(),
+            );
+            if !self.block_fits_or_forces(block) {
+                continue;
+            }
+
+            let candidate = if block.include_burn_rate {
+                Some(vec![block])
+            } else {
+                best_tails
+                    .get(model_end)
+                    .and_then(|tail| tail.as_ref())
+                    .map(|tail| {
+                        let mut layout = Vec::with_capacity(tail.len() + 1);
+                        layout.push(block);
+                        layout.extend(tail.iter().copied());
+                        layout
+                    })
+            };
+
+            if let Some(candidate) = candidate {
+                let should_replace = best_layout
+                    .as_ref()
+                    .is_none_or(|existing: &Vec<WatchTableBlock>| candidate.len() < existing.len());
+                if should_replace {
+                    best_layout = Some(candidate);
+                }
+            }
+        }
+        best_layout
+    }
+
+    /// Return whether the block fits the terminal or qualifies for forced one-column overflow.
+    fn block_fits_or_forces(&self, block: WatchTableBlock) -> bool {
+        if self.block_width(block) <= self.terminal_width {
+            return true;
+        }
+        block.model_count() == 1
+    }
+
+    /// Compute the rendered width of one stacked watch block.
+    fn block_width(&self, block: WatchTableBlock) -> usize {
+        let headers = watch_block_headers(self.model_headers, &block);
+        let header_refs = headers.iter().map(String::as_str).collect::<Vec<_>>();
+        let projected_rows = watch_block_rows(self.rows, &block);
+        let updated_row = watch_updated_row(self.snapshot, &block);
+        let widths = column_widths(
+            &header_refs,
+            &projected_rows,
+            &updated_row,
+            self.render_config.number_format,
+        );
+        table_display_width(&widths)
+    }
+}
+
+/// Build the stacked watch-table blocks for the current terminal width.
+fn watch_table_blocks(
+    model_headers: &[String],
+    rows: &[WatchMetricRow],
+    snapshot: &WatchSnapshot,
+    render_config: TableRenderConfig,
+    terminal_width: Option<usize>,
+) -> Vec<WatchTableBlock> {
+    let full_block = WatchTableBlock::new(true, 0, model_headers.len(), true);
+    let Some(terminal_width) = terminal_width else {
+        return vec![full_block];
+    };
+    let layout = WatchBlockLayoutContext {
+        model_headers,
+        rows,
+        snapshot,
+        render_config,
+        terminal_width,
+    };
+    if model_headers.is_empty() || layout.block_width(full_block) <= terminal_width {
+        return vec![full_block];
+    }
+
+    let mut best_tails = vec![None; model_headers.len() + 1];
+    best_tails[model_headers.len()] = Some(Vec::new());
+
+    for model_start in (0..model_headers.len()).rev() {
+        best_tails[model_start] = layout.best_layout_from(model_start, false, &best_tails);
+    }
+
+    layout
+        .best_layout_from(0, true, &best_tails)
+        .unwrap_or_else(|| vec![full_block])
+}
+
+/// Build the projected headers for one stacked watch block.
+fn watch_block_headers(model_headers: &[String], block: &WatchTableBlock) -> Vec<String> {
+    let mut headers = Vec::with_capacity(block.model_count() + 3);
+    headers.push("Metric".to_string());
+    if block.include_today {
+        headers.push("Today".to_string());
+    }
+    headers.extend(
+        model_headers[block.model_start..block.model_end]
+            .iter()
+            .cloned(),
+    );
+    if block.include_burn_rate {
+        headers.push("Burn Rate (/h)".to_string());
+    }
+    headers
+}
+
+/// Project the logical watch rows into one stacked block.
+fn watch_block_rows(rows: &[WatchMetricRow], block: &WatchTableBlock) -> Vec<DisplayRow> {
+    rows.iter()
+        .map(|row| {
+            let mut cells = Vec::with_capacity(block.model_count() + 3);
+            cells.push(row.metric.to_string());
+            if block.include_today {
+                cells.push(row.today.clone());
+            }
+            cells.extend(
+                row.per_model[block.model_start..block.model_end]
+                    .iter()
+                    .cloned(),
+            );
+            if block.include_burn_rate {
+                cells.push(row.burn_rate.clone());
+            }
+            DisplayRow {
+                cells,
+                kind: DisplayRowKind::Subtotal,
+            }
+        })
+        .collect()
+}
+
+/// Build the repeated `Updated` row for one stacked block.
+fn watch_updated_row(snapshot: &WatchSnapshot, block: &WatchTableBlock) -> DisplayRow {
+    let mut cells = Vec::with_capacity(block.model_count() + 3);
+    cells.push("Updated".to_string());
+    if block.include_today {
+        cells.push(snapshot.date.clone());
+    }
+    cells.extend(vec![String::new(); block.model_count()]);
+    if block.include_burn_rate {
+        cells.push(snapshot.updated_time.clone());
+    }
+    DisplayRow {
+        cells,
+        kind: DisplayRowKind::GrandTotal,
+    }
 }
 
 /// Return the explicit portion of a mixed model breakdown.
@@ -773,12 +1015,16 @@ fn column_widths(
 ) -> Vec<usize> {
     let mut widths = headers
         .iter()
-        .map(|header| header.len())
+        .map(|header| display_width(header))
         .collect::<Vec<_>>();
     for row in rows.iter().chain(std::iter::once(grand_total_row)) {
         for (index, cell) in row.cells.iter().enumerate() {
-            widths[index] =
-                widths[index].max(format_table_cell(headers, index, cell, number_format).len());
+            widths[index] = widths[index].max(display_width(&format_table_cell(
+                headers,
+                index,
+                cell,
+                number_format,
+            )));
         }
     }
     widths
@@ -893,12 +1139,7 @@ fn format_aligned_cells(
         .enumerate()
         .map(|(index, cell)| {
             let display = format_table_cell(headers, index, cell, number_format);
-            let formatted = if index <= text_column_limit(headers)
-                || headers[index] == "Directory"
-                || headers[index] == "Session"
-                || headers[index] == "Model"
-                || headers[index] == "Last Activity"
-            {
+            let formatted = if should_left_align(headers[index], &display) {
                 format!("{display:width$}", width = widths[index])
             } else {
                 format!("{display:>width$}", width = widths[index])
@@ -1028,13 +1269,25 @@ fn write_table_rule(output: &mut String, style: TableStyle, element: TableElemen
     let _ = writeln!(output, "{}", paint(style, element, line));
 }
 
-/// How many leading columns should left-align in this table.
-fn text_column_limit(headers: &[&str]) -> usize {
-    if headers.first() == Some(&"Directory") {
-        2
-    } else {
-        1
+/// Return the rendered table width in terminal columns.
+fn table_display_width(widths: &[usize]) -> usize {
+    widths.iter().sum::<usize>() + (widths.len() * 3) + 1
+}
+
+/// Return the number of terminal columns occupied by this string.
+fn display_width(value: &str) -> usize {
+    value.chars().count()
+}
+
+/// Return whether this cell should be left-aligned.
+fn should_left_align(header: &str, display: &str) -> bool {
+    if header == "Today" && display.contains('-') {
+        return true;
     }
+    matches!(
+        header,
+        "Date" | "Month" | "Metric" | "Directory" | "Session" | "Model" | "Last Activity"
+    )
 }
 
 /// One styleable table element.
@@ -1178,4 +1431,156 @@ fn format_short_with_suffix(value: u128, decimals: u32, suffix: &str) -> String 
 /// Format USD with two decimal places.
 pub(super) fn format_currency(value: f64) -> String {
     format!("${value:.2}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn watch_layout_snapshot() -> WatchSnapshot {
+        WatchSnapshot {
+            date: "2026-01-02".to_string(),
+            totals: Totals {
+                input_tokens: 3,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 3,
+                cost_usd: 0.03,
+            },
+            burn_rate: super::super::BurnRateSnapshot {
+                window_duration: Duration::from_secs(30 * 60),
+                window_minutes: 30,
+                input_tokens_per_hour: 6,
+                cached_input_tokens_per_hour: 0,
+                output_tokens_per_hour: 0,
+                reasoning_output_tokens_per_hour: 0,
+                total_tokens_per_hour: 6,
+                cost_usd_per_hour: 0.06,
+            },
+            per_model: BTreeMap::new(),
+            missing_directories: Vec::new(),
+            updated_time: "00:30:00".to_string(),
+        }
+    }
+
+    fn watch_layout_rows() -> Vec<WatchMetricRow> {
+        vec![WatchMetricRow {
+            metric: "Input",
+            today: "3".to_string(),
+            per_model: vec!["1".to_string(), "1".to_string(), "1".to_string()],
+            burn_rate: "6".to_string(),
+        }]
+    }
+
+    #[test]
+    fn watch_table_blocks_keep_single_block_when_width_is_sufficient() {
+        let blocks = watch_table_blocks(
+            &[
+                "alpha /h".to_string(),
+                "beta /h".to_string(),
+                "gamma /h".to_string(),
+            ],
+            &watch_layout_rows(),
+            &watch_layout_snapshot(),
+            TableRenderConfig {
+                style: TableStyle::Plain,
+                borders: BorderStyle::Ascii,
+                number_format: NumberFormat::Full,
+            },
+            Some(120),
+        );
+
+        assert_eq!(blocks, vec![WatchTableBlock::new(true, 0, 3, true)]);
+    }
+
+    #[test]
+    fn watch_table_blocks_split_into_minimal_stacked_layout() {
+        let blocks = watch_table_blocks(
+            &[
+                "alpha /h".to_string(),
+                "beta /h".to_string(),
+                "gamma /h".to_string(),
+            ],
+            &watch_layout_rows(),
+            &watch_layout_snapshot(),
+            TableRenderConfig {
+                style: TableStyle::Plain,
+                borders: BorderStyle::Ascii,
+                number_format: NumberFormat::Full,
+            },
+            Some(24),
+        );
+
+        assert_eq!(
+            blocks,
+            vec![
+                WatchTableBlock::new(true, 0, 1, false),
+                WatchTableBlock::new(false, 1, 2, false),
+                WatchTableBlock::new(false, 2, 3, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn watch_table_blocks_measure_unicode_borders_in_terminal_columns() {
+        let snapshot = watch_layout_snapshot();
+        let rows = watch_layout_rows();
+        let model_headers = vec!["alpha /h".to_string()];
+        let render_config = TableRenderConfig {
+            style: TableStyle::Plain,
+            borders: BorderStyle::Unicode,
+            number_format: NumberFormat::Full,
+        };
+        let layout = WatchBlockLayoutContext {
+            model_headers: &model_headers,
+            rows: &rows,
+            snapshot: &snapshot,
+            render_config,
+            terminal_width: usize::MAX,
+        };
+        let full_block = WatchTableBlock::new(true, 0, 1, true);
+        let measured_width = layout.block_width(full_block);
+
+        assert_eq!(measured_width, 52);
+        assert_eq!(
+            watch_table_blocks(
+                &model_headers,
+                &rows,
+                &snapshot,
+                render_config,
+                Some(measured_width),
+            ),
+            vec![full_block]
+        );
+    }
+
+    #[test]
+    fn today_column_right_aligns_numbers_but_keeps_updated_date_readable() {
+        let headers = ["Metric", "Today", "Burn Rate (/h)"];
+        let widths = [7, 10, 14];
+        let numeric_row = format_data_row(
+            &headers,
+            BorderStyle::Ascii,
+            &widths,
+            &["Input".to_string(), "120".to_string(), "240".to_string()],
+        );
+        let updated_row = format_data_row(
+            &headers,
+            BorderStyle::Ascii,
+            &widths,
+            &[
+                "Updated".to_string(),
+                "2026-01-02".to_string(),
+                "00:30:00".to_string(),
+            ],
+        );
+
+        let numeric_cells = numeric_row.split('|').collect::<Vec<_>>();
+        assert_eq!(numeric_cells[2], "        120 ");
+
+        let updated_cells = updated_row.split('|').collect::<Vec<_>>();
+        assert_eq!(updated_cells[2], " 2026-01-02 ");
+    }
 }
