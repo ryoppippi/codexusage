@@ -6,6 +6,8 @@ use crate::pricing::{
 };
 use chrono::{DateTime, Days, LocalResult, NaiveDate, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
+#[cfg(debug_assertions)]
+use clap::Args;
 use clap::{Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, eyre};
 use notify::{
@@ -30,7 +32,14 @@ use std::time::{Duration, Instant, SystemTime};
 #[path = "app/render.rs"]
 mod render;
 
+/// CLI-only scan progress and debug runtime helpers.
+#[path = "app/scan_runtime.rs"]
+mod scan_runtime;
+
 use render::{explicit_usage, render_report, render_watch_screen};
+#[cfg(test)]
+use scan_runtime::NoopScanBatchRunner;
+use scan_runtime::{CliScanBatchRunner, ScanBatchRunner, ScanBehavior, ScanObserver};
 
 #[cfg(test)]
 use render::{
@@ -237,6 +246,18 @@ struct WatchOptions {
     interval: Duration,
     /// Show per-model detail rows in the watch table.
     show_model_burn_rate: bool,
+    /// Debug-only runtime options forwarded from the CLI.
+    #[cfg(debug_assertions)]
+    debug: DebugRuntimeOptions,
+}
+
+/// Debug-only runtime options for development builds.
+#[cfg(debug_assertions)]
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DebugRuntimeOptions {
+    /// Simulate variable disk latency before opening each parsed file.
+    #[arg(long = "debug-simulate-slow-disk", global = true)]
+    simulate_slow_disk: bool,
 }
 
 /// Rolling burn-rate metrics for watch mode.
@@ -315,13 +336,22 @@ pub enum ReportOutput {
     },
 }
 
-/// Build the requested report from the provided session directories.
-///
-/// # Errors
-///
-/// Returns an error when date filters are invalid, pricing setup fails, session files cannot be
-/// read, or an event timestamp is malformed.
-pub fn build_report(kind: ReportKind, options: &ReportOptions) -> Result<ReportOutput> {
+/// Report inputs resolved once before the scan starts.
+struct PreparedReport {
+    /// Timezone used for grouping and date filters.
+    timezone: Tz,
+    /// Inclusive lower bound after normalization.
+    since: Option<NaiveDate>,
+    /// Inclusive upper bound after normalization.
+    until: Option<NaiveDate>,
+    /// Session roots selected for this run.
+    session_dirs: Vec<PathBuf>,
+    /// Pricing catalog loaded for the final render.
+    pricing: PricingCatalog,
+}
+
+/// Resolve shared report inputs before scanning.
+fn prepare_report(kind: ReportKind, options: &ReportOptions) -> Result<PreparedReport> {
     let timezone = parse_timezone(&options.timezone)?;
     let (since, until) = resolve_report_date_filters(
         kind,
@@ -331,14 +361,94 @@ pub fn build_report(kind: ReportKind, options: &ReportOptions) -> Result<ReportO
         timezone,
         Utc::now(),
     )?;
-    let session_dirs = resolve_session_dirs(&options.session_dirs);
-    let pricing = load_pricing_catalog(&PricingLoadOptions {
-        offline: options.offline,
-        force_refresh: options.refresh_pricing,
-    })?;
-    let mut builder = ReportBuilder::new(kind, timezone, since, until);
-    let missing_directories = scan_session_dirs(&session_dirs, options.parallelism, &mut builder)?;
-    builder.finish(&pricing, missing_directories)
+    Ok(PreparedReport {
+        timezone,
+        since,
+        until,
+        session_dirs: resolve_session_dirs(&options.session_dirs),
+        pricing: load_pricing_catalog(&PricingLoadOptions {
+            offline: options.offline,
+            force_refresh: options.refresh_pricing,
+        })?,
+    })
+}
+
+/// Build the requested report from the provided session directories.
+///
+/// # Errors
+///
+/// Returns an error when date filters are invalid, pricing setup fails, session files cannot be
+/// read, or an event timestamp is malformed.
+pub fn build_report(kind: ReportKind, options: &ReportOptions) -> Result<ReportOutput> {
+    let prepared = prepare_report(kind, options)?;
+    build_report_from_prepared_targets(
+        kind,
+        &prepared,
+        options.parallelism,
+        |selected_files, parallelism, kind, timezone, since, until| {
+            scan_selected_session_targets(selected_files, parallelism, kind, timezone, since, until)
+        },
+    )
+}
+
+/// Build the requested report with CLI-only scan behavior enabled.
+fn build_report_for_cli(
+    kind: ReportKind,
+    options: &ReportOptions,
+    scan_behavior: ScanBehavior,
+) -> Result<ReportOutput> {
+    let prepared = prepare_report(kind, options)?;
+    let scan_runner = CliScanBatchRunner::new(scan_behavior);
+    build_report_from_prepared_targets(
+        kind,
+        &prepared,
+        options.parallelism,
+        |selected_files, parallelism, kind, timezone, since, until| {
+            scan_runner.run_batch(selected_files.len(), |observer| {
+                scan_selected_session_targets_with_observer(
+                    selected_files,
+                    parallelism,
+                    kind,
+                    timezone,
+                    since,
+                    until,
+                    observer,
+                )
+            })
+        },
+    )
+}
+
+/// Finish one report from prepared shared inputs and a selected-target scan strategy.
+fn build_report_from_prepared_targets<S>(
+    kind: ReportKind,
+    prepared: &PreparedReport,
+    parallelism: ScannerParallelism,
+    scan_targets: S,
+) -> Result<ReportOutput>
+where
+    S: FnOnce(
+        &[SessionScanTarget],
+        ScannerParallelism,
+        ReportKind,
+        Tz,
+        Option<NaiveDate>,
+        Option<NaiveDate>,
+    ) -> Result<ReportBuilder>,
+{
+    let mut builder = ReportBuilder::new(kind, prepared.timezone, prepared.since, prepared.until);
+    let (missing_directories, selected_files) =
+        collect_session_scan_targets(&prepared.session_dirs)?;
+    let scanned = scan_targets(
+        &selected_files,
+        parallelism,
+        kind,
+        prepared.timezone,
+        prepared.since,
+        prepared.until,
+    )?;
+    builder.merge(scanned);
+    builder.finish(&prepared.pricing, missing_directories)
 }
 
 /// Build one watch snapshot at a fixed logical time.
@@ -385,6 +495,18 @@ fn validate_watch_flags(
     }
 
     Ok(())
+}
+
+/// Build the scan behavior used by CLI-driven scans.
+#[cfg(debug_assertions)]
+fn cli_scan_behavior(show_progress: bool, debug_simulate_slow_disk: bool) -> ScanBehavior {
+    ScanBehavior::cli(show_progress, debug_simulate_slow_disk)
+}
+
+/// Build the scan behavior used by CLI-driven scans.
+#[cfg(not(debug_assertions))]
+fn cli_scan_behavior(show_progress: bool) -> ScanBehavior {
+    ScanBehavior::cli(show_progress)
 }
 
 /// Pending filesystem changes observed by the watch backend.
@@ -639,9 +761,24 @@ fn run_watch_loop(options: &WatchOptions) -> Result<()> {
     })?;
     let timezone = parse_timezone(&options.timezone)?;
     let session_dirs = resolve_session_dirs(&options.session_dirs);
+    #[cfg(debug_assertions)]
+    let startup_scan_behavior = cli_scan_behavior(true, options.debug.simulate_slow_disk);
+    #[cfg(not(debug_assertions))]
+    let startup_scan_behavior = cli_scan_behavior(true);
+    #[cfg(debug_assertions)]
+    let refresh_scan_behavior = cli_scan_behavior(false, options.debug.simulate_slow_disk);
+    #[cfg(not(debug_assertions))]
+    let refresh_scan_behavior = cli_scan_behavior(false);
+    let startup_scan_runner = CliScanBatchRunner::new(startup_scan_behavior);
+    let refresh_scan_runner = CliScanBatchRunner::new(refresh_scan_behavior);
     let mut watch_events = WatchEventSource::new(&session_dirs)?;
-    let mut runtime =
-        WatchRuntimeState::load(&session_dirs, options.parallelism, timezone, Utc::now())?;
+    let mut runtime = WatchRuntimeState::load_with_scan_runner(
+        &session_dirs,
+        options.parallelism,
+        timezone,
+        Utc::now(),
+        &startup_scan_runner,
+    )?;
     let mut last_pricing_refresh_attempt_at = startup_refresh_attempted.then_some(now);
     let should_clear = supports_watch_screen_clear(std::env::var("TERM").ok().as_deref());
     if !should_clear {
@@ -669,12 +806,13 @@ fn run_watch_loop(options: &WatchOptions) -> Result<()> {
         }
         let mut changes = watch_events.drain_changes(&session_dirs);
         changes.discovery_due |= discovered_new_root;
-        runtime.refresh(
+        runtime.refresh_with_scan_runner(
             &session_dirs,
             options.parallelism,
             timezone,
             snapshot_now,
             changes,
+            &refresh_scan_runner,
         )?;
         let snapshot = runtime.snapshot(&pricing, snapshot_now, options.show_model_burn_rate)?;
         stdout.write_all(b"\x1b[2J\x1b[H")?;
@@ -790,6 +928,9 @@ pub fn run<I>(args: I) -> Result<()>
 where
     I: IntoIterator<Item = OsString>,
 {
+    let cli = Cli::parse_from(args);
+    #[cfg(debug_assertions)]
+    let debug = cli.debug;
     let Cli {
         json,
         since,
@@ -803,7 +944,8 @@ where
         session_dir,
         threads,
         command,
-    } = Cli::parse_from(args);
+        ..
+    } = cli;
     let timezone = timezone.unwrap_or_else(default_timezone_name);
     let parallelism = threads.map_or(ScannerParallelism::Auto, ScannerParallelism::Fixed);
 
@@ -823,6 +965,8 @@ where
                 parallelism,
                 interval,
                 show_model_burn_rate: per_model_burn_rate,
+                #[cfg(debug_assertions)]
+                debug,
             })
         }
         command => {
@@ -842,7 +986,11 @@ where
                 session_dirs: session_dir,
                 parallelism,
             };
-            let output = build_report(kind, &options)?;
+            #[cfg(debug_assertions)]
+            let scan_behavior = cli_scan_behavior(true, debug.simulate_slow_disk);
+            #[cfg(not(debug_assertions))]
+            let scan_behavior = cli_scan_behavior(true);
+            let output = build_report_for_cli(kind, &options, scan_behavior)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
@@ -904,6 +1052,10 @@ struct Cli {
     /// Scanner worker count. Use `1` for single-threaded profiling runs.
     #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(NonZeroUsize))]
     threads: Option<NonZeroUsize>,
+    /// Debug-only runtime options for development builds.
+    #[cfg(debug_assertions)]
+    #[command(flatten)]
+    debug: DebugRuntimeOptions,
     /// Report to execute.
     #[command(subcommand)]
     command: Option<Command>,
@@ -2334,12 +2486,33 @@ struct WatchRuntimeState {
 
 impl WatchRuntimeState {
     /// Load the initial runtime state.
+    #[cfg(test)]
     fn load(
         session_dirs: &[PathBuf],
         parallelism: ScannerParallelism,
         timezone: Tz,
         now_utc: DateTime<Utc>,
     ) -> Result<Self> {
+        Self::load_with_scan_runner(
+            session_dirs,
+            parallelism,
+            timezone,
+            now_utc,
+            &NoopScanBatchRunner,
+        )
+    }
+
+    /// Load the initial runtime state with the provided batch runner.
+    fn load_with_scan_runner<R>(
+        session_dirs: &[PathBuf],
+        parallelism: ScannerParallelism,
+        timezone: Tz,
+        now_utc: DateTime<Utc>,
+        scan_runner: &R,
+    ) -> Result<Self>
+    where
+        R: ScanBatchRunner,
+    {
         let mut state = Self {
             timezone,
             current_day: now_utc.with_timezone(&timezone).date_naive(),
@@ -2351,7 +2524,7 @@ impl WatchRuntimeState {
             last_snapshot_utc: None,
             next_discovery_at: None,
         };
-        state.refresh(
+        state.refresh_with_scan_runner(
             session_dirs,
             parallelism,
             timezone,
@@ -2360,19 +2533,44 @@ impl WatchRuntimeState {
                 dirty_sessions: HashMap::new(),
                 discovery_due: true,
             },
+            scan_runner,
         )?;
         Ok(state)
     }
 
     /// Refresh cached file data for the current watch tick.
+    #[cfg(test)]
     fn refresh(
         &mut self,
         session_dirs: &[PathBuf],
         parallelism: ScannerParallelism,
         timezone: Tz,
         now_utc: DateTime<Utc>,
-        mut changes: WatchChangeSet,
+        changes: WatchChangeSet,
     ) -> Result<()> {
+        self.refresh_with_scan_runner(
+            session_dirs,
+            parallelism,
+            timezone,
+            now_utc,
+            changes,
+            &NoopScanBatchRunner,
+        )
+    }
+
+    /// Refresh cached file data for the current watch tick with the provided batch runner.
+    fn refresh_with_scan_runner<R>(
+        &mut self,
+        session_dirs: &[PathBuf],
+        parallelism: ScannerParallelism,
+        timezone: Tz,
+        now_utc: DateTime<Utc>,
+        mut changes: WatchChangeSet,
+        scan_runner: &R,
+    ) -> Result<()>
+    where
+        R: ScanBatchRunner,
+    {
         let current_day = now_utc.with_timezone(&timezone).date_naive();
         if current_day != self.current_day {
             self.current_day = current_day;
@@ -2402,12 +2600,20 @@ impl WatchRuntimeState {
                 now_utc,
                 selected_files,
                 &changes.dirty_sessions,
+                scan_runner,
             )?;
         } else {
             self.missing_directories = collect_missing_session_dirs(session_dirs)?;
             for (session_id, dirty_kind) in changes.dirty_sessions {
                 let resolved = resolve_session_target_across_roots(session_dirs, &session_id)?;
-                self.refresh_dirty_session(session_id, resolved, dirty_kind, timezone, now_utc)?;
+                self.refresh_dirty_session(
+                    session_id,
+                    resolved,
+                    dirty_kind,
+                    timezone,
+                    now_utc,
+                    scan_runner,
+                )?;
             }
         }
 
@@ -2468,14 +2674,18 @@ impl WatchRuntimeState {
     }
 
     /// Refresh the tracked set of selected files after a full discovery pass.
-    fn refresh_discovered_targets(
+    fn refresh_discovered_targets<R>(
         &mut self,
         parallelism: ScannerParallelism,
         timezone: Tz,
         now_utc: DateTime<Utc>,
         selected_files: Vec<SessionScanTarget>,
         dirty_sessions: &HashMap<String, WatchDirtyKind>,
-    ) -> Result<()> {
+        scan_runner: &R,
+    ) -> Result<()>
+    where
+        R: ScanBatchRunner,
+    {
         let mut selected_targets = HashMap::with_capacity(selected_files.len());
         let mut next_cached_files = HashMap::with_capacity(selected_files.len());
         let mut full_rebuild_targets = Vec::new();
@@ -2494,13 +2704,16 @@ impl WatchRuntimeState {
             }
         }
 
-        for cached_file in load_cached_watch_files(
-            &full_rebuild_targets,
-            parallelism,
-            timezone,
-            self.current_day,
-            now_utc,
-        )? {
+        for cached_file in scan_runner.run_batch(full_rebuild_targets.len(), |observer| {
+            load_cached_watch_files_with_observer(
+                &full_rebuild_targets,
+                parallelism,
+                timezone,
+                self.current_day,
+                now_utc,
+                observer,
+            )
+        })? {
             next_cached_files.insert(cached_file.target.session_id.clone(), cached_file);
         }
 
@@ -2510,14 +2723,18 @@ impl WatchRuntimeState {
     }
 
     /// Refresh one dirty session selected by the watcher.
-    fn refresh_dirty_session(
+    fn refresh_dirty_session<R>(
         &mut self,
         session_id: String,
         target: Option<SessionScanTarget>,
         dirty_kind: WatchDirtyKind,
         timezone: Tz,
         now_utc: DateTime<Utc>,
-    ) -> Result<()> {
+        scan_runner: &R,
+    ) -> Result<()>
+    where
+        R: ScanBatchRunner,
+    {
         let window_start_utc = watch_window_start_utc(timezone, now_utc)?;
         let existing = self.cached_files.remove(&session_id);
         if let Some(cached) = existing.as_ref() {
@@ -2530,14 +2747,17 @@ impl WatchRuntimeState {
                     && target.bytes > cached.target.bytes
                     && cached.parser_checkpoint.offset == cached.target.bytes =>
             {
-                append_cached_watch_file(
-                    &mut cached,
-                    target,
-                    timezone,
-                    self.current_day,
-                    window_start_utc,
-                    now_utc,
-                )?;
+                scan_runner.run_batch(1, |observer| {
+                    append_cached_watch_file_with_observer(
+                        &mut cached,
+                        target,
+                        timezone,
+                        self.current_day,
+                        window_start_utc,
+                        now_utc,
+                        observer,
+                    )
+                })?;
                 add_cached_watch_file_to_runtime(self, &cached);
                 self.selected_targets
                     .insert(session_id, cached.target.clone());
@@ -2545,7 +2765,15 @@ impl WatchRuntimeState {
                     .insert(cached.target.session_id.clone(), cached);
             }
             (_existing, Some(target), _) => {
-                let cached = build_cached_watch_file(&target, timezone, self.current_day, now_utc)?;
+                let cached = scan_runner.run_batch(1, |observer| {
+                    build_cached_watch_file_with_observer(
+                        &target,
+                        timezone,
+                        self.current_day,
+                        now_utc,
+                        observer,
+                    )
+                })?;
                 add_cached_watch_file_to_runtime(self, &cached);
                 self.selected_targets.insert(session_id, target);
                 self.cached_files
@@ -2582,42 +2810,58 @@ fn same_watch_target(left: &SessionScanTarget, right: &SessionScanTarget) -> boo
 }
 
 /// Parse all current-day events from one session file for watch-mode caching.
-fn scan_watch_file_delta(
+fn scan_watch_file_delta_with_observer<O>(
     file: &Path,
     session_id: &str,
     timezone: Tz,
     current_day: NaiveDate,
     checkpoint: &SessionParseCheckpoint,
-) -> Result<(SessionParseCheckpoint, Vec<OwnedWatchEvent>)> {
+    observer: &O,
+) -> Result<(SessionParseCheckpoint, Vec<OwnedWatchEvent>)>
+where
+    O: ScanObserver,
+{
     let mut events = Vec::new();
-    let checkpoint = scan_session_file_from_checkpoint(file, session_id, checkpoint, |event| {
-        if event.timestamp_utc.with_timezone(&timezone).date_naive() != current_day {
-            return;
-        }
-        events.push(OwnedWatchEvent {
-            timestamp_utc: event.timestamp_utc,
-            model: event.model.to_string(),
-            is_fallback_model: event.is_fallback_model,
-            usage: event.usage.clone(),
-        });
-    })?;
+    let checkpoint = scan_session_file_from_checkpoint_with_observer(
+        file,
+        session_id,
+        checkpoint,
+        observer,
+        |event| {
+            if event.timestamp_utc.with_timezone(&timezone).date_naive() != current_day {
+                return;
+            }
+            events.push(OwnedWatchEvent {
+                timestamp_utc: event.timestamp_utc,
+                model: event.model.to_string(),
+                is_fallback_model: event.is_fallback_model,
+                usage: event.usage.clone(),
+            });
+        },
+    )?;
     Ok((checkpoint, events))
 }
 
 /// Build one cached watch file from the current file contents.
-fn build_cached_watch_file(
+fn build_cached_watch_file_with_observer<O>(
     target: &SessionScanTarget,
     timezone: Tz,
     current_day: NaiveDate,
     now_utc: DateTime<Utc>,
-) -> Result<CachedWatchFile> {
-    let (checkpoint, current_day_events) = scan_watch_file_delta(
+    observer: &O,
+) -> Result<CachedWatchFile>
+where
+    O: ScanObserver,
+{
+    let (checkpoint, current_day_events) = scan_watch_file_delta_with_observer(
         &target.path,
         &target.session_id,
         timezone,
         current_day,
         &SessionParseCheckpoint::default(),
+        observer,
     )?;
+    observer.on_file_complete();
     Ok(CachedWatchFile::from_full_scan(
         target.clone(),
         checkpoint,
@@ -2628,21 +2872,27 @@ fn build_cached_watch_file(
 }
 
 /// Refresh one cached watch file by parsing only the appended suffix.
-fn append_cached_watch_file(
+fn append_cached_watch_file_with_observer<O>(
     cached: &mut CachedWatchFile,
     target: SessionScanTarget,
     timezone: Tz,
     current_day: NaiveDate,
     window_start_utc: DateTime<Utc>,
     now_utc: DateTime<Utc>,
-) -> Result<()> {
-    let (checkpoint, appended_events) = scan_watch_file_delta(
+    observer: &O,
+) -> Result<()>
+where
+    O: ScanObserver,
+{
+    let (checkpoint, appended_events) = scan_watch_file_delta_with_observer(
         &target.path,
         &target.session_id,
         timezone,
         current_day,
         &cached.parser_checkpoint,
+        observer,
     )?;
+    observer.on_file_complete();
     cached.target = target;
     cached.parser_checkpoint = checkpoint;
     cached.current_day_events.extend(appended_events);
@@ -2677,20 +2927,30 @@ fn remove_cached_watch_file_from_runtime(
 }
 
 /// Load current-day watch data for the provided changed targets.
-fn load_cached_watch_files(
+fn load_cached_watch_files_with_observer<O>(
     selected_files: &[SessionScanTarget],
     parallelism: ScannerParallelism,
     timezone: Tz,
     current_day: NaiveDate,
     now_utc: DateTime<Utc>,
-) -> Result<Vec<CachedWatchFile>> {
+    observer: &O,
+) -> Result<Vec<CachedWatchFile>>
+where
+    O: ScanObserver,
+{
     if selected_files.is_empty() {
         return Ok(Vec::new());
     }
 
     let worker_count = resolve_scan_worker_count(parallelism, selected_files.len());
     if worker_count == 1 {
-        return scan_watch_file_chunk(selected_files, timezone, current_day, now_utc);
+        return scan_watch_file_chunk_with_observer(
+            selected_files,
+            timezone,
+            current_day,
+            now_utc,
+            observer,
+        );
     }
 
     let chunk_size = selected_files.len().div_ceil(worker_count);
@@ -2701,11 +2961,26 @@ fn load_cached_watch_files(
             .ok_or_else(|| eyre!("missing initial watch file chunk"))?;
         let handles = chunks
             .map(|chunk| {
-                scope.spawn(move || scan_watch_file_chunk(chunk, timezone, current_day, now_utc))
+                let observer = observer.clone();
+                scope.spawn(move || {
+                    scan_watch_file_chunk_with_observer(
+                        chunk,
+                        timezone,
+                        current_day,
+                        now_utc,
+                        &observer,
+                    )
+                })
             })
             .collect::<Vec<_>>();
 
-        let mut cached_files = scan_watch_file_chunk(first_chunk, timezone, current_day, now_utc)?;
+        let mut cached_files = scan_watch_file_chunk_with_observer(
+            first_chunk,
+            timezone,
+            current_day,
+            now_utc,
+            observer,
+        )?;
         for handle in handles {
             cached_files.extend(
                 handle
@@ -2718,15 +2993,21 @@ fn load_cached_watch_files(
 }
 
 /// Parse one worker chunk of changed watch files.
-fn scan_watch_file_chunk(
+fn scan_watch_file_chunk_with_observer<O>(
     selected_files: &[SessionScanTarget],
     timezone: Tz,
     current_day: NaiveDate,
     now_utc: DateTime<Utc>,
-) -> Result<Vec<CachedWatchFile>> {
+    observer: &O,
+) -> Result<Vec<CachedWatchFile>>
+where
+    O: ScanObserver,
+{
     selected_files
         .iter()
-        .map(|target| build_cached_watch_file(target, timezone, current_day, now_utc))
+        .map(|target| {
+            build_cached_watch_file_with_observer(target, timezone, current_day, now_utc, observer)
+        })
         .collect()
 }
 
@@ -3014,29 +3295,6 @@ fn split_session_id(session_id: &str) -> (String, String) {
     }
 }
 
-/// Scan the provided directories and feed all events into the report builder.
-///
-/// Duplicate relative session identifiers across roots intentionally collapse to one selected
-/// file. The user-defined contract is that the session identifier itself is globally unique, and
-/// a longer duplicate file represents a newer version of the same session.
-fn scan_session_dirs(
-    session_dirs: &[PathBuf],
-    parallelism: ScannerParallelism,
-    builder: &mut ReportBuilder,
-) -> Result<Vec<String>> {
-    let (missing_directories, selected_files) = collect_session_scan_targets(session_dirs)?;
-    let scanned = scan_selected_session_targets(
-        &selected_files,
-        parallelism,
-        builder.kind,
-        builder.timezone,
-        builder.since,
-        builder.until,
-    )?;
-    builder.merge(scanned);
-    Ok(missing_directories)
-}
-
 /// Discover selected session files and collect missing roots.
 fn collect_session_scan_targets(
     session_dirs: &[PathBuf],
@@ -3081,13 +3339,55 @@ fn scan_selected_session_targets(
     since: Option<NaiveDate>,
     until: Option<NaiveDate>,
 ) -> Result<ReportBuilder> {
+    scan_selected_session_targets_with(
+        selected_files,
+        parallelism,
+        || ReportBuilder::new(kind, timezone, since, until),
+        |chunk| scan_selected_session_chunk(chunk, kind, timezone, since, until),
+    )
+}
+
+/// Scan all selected targets, optionally across multiple worker threads.
+fn scan_selected_session_targets_with_observer<O>(
+    selected_files: &[SessionScanTarget],
+    parallelism: ScannerParallelism,
+    kind: ReportKind,
+    timezone: Tz,
+    since: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    observer: &O,
+) -> Result<ReportBuilder>
+where
+    O: ScanObserver,
+{
+    scan_selected_session_targets_with(
+        selected_files,
+        parallelism,
+        || ReportBuilder::new(kind, timezone, since, until),
+        |chunk| {
+            scan_selected_session_chunk_with_observer(chunk, kind, timezone, since, until, observer)
+        },
+    )
+}
+
+/// Scan selected session targets using the provided chunk strategy.
+fn scan_selected_session_targets_with<F, B>(
+    selected_files: &[SessionScanTarget],
+    parallelism: ScannerParallelism,
+    empty_builder: B,
+    scan_chunk: F,
+) -> Result<ReportBuilder>
+where
+    F: Fn(&[SessionScanTarget]) -> Result<ReportBuilder> + Copy + Send + Sync,
+    B: FnOnce() -> ReportBuilder,
+{
     if selected_files.is_empty() {
-        return Ok(ReportBuilder::new(kind, timezone, since, until));
+        return Ok(empty_builder());
     }
 
     let worker_count = resolve_scan_worker_count(parallelism, selected_files.len());
     if worker_count == 1 {
-        return scan_selected_session_chunk(selected_files, kind, timezone, since, until);
+        return scan_chunk(selected_files);
     }
 
     let chunk_size = selected_files.len().div_ceil(worker_count);
@@ -3097,13 +3397,10 @@ fn scan_selected_session_targets(
             .next()
             .ok_or_else(|| eyre!("missing initial scan chunk"))?;
         let handles = chunks
-            .map(|chunk| {
-                scope
-                    .spawn(move || scan_selected_session_chunk(chunk, kind, timezone, since, until))
-            })
+            .map(|chunk| scope.spawn(move || scan_chunk(chunk)))
             .collect::<Vec<_>>();
 
-        let mut merged = scan_selected_session_chunk(first_chunk, kind, timezone, since, until)?;
+        let mut merged = scan_chunk(first_chunk)?;
         for handle in handles {
             let partial = handle
                 .join()
@@ -3160,9 +3457,55 @@ fn scan_selected_session_chunk(
     since: Option<NaiveDate>,
     until: Option<NaiveDate>,
 ) -> Result<ReportBuilder> {
+    scan_selected_session_chunk_with(
+        selected_files,
+        kind,
+        timezone,
+        since,
+        until,
+        |target, builder| scan_session_file(&target.path, &target.session_id, builder),
+    )
+}
+
+/// Scan one worker chunk of selected session files.
+fn scan_selected_session_chunk_with_observer<O>(
+    selected_files: &[SessionScanTarget],
+    kind: ReportKind,
+    timezone: Tz,
+    since: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    observer: &O,
+) -> Result<ReportBuilder>
+where
+    O: ScanObserver,
+{
+    scan_selected_session_chunk_with(
+        selected_files,
+        kind,
+        timezone,
+        since,
+        until,
+        |target, builder| {
+            scan_session_file_with_observer(&target.path, &target.session_id, builder, observer)
+        },
+    )
+}
+
+/// Scan one worker chunk of selected session files using the provided file strategy.
+fn scan_selected_session_chunk_with<F>(
+    selected_files: &[SessionScanTarget],
+    kind: ReportKind,
+    timezone: Tz,
+    since: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    mut scan_file: F,
+) -> Result<ReportBuilder>
+where
+    F: FnMut(&SessionScanTarget, &mut ReportBuilder) -> Result<()>,
+{
     let mut builder = ReportBuilder::new(kind, timezone, since, until);
     for target in selected_files {
-        scan_session_file(&target.path, &target.session_id, &mut builder)?;
+        scan_file(target, &mut builder)?;
     }
     Ok(builder)
 }
@@ -3305,10 +3648,17 @@ fn merge_model_breakdowns(
 
 /// Scan one JSONL session file.
 fn scan_session_file(file: &Path, session_id: &str, builder: &mut ReportBuilder) -> Result<()> {
-    scan_session_file_with(file, session_id, |event| builder.observe(event))
+    let _ = scan_session_file_from_checkpoint(
+        file,
+        session_id,
+        &SessionParseCheckpoint::default(),
+        |event| builder.observe(event),
+    )?;
+    Ok(())
 }
 
 /// Scan one JSONL session file and feed every parsed event into the provided callback.
+#[cfg(test)]
 fn scan_session_file_with(
     file: &Path,
     session_id: &str,
@@ -3318,8 +3668,46 @@ fn scan_session_file_with(
         file,
         session_id,
         &SessionParseCheckpoint::default(),
+        |event| {
+            on_event(event);
+        },
+    )?;
+    Ok(())
+}
+
+/// Scan one JSONL session file into a report builder with an explicit observer.
+fn scan_session_file_with_observer<O>(
+    file: &Path,
+    session_id: &str,
+    builder: &mut ReportBuilder,
+    observer: &O,
+) -> Result<()>
+where
+    O: ScanObserver,
+{
+    scan_session_file_with_callback_and_observer(file, session_id, observer, |event| {
+        builder.observe(event);
+    })
+}
+
+/// Scan one JSONL session file and feed every parsed event into the provided callback.
+fn scan_session_file_with_callback_and_observer<O>(
+    file: &Path,
+    session_id: &str,
+    observer: &O,
+    mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
+) -> Result<()>
+where
+    O: ScanObserver,
+{
+    let _ = scan_session_file_from_checkpoint_with_observer(
+        file,
+        session_id,
+        &SessionParseCheckpoint::default(),
+        observer,
         |event| on_event(event),
     )?;
+    observer.on_file_complete();
     Ok(())
 }
 
@@ -3330,6 +3718,47 @@ fn scan_session_file_from_checkpoint(
     checkpoint: &SessionParseCheckpoint,
     mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
 ) -> Result<SessionParseCheckpoint> {
+    scan_session_file_from_checkpoint_inner(
+        file,
+        session_id,
+        checkpoint,
+        || {},
+        |event| {
+            on_event(event);
+        },
+    )
+}
+
+/// Scan one JSONL session file from a stored parser checkpoint.
+fn scan_session_file_from_checkpoint_with_observer<O>(
+    file: &Path,
+    session_id: &str,
+    checkpoint: &SessionParseCheckpoint,
+    observer: &O,
+    mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
+) -> Result<SessionParseCheckpoint>
+where
+    O: ScanObserver,
+{
+    scan_session_file_from_checkpoint_inner(
+        file,
+        session_id,
+        checkpoint,
+        || observer.before_file_open(),
+        |event| on_event(event),
+    )
+}
+
+/// Scan one JSONL session file from a stored parser checkpoint using shared parse mechanics.
+fn scan_session_file_from_checkpoint_inner(
+    file: &Path,
+    session_id: &str,
+    checkpoint: &SessionParseCheckpoint,
+    before_file_open: impl FnOnce(),
+    mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
+) -> Result<SessionParseCheckpoint> {
+    before_file_open();
+
     let mut file = File::open(file)?;
     file.seek(SeekFrom::Start(checkpoint.offset))?;
     let reader = BufReader::new(file);
@@ -5037,6 +5466,8 @@ mod tests {
                 parallelism: ScannerParallelism::Auto,
                 interval: Duration::from_secs(5),
                 show_model_burn_rate: true,
+                #[cfg(debug_assertions)]
+                debug: DebugRuntimeOptions::default(),
             },
             now,
         )
@@ -6222,6 +6653,15 @@ mod tests {
         let cli = Cli::try_parse_from(["codexusage", "--threads", "1", "daily"]).expect("cli");
 
         assert_eq!(cli.threads, NonZeroUsize::new(1));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn cli_accepts_debug_simulate_slow_disk_flag() {
+        let cli = Cli::try_parse_from(["codexusage", "--debug-simulate-slow-disk", "daily"])
+            .expect("cli");
+
+        assert!(cli.debug.simulate_slow_disk);
     }
 
     #[test]
