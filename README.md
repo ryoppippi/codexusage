@@ -109,6 +109,7 @@ Flags:
 - `--offline` - use cached pricing, never hit the network
 - `--refresh-pricing` - force a pricing refresh
 - `--no-cache-cost` - treat cache-read input tokens as free in cost calculations
+- `--exclude-cache-read` - subtract cache-read input tokens from reported input/total usage and hide cache-read columns
 - `--session-dir` - override session directory (repeatable)
 - `--threads N` - scanner worker count
 - `--number-format full` - show full token counts instead of K/M/B/T
@@ -137,7 +138,7 @@ Daily Codex Usage Report
 
 ## Pricing
 
-Pricing data is cached locally and refreshed automatically when stale. Use `--offline` to skip network access entirely, or `--refresh-pricing` to force an update. Use `--no-cache-cost` to keep cache-read tokens in token totals while excluding their cached-input price from cost totals.
+Pricing data is cached locally and refreshed automatically when stale. Use `--offline` to skip network access entirely, or `--refresh-pricing` to force an update. Use `--no-cache-cost` to keep cache-read tokens in token totals while excluding their cached-input price from cost totals. Use `--exclude-cache-read` to report fresh-input usage only; it also treats cache-read input as free for cost calculations.
 
 Live pricing refreshes use the system CA store through `reqwest`'s Rustls backend. Minimal containers or stripped-down CI images may need a CA bundle such as `ca-certificates` installed for refreshes to succeed.
 

@@ -1,6 +1,6 @@
 use codexusage::app::{
-    CachedInputCostMode, NumberFormat, ReportKind, ReportOptions, ReportOutput, ScannerParallelism,
-    build_report,
+    CacheReadMode, CachedInputCostMode, NumberFormat, ReportKind, ReportOptions, ReportOutput,
+    ScannerParallelism, build_report,
 };
 use std::fs;
 use std::num::NonZeroUsize;
@@ -26,6 +26,7 @@ fn options(session_dir: &std::path::Path) -> ReportOptions {
         offline: true,
         refresh_pricing: false,
         cached_input_cost_mode: CachedInputCostMode::Priced,
+        cache_read_mode: CacheReadMode::Include,
         session_dirs: vec![session_dir.to_path_buf()],
         parallelism: ScannerParallelism::Auto,
     }
@@ -87,6 +88,43 @@ fn no_cache_cost_leaves_tokens_unchanged_and_omits_cached_input_cost() {
             assert_eq!(totals.cached_input_tokens, 250_000);
             assert!((rows[0].cost_usd - 1.9375).abs() < f64::EPSILON);
             assert!((totals.cost_usd - 1.9375).abs() < f64::EPSILON);
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+#[test]
+fn exclude_cache_read_subtracts_cached_tokens_and_implies_cache_free_cost() {
+    let temp = TempDir::new().expect("tempdir");
+    write_session(
+        &temp,
+        "sessions/project/session.jsonl",
+        concat!(
+            "{\"timestamp\":\"2025-09-11T18:00:00.000Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2025-09-11T18:01:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1000000,\"cached_input_tokens\":250000,\"output_tokens\":100000,\"reasoning_output_tokens\":0,\"total_tokens\":1100000}}}}\n"
+        ),
+    );
+    let mut report_options = options(&temp.path().join("sessions"));
+    report_options.cache_read_mode = CacheReadMode::Exclude;
+
+    let report = build_report(ReportKind::Daily, &report_options).expect("build report");
+
+    match report {
+        ReportOutput::Daily { rows, totals, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].input_tokens, 750_000);
+            assert_eq!(rows[0].cached_input_tokens, 0);
+            assert_eq!(rows[0].total_tokens, 850_000);
+            assert_eq!(totals.input_tokens, 750_000);
+            assert_eq!(totals.cached_input_tokens, 0);
+            assert_eq!(totals.total_tokens, 850_000);
+            assert!((rows[0].cost_usd - 1.9375).abs() < f64::EPSILON);
+            assert!((totals.cost_usd - 1.9375).abs() < f64::EPSILON);
+
+            let model = rows[0].models.get("gpt-5").expect("model breakdown");
+            assert_eq!(model.input_tokens, 750_000);
+            assert_eq!(model.cached_input_tokens, 0);
+            assert_eq!(model.total_tokens, 850_000);
         }
         other => panic!("unexpected report: {other:?}"),
     }

@@ -1,6 +1,6 @@
 use super::{
-    DailyRow, ModelBreakdown, MonthlyRow, NumberFormat, ReportOutput, SessionRow, Totals,
-    UsageTotals, WatchSnapshot, scale_cost_per_hour, scale_usage_per_hour,
+    CacheReadMode, DailyRow, ModelBreakdown, MonthlyRow, NumberFormat, ReportOutput, SessionRow,
+    Totals, UsageTotals, WatchSnapshot, scale_cost_per_hour, scale_usage_per_hour,
 };
 use std::collections::BTreeMap;
 use std::env;
@@ -13,16 +13,17 @@ pub(super) fn render_report(
     report: &ReportOutput,
     locale: &str,
     number_format: NumberFormat,
+    cache_read_mode: CacheReadMode,
 ) -> String {
     let mut output = match report {
         ReportOutput::Daily { rows, totals, .. } => {
-            render_daily_report(rows, totals, locale, number_format)
+            render_daily_report(rows, totals, locale, number_format, cache_read_mode)
         }
         ReportOutput::Monthly { rows, totals, .. } => {
-            render_monthly_report(rows, totals, locale, number_format)
+            render_monthly_report(rows, totals, locale, number_format, cache_read_mode)
         }
         ReportOutput::Session { rows, totals, .. } => {
-            render_session_report(rows, totals, locale, number_format)
+            render_session_report(rows, totals, locale, number_format, cache_read_mode)
         }
     };
 
@@ -59,12 +60,14 @@ pub(super) fn render_watch_screen(
     locale: &str,
     number_format: NumberFormat,
     show_model_burn_rate: bool,
+    cache_read_mode: CacheReadMode,
 ) -> String {
     render_watch_screen_with_width(
         snapshot,
         locale,
         number_format,
         show_model_burn_rate,
+        cache_read_mode,
         detect_terminal_width(),
     )
 }
@@ -75,6 +78,7 @@ pub(super) fn render_watch_screen_with_width(
     _locale: &str,
     number_format: NumberFormat,
     show_model_burn_rate: bool,
+    cache_read_mode: CacheReadMode,
     terminal_width: Option<usize>,
 ) -> String {
     let render_config = TableRenderConfig {
@@ -104,6 +108,7 @@ pub(super) fn render_watch_screen_with_width(
         snapshot,
         number_format,
         show_model_burn_rate,
+        cache_read_mode,
         terminal_width,
     );
 
@@ -132,6 +137,7 @@ fn write_watch_table(
     snapshot: &WatchSnapshot,
     number_format: NumberFormat,
     show_model_burn_rate: bool,
+    cache_read_mode: CacheReadMode,
     terminal_width: Option<usize>,
 ) {
     let model_columns = if show_model_burn_rate {
@@ -143,7 +149,7 @@ fn write_watch_table(
         .iter()
         .map(|column| column.label.clone())
         .collect::<Vec<_>>();
-    let rows = watch_rows(snapshot, number_format, &model_columns);
+    let rows = watch_rows(snapshot, number_format, &model_columns, cache_read_mode);
     let blocks = watch_table_blocks(
         &model_headers,
         &rows,
@@ -197,17 +203,25 @@ fn render_daily_report(
     totals: &Totals,
     locale: &str,
     number_format: NumberFormat,
+    cache_read_mode: CacheReadMode,
 ) -> String {
     let render_config = TableRenderConfig {
         style: detect_table_style(),
         borders: detect_border_style(),
         number_format,
     };
-    render_usage_table(
-        "Daily",
-        render_config,
-        locale,
-        &[
+    let headers = if cache_read_mode == CacheReadMode::Exclude {
+        vec![
+            "Date",
+            "Model",
+            "Input",
+            "Output",
+            "Reasoning",
+            "Total",
+            "Cost",
+        ]
+    } else {
+        vec![
             "Date",
             "Model",
             "Input",
@@ -216,8 +230,14 @@ fn render_daily_report(
             "Reasoning",
             "Total",
             "Cost",
-        ],
-        daily_display_rows(rows),
+        ]
+    };
+    render_usage_table(
+        "Daily",
+        render_config,
+        locale,
+        &headers,
+        daily_display_rows(rows, cache_read_mode),
         totals,
     )
 }
@@ -228,17 +248,25 @@ fn render_monthly_report(
     totals: &Totals,
     locale: &str,
     number_format: NumberFormat,
+    cache_read_mode: CacheReadMode,
 ) -> String {
     let render_config = TableRenderConfig {
         style: detect_table_style(),
         borders: detect_border_style(),
         number_format,
     };
-    render_usage_table(
-        "Monthly",
-        render_config,
-        locale,
-        &[
+    let headers = if cache_read_mode == CacheReadMode::Exclude {
+        vec![
+            "Month",
+            "Model",
+            "Input",
+            "Output",
+            "Reasoning",
+            "Total",
+            "Cost",
+        ]
+    } else {
+        vec![
             "Month",
             "Model",
             "Input",
@@ -247,8 +275,14 @@ fn render_monthly_report(
             "Reasoning",
             "Total",
             "Cost",
-        ],
-        monthly_display_rows(rows),
+        ]
+    };
+    render_usage_table(
+        "Monthly",
+        render_config,
+        locale,
+        &headers,
+        monthly_display_rows(rows, cache_read_mode),
         totals,
     )
 }
@@ -259,17 +293,27 @@ fn render_session_report(
     totals: &Totals,
     locale: &str,
     number_format: NumberFormat,
+    cache_read_mode: CacheReadMode,
 ) -> String {
     let render_config = TableRenderConfig {
         style: detect_table_style(),
         borders: detect_border_style(),
         number_format,
     };
-    render_usage_table(
-        "Session",
-        render_config,
-        locale,
-        &[
+    let headers = if cache_read_mode == CacheReadMode::Exclude {
+        vec![
+            "Directory",
+            "Session",
+            "Model",
+            "Input",
+            "Output",
+            "Reasoning",
+            "Total",
+            "Cost",
+            "Last Activity",
+        ]
+    } else {
+        vec![
             "Directory",
             "Session",
             "Model",
@@ -280,8 +324,14 @@ fn render_session_report(
             "Total",
             "Cost",
             "Last Activity",
-        ],
-        session_display_rows(rows),
+        ]
+    };
+    render_usage_table(
+        "Session",
+        render_config,
+        locale,
+        &headers,
+        session_display_rows(rows, cache_read_mode),
         totals,
     )
 }
@@ -416,7 +466,7 @@ pub(super) fn detect_table_style_for(
 }
 
 /// Build display rows for a daily report.
-fn daily_display_rows(rows: &[DailyRow]) -> Vec<DisplayRow> {
+fn daily_display_rows(rows: &[DailyRow], cache_read_mode: CacheReadMode) -> Vec<DisplayRow> {
     let mut display_rows = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         if index > 0 {
@@ -425,26 +475,28 @@ fn daily_display_rows(rows: &[DailyRow]) -> Vec<DisplayRow> {
                 kind: DisplayRowKind::Spacer,
             });
         }
-        display_rows.push(DisplayRow {
-            cells: vec![
-                row.date.clone(),
-                "TOTAL".to_string(),
-                row.input_tokens.to_string(),
-                row.cached_input_tokens.to_string(),
-                row.output_tokens.to_string(),
-                row.reasoning_output_tokens.to_string(),
-                row.total_tokens.to_string(),
-                format_currency(row.cost_usd),
-            ],
+        let mut subtotal = DisplayRow {
+            cells: vec![row.date.clone(), "TOTAL".to_string()],
             kind: DisplayRowKind::Subtotal,
-        });
-        append_model_display_rows(&mut display_rows, 1, false, &row.models);
+        };
+        append_usage_cells(
+            &mut subtotal.cells,
+            row.input_tokens,
+            row.cached_input_tokens,
+            row.output_tokens,
+            row.reasoning_output_tokens,
+            row.total_tokens,
+            row.cost_usd,
+            cache_read_mode,
+        );
+        display_rows.push(subtotal);
+        append_model_display_rows(&mut display_rows, 1, false, &row.models, cache_read_mode);
     }
     display_rows
 }
 
 /// Build display rows for a monthly report.
-fn monthly_display_rows(rows: &[MonthlyRow]) -> Vec<DisplayRow> {
+fn monthly_display_rows(rows: &[MonthlyRow], cache_read_mode: CacheReadMode) -> Vec<DisplayRow> {
     let mut display_rows = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         if index > 0 {
@@ -453,26 +505,28 @@ fn monthly_display_rows(rows: &[MonthlyRow]) -> Vec<DisplayRow> {
                 kind: DisplayRowKind::Spacer,
             });
         }
-        display_rows.push(DisplayRow {
-            cells: vec![
-                row.month.clone(),
-                "TOTAL".to_string(),
-                row.input_tokens.to_string(),
-                row.cached_input_tokens.to_string(),
-                row.output_tokens.to_string(),
-                row.reasoning_output_tokens.to_string(),
-                row.total_tokens.to_string(),
-                format_currency(row.cost_usd),
-            ],
+        let mut subtotal = DisplayRow {
+            cells: vec![row.month.clone(), "TOTAL".to_string()],
             kind: DisplayRowKind::Subtotal,
-        });
-        append_model_display_rows(&mut display_rows, 1, false, &row.models);
+        };
+        append_usage_cells(
+            &mut subtotal.cells,
+            row.input_tokens,
+            row.cached_input_tokens,
+            row.output_tokens,
+            row.reasoning_output_tokens,
+            row.total_tokens,
+            row.cost_usd,
+            cache_read_mode,
+        );
+        display_rows.push(subtotal);
+        append_model_display_rows(&mut display_rows, 1, false, &row.models, cache_read_mode);
     }
     display_rows
 }
 
 /// Build display rows for a session report.
-fn session_display_rows(rows: &[SessionRow]) -> Vec<DisplayRow> {
+fn session_display_rows(rows: &[SessionRow], cache_read_mode: CacheReadMode) -> Vec<DisplayRow> {
     let mut display_rows = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         if index > 0 {
@@ -481,7 +535,7 @@ fn session_display_rows(rows: &[SessionRow]) -> Vec<DisplayRow> {
                 kind: DisplayRowKind::Spacer,
             });
         }
-        display_rows.push(DisplayRow {
+        let mut subtotal = DisplayRow {
             cells: vec![
                 if row.directory.is_empty() {
                     "-".to_string()
@@ -490,19 +544,49 @@ fn session_display_rows(rows: &[SessionRow]) -> Vec<DisplayRow> {
                 },
                 row.session_file.clone(),
                 "TOTAL".to_string(),
-                row.input_tokens.to_string(),
-                row.cached_input_tokens.to_string(),
-                row.output_tokens.to_string(),
-                row.reasoning_output_tokens.to_string(),
-                row.total_tokens.to_string(),
-                format_currency(row.cost_usd),
-                row.last_activity.clone(),
             ],
             kind: DisplayRowKind::Subtotal,
-        });
-        append_model_display_rows(&mut display_rows, 2, true, &row.models);
+        };
+        append_usage_cells(
+            &mut subtotal.cells,
+            row.input_tokens,
+            row.cached_input_tokens,
+            row.output_tokens,
+            row.reasoning_output_tokens,
+            row.total_tokens,
+            row.cost_usd,
+            cache_read_mode,
+        );
+        subtotal.cells.push(row.last_activity.clone());
+        display_rows.push(subtotal);
+        append_model_display_rows(&mut display_rows, 2, true, &row.models, cache_read_mode);
     }
     display_rows
+}
+
+/// Append usage and cost cells in the active cache-read column layout.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keeps display-row construction explicit at each call site"
+)]
+fn append_usage_cells(
+    cells: &mut Vec<String>,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
+    cost_usd: f64,
+    cache_read_mode: CacheReadMode,
+) {
+    cells.push(input_tokens.to_string());
+    if cache_read_mode == CacheReadMode::Include {
+        cells.push(cached_input_tokens.to_string());
+    }
+    cells.push(output_tokens.to_string());
+    cells.push(reasoning_output_tokens.to_string());
+    cells.push(total_tokens.to_string());
+    cells.push(format_currency(cost_usd));
 }
 
 /// Append child rows for every model in a group.
@@ -511,6 +595,7 @@ fn append_model_display_rows(
     columns_before_model: usize,
     include_last_activity_column: bool,
     models: &BTreeMap<String, ModelBreakdown>,
+    cache_read_mode: CacheReadMode,
 ) {
     for (model, breakdown) in models {
         let explicit_usage = explicit_usage(breakdown);
@@ -521,6 +606,7 @@ fn append_model_display_rows(
                 model,
                 &explicit_usage,
                 breakdown.cost_usd,
+                cache_read_mode,
             ));
         }
 
@@ -531,6 +617,7 @@ fn append_model_display_rows(
                 &format!("{model} (fallback)"),
                 &breakdown.fallback_usage,
                 breakdown.fallback_cost_usd,
+                cache_read_mode,
             ));
         }
     }
@@ -543,17 +630,20 @@ fn model_display_row(
     model_label: &str,
     usage: &UsageTotals,
     cost_usd: f64,
+    cache_read_mode: CacheReadMode,
 ) -> DisplayRow {
     let mut cells = vec![String::new(); columns_before_model];
     cells.push(format!("  {model_label}"));
-    cells.extend_from_slice(&[
-        usage.input.to_string(),
-        usage.cached_input.to_string(),
-        usage.output.to_string(),
-        usage.reasoning_output.to_string(),
-        usage.total.to_string(),
-        format_currency(cost_usd),
-    ]);
+    append_usage_cells(
+        &mut cells,
+        usage.input,
+        usage.cached_input,
+        usage.output,
+        usage.reasoning_output,
+        usage.total,
+        cost_usd,
+        cache_read_mode,
+    );
     if include_last_activity_column {
         cells.push(String::new());
     }
@@ -651,6 +741,7 @@ fn watch_rows(
     snapshot: &WatchSnapshot,
     number_format: NumberFormat,
     model_columns: &[WatchBurnColumn],
+    cache_read_mode: CacheReadMode,
 ) -> Vec<WatchMetricRow> {
     let token_cells = |select: fn(&UsageTotals) -> u64| {
         model_columns
@@ -671,14 +762,14 @@ fn watch_rows(
         })
         .collect::<Vec<_>>();
 
-    vec![
-        WatchMetricRow {
-            metric: "Input",
-            today: format_u64_with(snapshot.totals.input_tokens, number_format),
-            per_model: token_cells(|usage| usage.input),
-            burn_rate: format_u64_with(snapshot.burn_rate.input_tokens_per_hour, number_format),
-        },
-        WatchMetricRow {
+    let mut rows = vec![WatchMetricRow {
+        metric: "Input",
+        today: format_u64_with(snapshot.totals.input_tokens, number_format),
+        per_model: token_cells(|usage| usage.input),
+        burn_rate: format_u64_with(snapshot.burn_rate.input_tokens_per_hour, number_format),
+    }];
+    if cache_read_mode == CacheReadMode::Include {
+        rows.push(WatchMetricRow {
             metric: "Cache",
             today: format_u64_with(snapshot.totals.cached_input_tokens, number_format),
             per_model: token_cells(|usage| usage.cached_input),
@@ -686,7 +777,9 @@ fn watch_rows(
                 snapshot.burn_rate.cached_input_tokens_per_hour,
                 number_format,
             ),
-        },
+        });
+    }
+    rows.extend([
         WatchMetricRow {
             metric: "Output",
             today: format_u64_with(snapshot.totals.output_tokens, number_format),
@@ -714,7 +807,8 @@ fn watch_rows(
             per_model: cost_cells,
             burn_rate: format_currency(snapshot.burn_rate.cost_usd_per_hour),
         },
-    ]
+    ]);
+    rows
 }
 
 /// Shared inputs for stacked watch-table layout decisions.
@@ -974,31 +1068,29 @@ fn render_usage_table(
 
 /// Build the final grand total row for a table.
 fn grand_total_row(headers: &[&str], totals: &Totals) -> DisplayRow {
-    let cells = if headers.first() == Some(&"Directory") {
-        vec![
-            String::new(),
-            String::new(),
-            "GRAND TOTAL".to_string(),
-            totals.input_tokens.to_string(),
-            totals.cached_input_tokens.to_string(),
-            totals.output_tokens.to_string(),
-            totals.reasoning_output_tokens.to_string(),
-            totals.total_tokens.to_string(),
-            format_currency(totals.cost_usd),
-            String::new(),
-        ]
+    let cache_read_mode = if headers.contains(&"Cache") {
+        CacheReadMode::Include
     } else {
-        vec![
-            String::new(),
-            "GRAND TOTAL".to_string(),
-            totals.input_tokens.to_string(),
-            totals.cached_input_tokens.to_string(),
-            totals.output_tokens.to_string(),
-            totals.reasoning_output_tokens.to_string(),
-            totals.total_tokens.to_string(),
-            format_currency(totals.cost_usd),
-        ]
+        CacheReadMode::Exclude
     };
+    let mut cells = if headers.first() == Some(&"Directory") {
+        vec![String::new(), String::new(), "GRAND TOTAL".to_string()]
+    } else {
+        vec![String::new(), "GRAND TOTAL".to_string()]
+    };
+    append_usage_cells(
+        &mut cells,
+        totals.input_tokens,
+        totals.cached_input_tokens,
+        totals.output_tokens,
+        totals.reasoning_output_tokens,
+        totals.total_tokens,
+        totals.cost_usd,
+        cache_read_mode,
+    );
+    if headers.first() == Some(&"Directory") {
+        cells.push(String::new());
+    }
 
     DisplayRow {
         cells,

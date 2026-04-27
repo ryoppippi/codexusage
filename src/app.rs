@@ -63,6 +63,16 @@ pub enum CachedInputCostMode {
     Free,
 }
 
+/// Cache-read token reporting mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CacheReadMode {
+    /// Include cache-read input tokens in the reported token counters.
+    #[default]
+    Include,
+    /// Exclude cache-read input tokens from input and total counters.
+    Exclude,
+}
+
 /// Supported report kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReportKind {
@@ -116,6 +126,8 @@ pub struct ReportOptions {
     pub refresh_pricing: bool,
     /// Cached input token pricing mode.
     pub cached_input_cost_mode: CachedInputCostMode,
+    /// Cache-read token reporting mode.
+    pub cache_read_mode: CacheReadMode,
     /// Session directories to scan.
     pub session_dirs: Vec<PathBuf>,
     /// Scanner worker configuration.
@@ -250,6 +262,8 @@ struct WatchOptions {
     refresh_pricing: bool,
     /// Cached input token pricing mode.
     cached_input_cost_mode: CachedInputCostMode,
+    /// Cache-read token reporting mode.
+    cache_read_mode: CacheReadMode,
     /// Session directories to scan.
     session_dirs: Vec<PathBuf>,
     /// Scanner worker configuration.
@@ -269,15 +283,27 @@ struct CacheCostCliOptions {
     /// Treat cache-read input tokens as free in cost calculations.
     #[arg(long = "no-cache-cost", global = true)]
     no_cache_cost: bool,
+    /// Exclude cache-read input tokens from reported usage and cost calculations.
+    #[arg(long = "exclude-cache-read", global = true)]
+    exclude_cache_read: bool,
 }
 
 impl CacheCostCliOptions {
     /// Convert the parsed CLI flags into the internal pricing mode.
     fn cached_input_cost_mode(self) -> CachedInputCostMode {
-        if self.no_cache_cost {
+        if self.no_cache_cost || self.exclude_cache_read {
             CachedInputCostMode::Free
         } else {
             CachedInputCostMode::Priced
+        }
+    }
+
+    /// Convert the parsed CLI flags into the cache-read reporting mode.
+    fn cache_read_mode(self) -> CacheReadMode {
+        if self.exclude_cache_read {
+            CacheReadMode::Exclude
+        } else {
+            CacheReadMode::Include
         }
     }
 }
@@ -379,8 +405,30 @@ struct PreparedReport {
     session_dirs: Vec<PathBuf>,
     /// Pricing catalog loaded for the final render.
     pricing: PricingCatalog,
+    /// Usage and cost presentation behavior.
+    presentation: UsagePresentation,
+}
+
+/// Usage and cost presentation behavior shared by reports and watch snapshots.
+#[derive(Clone, Copy, Debug)]
+struct UsagePresentation {
     /// Cached input token pricing behavior.
     cached_input_cost_mode: CachedInputCostMode,
+    /// Cache-read token reporting behavior.
+    cache_read_mode: CacheReadMode,
+}
+
+impl UsagePresentation {
+    /// Create presentation behavior from the CLI-free option modes.
+    const fn new(
+        cached_input_cost_mode: CachedInputCostMode,
+        cache_read_mode: CacheReadMode,
+    ) -> Self {
+        Self {
+            cached_input_cost_mode,
+            cache_read_mode,
+        }
+    }
 }
 
 /// Resolve shared report inputs before scanning.
@@ -403,7 +451,10 @@ fn prepare_report(kind: ReportKind, options: &ReportOptions) -> Result<PreparedR
             offline: options.offline,
             force_refresh: options.refresh_pricing,
         })?,
-        cached_input_cost_mode: options.cached_input_cost_mode,
+        presentation: UsagePresentation::new(
+            options.cached_input_cost_mode,
+            options.cache_read_mode,
+        ),
     })
 }
 
@@ -484,7 +535,7 @@ where
     builder.merge(scanned);
     builder.finish(
         &prepared.pricing,
-        prepared.cached_input_cost_mode,
+        prepared.presentation,
         missing_directories,
     )
 }
@@ -515,7 +566,7 @@ fn build_watch_snapshot_with_pricing_at(
     let builder = scan_watch_targets(&selected_files, options.parallelism, timezone, now_utc)?;
     Ok(builder.finish(
         pricing,
-        options.cached_input_cost_mode,
+        UsagePresentation::new(options.cached_input_cost_mode, options.cache_read_mode),
         missing_directories,
         options.show_model_burn_rate,
     ))
@@ -859,26 +910,37 @@ fn run_watch_loop(options: &WatchOptions) -> Result<()> {
         )?;
         let snapshot = runtime.snapshot(
             &pricing,
-            options.cached_input_cost_mode,
+            UsagePresentation::new(options.cached_input_cost_mode, options.cache_read_mode),
             snapshot_now,
             options.show_model_burn_rate,
         )?;
-        stdout.write_all(b"\x1b[2J\x1b[H")?;
-        stdout.write_all(
-            render_watch_screen(
-                &snapshot,
-                &options.locale,
-                options.number_format,
-                options.show_model_burn_rate,
-            )
-            .as_bytes(),
-        )?;
-        stdout.flush()?;
+        write_watch_snapshot(&mut stdout, &snapshot, options)?;
         thread::sleep(remaining_watch_sleep(
             options.interval,
             loop_started_at.elapsed(),
         ));
     }
+}
+
+/// Render and flush one watch snapshot to terminal output.
+fn write_watch_snapshot(
+    output: &mut impl Write,
+    snapshot: &WatchSnapshot,
+    options: &WatchOptions,
+) -> Result<()> {
+    output.write_all(b"\x1b[2J\x1b[H")?;
+    output.write_all(
+        render_watch_screen(
+            snapshot,
+            &options.locale,
+            options.number_format,
+            options.show_model_burn_rate,
+            options.cache_read_mode,
+        )
+        .as_bytes(),
+    )?;
+    output.flush()?;
+    Ok(())
 }
 
 /// Decide whether the terminal should receive ANSI clear-screen sequences.
@@ -998,6 +1060,7 @@ where
     let timezone = timezone.unwrap_or_else(default_timezone_name);
     let parallelism = threads.map_or(ScannerParallelism::Auto, ScannerParallelism::Fixed);
     let cached_input_cost_mode = cache_cost.cached_input_cost_mode();
+    let cache_read_mode = cache_cost.cache_read_mode();
 
     match command {
         Some(Command::Watch {
@@ -1012,6 +1075,7 @@ where
                 offline,
                 refresh_pricing,
                 cached_input_cost_mode,
+                cache_read_mode,
                 session_dirs: session_dir,
                 parallelism,
                 interval,
@@ -1035,6 +1099,7 @@ where
                 offline,
                 refresh_pricing,
                 cached_input_cost_mode,
+                cache_read_mode,
                 session_dirs: session_dir,
                 parallelism,
             };
@@ -1048,7 +1113,12 @@ where
             } else {
                 println!(
                     "{}",
-                    render_report(&output, &options.locale, options.number_format)
+                    render_report(
+                        &output,
+                        &options.locale,
+                        options.number_format,
+                        options.cache_read_mode,
+                    )
                 );
             }
             Ok(())
@@ -1409,6 +1479,23 @@ impl UsageTotals {
             || self.output > 0
             || self.reasoning_output > 0
             || self.total > 0
+    }
+
+    /// Return usage counters with the selected cache-read reporting mode applied.
+    fn with_cache_read_mode(&self, cache_read_mode: CacheReadMode) -> Self {
+        match cache_read_mode {
+            CacheReadMode::Include => self.clone(),
+            CacheReadMode::Exclude => {
+                let cached_input = self.cached_input.min(self.input);
+                Self {
+                    input: self.input.saturating_sub(cached_input),
+                    cached_input: 0,
+                    output: self.output,
+                    reasoning_output: self.reasoning_output,
+                    total: self.total.saturating_sub(cached_input),
+                }
+            }
+        }
     }
 }
 
@@ -2125,105 +2212,128 @@ impl ReportBuilder {
     fn finish(
         self,
         pricing: &PricingCatalog,
-        cached_input_cost_mode: CachedInputCostMode,
+        presentation: UsagePresentation,
         missing_directories: Vec<String>,
     ) -> Result<ReportOutput> {
+        let context = ReportFinishContext {
+            pricing,
+            presentation,
+        };
         match self.kind {
-            ReportKind::Daily => {
-                let mut rows = Vec::with_capacity(self.daily.len());
-                let mut keys = self.daily.keys().cloned().collect::<Vec<_>>();
-                keys.sort_unstable();
-                let mut totals = Totals::default();
-                for key in keys {
-                    let summary = self
-                        .daily
-                        .get(&key)
-                        .ok_or_else(|| eyre!("missing daily summary for key {key}"))?;
-                    let models = to_sorted_models(&summary.models, pricing, cached_input_cost_mode);
-                    let cost =
-                        calculate_summary_cost(&summary.models, pricing, cached_input_cost_mode);
-                    push_totals(&mut totals, &summary.totals, cost);
-                    rows.push(DailyRow {
-                        date: key,
-                        input_tokens: summary.totals.input,
-                        cached_input_tokens: summary.totals.cached_input,
-                        output_tokens: summary.totals.output,
-                        reasoning_output_tokens: summary.totals.reasoning_output,
-                        total_tokens: summary.totals.total,
-                        cost_usd: cost,
-                        models,
-                    });
-                }
-                Ok(ReportOutput::Daily {
-                    rows,
-                    totals,
-                    missing_directories,
-                })
-            }
-            ReportKind::Monthly => {
-                let mut rows = Vec::with_capacity(self.monthly.len());
-                let mut keys = self.monthly.keys().cloned().collect::<Vec<_>>();
-                keys.sort_unstable();
-                let mut totals = Totals::default();
-                for key in keys {
-                    let summary = self
-                        .monthly
-                        .get(&key)
-                        .ok_or_else(|| eyre!("missing monthly summary for key {key}"))?;
-                    let models = to_sorted_models(&summary.models, pricing, cached_input_cost_mode);
-                    let cost =
-                        calculate_summary_cost(&summary.models, pricing, cached_input_cost_mode);
-                    push_totals(&mut totals, &summary.totals, cost);
-                    rows.push(MonthlyRow {
-                        month: key,
-                        input_tokens: summary.totals.input,
-                        cached_input_tokens: summary.totals.cached_input,
-                        output_tokens: summary.totals.output,
-                        reasoning_output_tokens: summary.totals.reasoning_output,
-                        total_tokens: summary.totals.total,
-                        cost_usd: cost,
-                        models,
-                    });
-                }
-                Ok(ReportOutput::Monthly {
-                    rows,
-                    totals,
-                    missing_directories,
-                })
-            }
-            ReportKind::Session => {
-                let mut rows = Vec::with_capacity(self.session.len());
-                let mut entries = self.session.into_iter().collect::<Vec<_>>();
-                sort_session_entries(&mut entries);
-                let mut totals = Totals::default();
-                for (_session_key, summary) in entries {
-                    let cost =
-                        calculate_summary_cost(&summary.models, pricing, cached_input_cost_mode);
-                    push_totals(&mut totals, &summary.totals, cost);
-                    let (directory, session_file) = split_session_id(&summary.display_session_id);
-                    rows.push(SessionRow {
-                        session_id: summary.display_session_id,
-                        directory,
-                        session_file,
-                        last_activity: summary
-                            .last_activity
-                            .with_timezone(&self.timezone)
-                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                        input_tokens: summary.totals.input,
-                        cached_input_tokens: summary.totals.cached_input,
-                        output_tokens: summary.totals.output,
-                        reasoning_output_tokens: summary.totals.reasoning_output,
-                        total_tokens: summary.totals.total,
-                        cost_usd: cost,
-                        models: to_sorted_models(&summary.models, pricing, cached_input_cost_mode),
-                    });
-                }
-                Ok(ReportOutput::Session {
-                    rows,
-                    totals,
-                    missing_directories,
-                })
-            }
+            ReportKind::Daily => self.finish_daily(context, missing_directories),
+            ReportKind::Monthly => self.finish_monthly(context, missing_directories),
+            ReportKind::Session => Ok(self.finish_session(context, missing_directories)),
+        }
+    }
+
+    /// Finish a daily report.
+    fn finish_daily(
+        self,
+        context: ReportFinishContext<'_>,
+        missing_directories: Vec<String>,
+    ) -> Result<ReportOutput> {
+        let mut rows = Vec::with_capacity(self.daily.len());
+        let mut keys = self.daily.keys().cloned().collect::<Vec<_>>();
+        keys.sort_unstable();
+        let mut totals = Totals::default();
+        for key in keys {
+            let summary = self
+                .daily
+                .get(&key)
+                .ok_or_else(|| eyre!("missing daily summary for key {key}"))?;
+            let (visible_totals, cost, models) =
+                context.finish_summary(&summary.totals, &summary.models);
+            push_totals(&mut totals, &visible_totals, cost);
+            rows.push(DailyRow {
+                date: key,
+                input_tokens: visible_totals.input,
+                cached_input_tokens: visible_totals.cached_input,
+                output_tokens: visible_totals.output,
+                reasoning_output_tokens: visible_totals.reasoning_output,
+                total_tokens: visible_totals.total,
+                cost_usd: cost,
+                models,
+            });
+        }
+        Ok(ReportOutput::Daily {
+            rows,
+            totals,
+            missing_directories,
+        })
+    }
+
+    /// Finish a monthly report.
+    fn finish_monthly(
+        self,
+        context: ReportFinishContext<'_>,
+        missing_directories: Vec<String>,
+    ) -> Result<ReportOutput> {
+        let mut rows = Vec::with_capacity(self.monthly.len());
+        let mut keys = self.monthly.keys().cloned().collect::<Vec<_>>();
+        keys.sort_unstable();
+        let mut totals = Totals::default();
+        for key in keys {
+            let summary = self
+                .monthly
+                .get(&key)
+                .ok_or_else(|| eyre!("missing monthly summary for key {key}"))?;
+            let (visible_totals, cost, models) =
+                context.finish_summary(&summary.totals, &summary.models);
+            push_totals(&mut totals, &visible_totals, cost);
+            rows.push(MonthlyRow {
+                month: key,
+                input_tokens: visible_totals.input,
+                cached_input_tokens: visible_totals.cached_input,
+                output_tokens: visible_totals.output,
+                reasoning_output_tokens: visible_totals.reasoning_output,
+                total_tokens: visible_totals.total,
+                cost_usd: cost,
+                models,
+            });
+        }
+        Ok(ReportOutput::Monthly {
+            rows,
+            totals,
+            missing_directories,
+        })
+    }
+
+    /// Finish a session report.
+    fn finish_session(
+        self,
+        context: ReportFinishContext<'_>,
+        missing_directories: Vec<String>,
+    ) -> ReportOutput {
+        let mut rows = Vec::with_capacity(self.session.len());
+        let mut entries = self.session.into_iter().collect::<Vec<_>>();
+        sort_session_entries(&mut entries);
+        let mut totals = Totals::default();
+        for (_session_key, summary) in entries {
+            let (visible_totals, cost, models) =
+                context.finish_summary(&summary.totals, &summary.models);
+            push_totals(&mut totals, &visible_totals, cost);
+            let (directory, session_file) = split_session_id(&summary.display_session_id);
+            rows.push(SessionRow {
+                session_id: summary.display_session_id,
+                directory,
+                session_file,
+                last_activity: summary
+                    .last_activity
+                    .with_timezone(&self.timezone)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                input_tokens: visible_totals.input,
+                cached_input_tokens: visible_totals.cached_input,
+                output_tokens: visible_totals.output,
+                reasoning_output_tokens: visible_totals.reasoning_output,
+                total_tokens: visible_totals.total,
+                cost_usd: cost,
+                models,
+            });
+        }
+        ReportOutput::Session {
+            rows,
+            totals,
+            missing_directories,
         }
     }
 
@@ -2249,6 +2359,29 @@ impl ReportBuilder {
         merge_group_summaries(&mut self.daily, other.daily);
         merge_group_summaries(&mut self.monthly, other.monthly);
         merge_session_summaries(&mut self.session, other.session);
+    }
+}
+
+/// Shared report finalization inputs.
+#[derive(Clone, Copy)]
+struct ReportFinishContext<'a> {
+    /// Pricing catalog used to compute costs.
+    pricing: &'a PricingCatalog,
+    /// Usage and cost presentation behavior.
+    presentation: UsagePresentation,
+}
+
+impl ReportFinishContext<'_> {
+    /// Finish one group summary into visible totals, cost, and model rows.
+    fn finish_summary(
+        self,
+        totals: &UsageTotals,
+        models: &HashMap<String, ModelBreakdown>,
+    ) -> (UsageTotals, f64, BTreeMap<String, ModelBreakdown>) {
+        let visible_totals = totals.with_cache_read_mode(self.presentation.cache_read_mode);
+        let cost = calculate_summary_cost(models, self.pricing, self.presentation);
+        let sorted_models = to_sorted_models(models, self.pricing, self.presentation);
+        (visible_totals, cost, sorted_models)
     }
 }
 
@@ -2287,24 +2420,29 @@ impl WatchSnapshotContext {
         current_day_summary: &GroupSummary,
         burn_window_summary: &GroupSummary,
         pricing: &PricingCatalog,
-        cached_input_cost_mode: CachedInputCostMode,
+        presentation: UsagePresentation,
         missing_directories: Vec<String>,
         include_per_model: bool,
     ) -> WatchSnapshot {
         let current_day_cost =
-            calculate_summary_cost(&current_day_summary.models, pricing, cached_input_cost_mode);
-        let burn_cost =
-            calculate_summary_cost(&burn_window_summary.models, pricing, cached_input_cost_mode);
+            calculate_summary_cost(&current_day_summary.models, pricing, presentation);
+        let burn_cost = calculate_summary_cost(&burn_window_summary.models, pricing, presentation);
+        let current_day_totals = current_day_summary
+            .totals
+            .with_cache_read_mode(presentation.cache_read_mode);
+        let burn_window_totals = burn_window_summary
+            .totals
+            .with_cache_read_mode(presentation.cache_read_mode);
         let totals = Totals {
-            input_tokens: current_day_summary.totals.input,
-            cached_input_tokens: current_day_summary.totals.cached_input,
-            output_tokens: current_day_summary.totals.output,
-            reasoning_output_tokens: current_day_summary.totals.reasoning_output,
-            total_tokens: current_day_summary.totals.total,
+            input_tokens: current_day_totals.input,
+            cached_input_tokens: current_day_totals.cached_input,
+            output_tokens: current_day_totals.output,
+            reasoning_output_tokens: current_day_totals.reasoning_output,
+            total_tokens: current_day_totals.total,
             cost_usd: current_day_cost,
         };
         let per_model = if include_per_model {
-            to_sorted_models(&burn_window_summary.models, pricing, cached_input_cost_mode)
+            to_sorted_models(&burn_window_summary.models, pricing, presentation)
         } else {
             BTreeMap::new()
         };
@@ -2316,23 +2454,23 @@ impl WatchSnapshotContext {
                 window_duration: self.window_duration,
                 window_minutes: display_window_minutes(self.window_duration),
                 input_tokens_per_hour: scale_usage_per_hour(
-                    burn_window_summary.totals.input,
+                    burn_window_totals.input,
                     self.window_duration,
                 ),
                 cached_input_tokens_per_hour: scale_usage_per_hour(
-                    burn_window_summary.totals.cached_input,
+                    burn_window_totals.cached_input,
                     self.window_duration,
                 ),
                 output_tokens_per_hour: scale_usage_per_hour(
-                    burn_window_summary.totals.output,
+                    burn_window_totals.output,
                     self.window_duration,
                 ),
                 reasoning_output_tokens_per_hour: scale_usage_per_hour(
-                    burn_window_summary.totals.reasoning_output,
+                    burn_window_totals.reasoning_output,
                     self.window_duration,
                 ),
                 total_tokens_per_hour: scale_usage_per_hour(
-                    burn_window_summary.totals.total,
+                    burn_window_totals.total,
                     self.window_duration,
                 ),
                 cost_usd_per_hour: scale_cost_per_hour(burn_cost, self.window_duration),
@@ -2419,7 +2557,7 @@ impl WatchBuilder {
     fn finish(
         self,
         pricing: &PricingCatalog,
-        cached_input_cost_mode: CachedInputCostMode,
+        presentation: UsagePresentation,
         missing_directories: Vec<String>,
         include_per_model: bool,
     ) -> WatchSnapshot {
@@ -2427,7 +2565,7 @@ impl WatchBuilder {
             &self.current_day_summary,
             &self.burn_window_summary,
             pricing,
-            cached_input_cost_mode,
+            presentation,
             missing_directories,
             include_per_model,
         )
@@ -2854,7 +2992,7 @@ impl WatchRuntimeState {
     fn snapshot(
         &self,
         pricing: &PricingCatalog,
-        cached_input_cost_mode: CachedInputCostMode,
+        presentation: UsagePresentation,
         now_utc: DateTime<Utc>,
         include_per_model: bool,
     ) -> Result<WatchSnapshot> {
@@ -2863,7 +3001,7 @@ impl WatchRuntimeState {
             &self.current_day_summary,
             &self.burn_window_summary,
             pricing,
-            cached_input_cost_mode,
+            presentation,
             self.missing_directories.clone(),
             include_per_model,
         ))
@@ -3317,26 +3455,51 @@ fn remove_usage_from_breakdown(
 fn to_sorted_models(
     models: &HashMap<String, ModelBreakdown>,
     pricing: &PricingCatalog,
-    cached_input_cost_mode: CachedInputCostMode,
+    presentation: UsagePresentation,
 ) -> BTreeMap<String, ModelBreakdown> {
     models
         .iter()
         .map(|(model, usage)| {
-            let mut breakdown = usage.clone();
+            let visible_usage =
+                breakdown_usage(usage).with_cache_read_mode(presentation.cache_read_mode);
+            let visible_fallback_usage = usage
+                .fallback_usage
+                .with_cache_read_mode(presentation.cache_read_mode);
+            let mut breakdown = ModelBreakdown {
+                input_tokens: visible_usage.input,
+                cached_input_tokens: visible_usage.cached_input,
+                output_tokens: visible_usage.output,
+                reasoning_output_tokens: visible_usage.reasoning_output,
+                total_tokens: visible_usage.total,
+                fallback_usage: visible_fallback_usage,
+                is_fallback: usage.is_fallback,
+                ..ModelBreakdown::default()
+            };
             let resolved_pricing = pricing.resolve(model);
             breakdown.cost_usd = calculate_cost_from_usage(
                 &explicit_usage(&breakdown),
                 &resolved_pricing,
-                cached_input_cost_mode,
+                presentation.cached_input_cost_mode,
             );
             breakdown.fallback_cost_usd = calculate_cost_from_usage(
                 &breakdown.fallback_usage,
                 &resolved_pricing,
-                cached_input_cost_mode,
+                presentation.cached_input_cost_mode,
             );
             (model.clone(), breakdown)
         })
         .collect()
+}
+
+/// Convert one model breakdown into internal usage totals.
+fn breakdown_usage(breakdown: &ModelBreakdown) -> UsageTotals {
+    UsageTotals {
+        input: breakdown.input_tokens,
+        cached_input: breakdown.cached_input_tokens,
+        output: breakdown.output_tokens,
+        reasoning_output: breakdown.reasoning_output_tokens,
+        total: breakdown.total_tokens,
+    }
 }
 
 /// Add one row into grand totals.
@@ -3353,12 +3516,16 @@ fn push_totals(totals: &mut Totals, usage: &UsageTotals, cost: f64) {
 fn calculate_summary_cost(
     models: &HashMap<String, ModelBreakdown>,
     pricing: &PricingCatalog,
-    cached_input_cost_mode: CachedInputCostMode,
+    presentation: UsagePresentation,
 ) -> f64 {
     models
         .iter()
         .map(|(model, usage)| {
-            calculate_cost(usage, &pricing.resolve(model), cached_input_cost_mode)
+            calculate_cost_from_usage(
+                &breakdown_usage(usage).with_cache_read_mode(presentation.cache_read_mode),
+                &pricing.resolve(model),
+                presentation.cached_input_cost_mode,
+            )
         })
         .sum()
 }
@@ -4100,6 +4267,7 @@ fn subtract_usage(current: RawUsage, previous: Option<RawUsage>) -> RawUsage {
 }
 
 /// Price one usage entry.
+#[cfg(test)]
 #[allow(
     clippy::cast_precision_loss,
     reason = "Codex token counters are orders of magnitude below f64 precision limits"
@@ -4769,8 +4937,14 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let daily_render = render_report(&daily, "en-US", NumberFormat::Short);
-        let session_render = render_report(&session, "en-US", NumberFormat::Short);
+        let daily_render =
+            render_report(&daily, "en-US", NumberFormat::Short, CacheReadMode::Include);
+        let session_render = render_report(
+            &session,
+            "en-US",
+            NumberFormat::Short,
+            CacheReadMode::Include,
+        );
         assert!(daily_render.contains("TOTAL"));
         assert!(daily_render.contains("2025-09-11"));
         assert!(daily_render.contains("Model"));
@@ -4804,9 +4978,45 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let rendered = render_report(&monthly, "en-US", NumberFormat::Short);
+        let rendered = render_report(
+            &monthly,
+            "en-US",
+            NumberFormat::Short,
+            CacheReadMode::Include,
+        );
         assert!(rendered.contains("Monthly Codex Usage Report"));
         assert!(rendered.contains("2025-09"));
+    }
+
+    #[test]
+    fn render_report_omits_cache_column_when_cache_read_is_excluded() {
+        let daily = ReportOutput::Daily {
+            rows: vec![DailyRow {
+                date: "2025-09-11".to_string(),
+                input_tokens: 80,
+                cached_input_tokens: 0,
+                output_tokens: 20,
+                reasoning_output_tokens: 0,
+                total_tokens: 100,
+                cost_usd: 0.25,
+                models: BTreeMap::new(),
+            }],
+            totals: Totals {
+                input_tokens: 80,
+                cached_input_tokens: 0,
+                output_tokens: 20,
+                reasoning_output_tokens: 0,
+                total_tokens: 100,
+                cost_usd: 0.25,
+            },
+            missing_directories: Vec::new(),
+        };
+
+        let rendered = render_report(&daily, "en-US", NumberFormat::Short, CacheReadMode::Exclude);
+
+        assert!(!rendered.contains("Cache"));
+        assert!(rendered.contains("Input"));
+        assert!(rendered.contains("Output"));
     }
 
     #[test]
@@ -4860,7 +5070,7 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let rendered = render_report(&daily, "en-US", NumberFormat::Short);
+        let rendered = render_report(&daily, "en-US", NumberFormat::Short, CacheReadMode::Include);
         let subtotal = rendered
             .lines()
             .find(|line| line.contains("2025-09-11") && line.contains("TOTAL"))
@@ -4919,7 +5129,12 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let rendered = render_report(&session, "en-US", NumberFormat::Short);
+        let rendered = render_report(
+            &session,
+            "en-US",
+            NumberFormat::Short,
+            CacheReadMode::Include,
+        );
         let subtotal = rendered
             .lines()
             .find(|line| line.contains("session") && line.contains("TOTAL"))
@@ -4976,7 +5191,12 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let rendered = render_report(&report, "en-US", NumberFormat::Short);
+        let rendered = render_report(
+            &report,
+            "en-US",
+            NumberFormat::Short,
+            CacheReadMode::Include,
+        );
         let explicit_row = rendered
             .lines()
             .find(|line| line.contains("  gpt-5") && !line.contains("(fallback)"))
@@ -5115,7 +5335,7 @@ mod tests {
             missing_directories: vec!["/tmp/missing-a".to_string(), "/tmp/missing-b".to_string()],
         };
 
-        let rendered = render_report(&daily, "en-US", NumberFormat::Short);
+        let rendered = render_report(&daily, "en-US", NumberFormat::Short, CacheReadMode::Include);
         assert!(rendered.contains("Warning: missing session directories"));
         assert!(rendered.contains("/tmp/missing-a"));
         assert!(rendered.contains("/tmp/missing-b"));
@@ -5145,8 +5365,8 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let short = render_report(&daily, "en-US", NumberFormat::Short);
-        let full = render_report(&daily, "en-US", NumberFormat::Full);
+        let short = render_report(&daily, "en-US", NumberFormat::Short, CacheReadMode::Include);
+        let full = render_report(&daily, "en-US", NumberFormat::Full, CacheReadMode::Include);
 
         assert!(short.contains("100K"));
         assert!(short.contains("$1234.50"));
@@ -5178,7 +5398,7 @@ mod tests {
             missing_directories: Vec::new(),
         };
 
-        let rendered = render_report(&daily, "en-US", NumberFormat::Full);
+        let rendered = render_report(&daily, "en-US", NumberFormat::Full, CacheReadMode::Include);
         let lines = rendered
             .lines()
             .map(strip_ansi_sequences)
@@ -5288,7 +5508,7 @@ mod tests {
         let report = builder
             .finish(
                 &PricingCatalog::default(),
-                CachedInputCostMode::Priced,
+                UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
                 Vec::new(),
             )
             .expect("report");
@@ -5551,6 +5771,7 @@ mod tests {
                 offline: true,
                 refresh_pricing: false,
                 cached_input_cost_mode: CachedInputCostMode::Priced,
+                cache_read_mode: CacheReadMode::Include,
                 session_dirs: vec![first_sessions, second_sessions],
                 parallelism: ScannerParallelism::Auto,
             },
@@ -5597,6 +5818,7 @@ mod tests {
             offline: true,
             refresh_pricing: false,
             cached_input_cost_mode: CachedInputCostMode::Priced,
+            cache_read_mode: CacheReadMode::Include,
             session_dirs: vec![sessions],
             parallelism: ScannerParallelism::Auto,
             interval: Duration::from_secs(5),
@@ -5642,6 +5864,22 @@ mod tests {
                 .abs()
                 < f64::EPSILON
         );
+
+        let mut exclude_cache_options = options.clone();
+        exclude_cache_options.cache_read_mode = CacheReadMode::Exclude;
+        let exclude_cache_snapshot =
+            build_watch_snapshot_at(&exclude_cache_options, now).expect("watch snapshot");
+        assert_eq!(exclude_cache_snapshot.totals.input_tokens, 35);
+        assert_eq!(exclude_cache_snapshot.totals.cached_input_tokens, 0);
+        assert_eq!(exclude_cache_snapshot.totals.total_tokens, 45);
+        assert_eq!(exclude_cache_snapshot.burn_rate.input_tokens_per_hour, 70);
+        assert_eq!(
+            exclude_cache_snapshot
+                .burn_rate
+                .cached_input_tokens_per_hour,
+            0
+        );
+        assert_eq!(exclude_cache_snapshot.burn_rate.total_tokens_per_hour, 90);
     }
 
     #[test]
@@ -5672,7 +5910,7 @@ mod tests {
         let initial_snapshot = runtime
             .snapshot(
                 &PricingCatalog::default(),
-                CachedInputCostMode::Priced,
+                UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
                 now,
                 false,
             )
@@ -5700,7 +5938,7 @@ mod tests {
         let refreshed_snapshot = runtime
             .snapshot(
                 &PricingCatalog::default(),
-                CachedInputCostMode::Priced,
+                UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
                 now,
                 false,
             )
@@ -5738,7 +5976,7 @@ mod tests {
         let early_snapshot = runtime
             .snapshot(
                 &PricingCatalog::default(),
-                CachedInputCostMode::Priced,
+                UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
                 loaded_at,
                 false,
             )
@@ -5762,7 +6000,7 @@ mod tests {
         let later_snapshot = runtime
             .snapshot(
                 &PricingCatalog::default(),
-                CachedInputCostMode::Priced,
+                UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
                 later_now,
                 false,
             )
@@ -5826,7 +6064,7 @@ mod tests {
         let snapshot = runtime
             .snapshot(
                 &PricingCatalog::default(),
-                CachedInputCostMode::Priced,
+                UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
                 now,
                 false,
             )
@@ -5892,7 +6130,7 @@ mod tests {
         let snapshot = runtime
             .snapshot(
                 &PricingCatalog::default(),
-                CachedInputCostMode::Priced,
+                UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
                 now,
                 false,
             )
@@ -6151,6 +6389,7 @@ mod tests {
             "en-US",
             NumberFormat::Short,
             false,
+            CacheReadMode::Include,
         );
 
         assert!(rendered.contains("Current Day Codex Usage Watch"));
@@ -6161,6 +6400,44 @@ mod tests {
         assert!(rendered.contains("Input"));
         assert!(rendered.contains("$2.50"));
         assert!(rendered.contains("/tmp/missing"));
+    }
+
+    #[test]
+    fn render_watch_screen_omits_cache_metric_when_cache_read_is_excluded() {
+        let rendered = render_watch_screen(
+            &WatchSnapshot {
+                date: "2026-01-02".to_string(),
+                totals: Totals {
+                    input_tokens: 35,
+                    cached_input_tokens: 0,
+                    output_tokens: 10,
+                    reasoning_output_tokens: 3,
+                    total_tokens: 45,
+                    cost_usd: 1.25,
+                },
+                burn_rate: BurnRateSnapshot {
+                    window_duration: Duration::from_secs(30 * 60),
+                    window_minutes: 30,
+                    input_tokens_per_hour: 70,
+                    cached_input_tokens_per_hour: 0,
+                    output_tokens_per_hour: 20,
+                    reasoning_output_tokens_per_hour: 6,
+                    total_tokens_per_hour: 90,
+                    cost_usd_per_hour: 2.5,
+                },
+                per_model: BTreeMap::new(),
+                missing_directories: Vec::new(),
+                updated_time: "00:30:00".to_string(),
+            },
+            "en-US",
+            NumberFormat::Short,
+            false,
+            CacheReadMode::Exclude,
+        );
+
+        assert!(!rendered.contains("Cache"));
+        assert!(rendered.contains("Input"));
+        assert!(rendered.contains("Output"));
     }
 
     #[test]
@@ -6190,8 +6467,20 @@ mod tests {
             updated_time: "00:30:00".to_string(),
         };
 
-        let short = render_watch_screen(&snapshot, "en-US", NumberFormat::Short, false);
-        let full = render_watch_screen(&snapshot, "en-US", NumberFormat::Full, false);
+        let short = render_watch_screen(
+            &snapshot,
+            "en-US",
+            NumberFormat::Short,
+            false,
+            CacheReadMode::Include,
+        );
+        let full = render_watch_screen(
+            &snapshot,
+            "en-US",
+            NumberFormat::Full,
+            false,
+            CacheReadMode::Include,
+        );
 
         assert!(short.contains("100K"));
         assert!(!short.contains("100,000"));
@@ -6241,6 +6530,7 @@ mod tests {
             "en-US",
             NumberFormat::Short,
             false,
+            CacheReadMode::Include,
         );
 
         assert!(!rendered.contains("| gpt-5 "));
@@ -6319,6 +6609,7 @@ mod tests {
             "en-US",
             NumberFormat::Short,
             true,
+            CacheReadMode::Include,
         );
 
         assert!(rendered.contains("gpt-5"));
@@ -6428,6 +6719,7 @@ mod tests {
             "en-US",
             NumberFormat::Full,
             true,
+            CacheReadMode::Include,
         );
 
         let header = rendered
@@ -6499,6 +6791,7 @@ mod tests {
             "en-US",
             NumberFormat::Full,
             true,
+            CacheReadMode::Include,
         );
 
         let input_row = rendered
@@ -6562,6 +6855,7 @@ mod tests {
             "en-US",
             NumberFormat::Full,
             true,
+            CacheReadMode::Include,
         );
 
         let header = rendered
@@ -6635,6 +6929,7 @@ mod tests {
             "en-US",
             NumberFormat::Full,
             true,
+            CacheReadMode::Include,
             Some(40),
         );
 
@@ -6707,6 +7002,7 @@ mod tests {
             "en-US",
             NumberFormat::Full,
             true,
+            CacheReadMode::Include,
             Some(200),
         );
 
@@ -6823,6 +7119,32 @@ mod tests {
         assert_eq!(
             watch_cli.cache_cost.cached_input_cost_mode(),
             CachedInputCostMode::Free
+        );
+        assert!(matches!(watch_cli.command, Some(Command::Watch { .. })));
+    }
+
+    #[test]
+    fn cli_accepts_exclude_cache_read_as_global_flag() {
+        let cli =
+            Cli::try_parse_from(["codexusage", "--exclude-cache-read", "daily"]).expect("cli");
+
+        assert_eq!(
+            cli.cache_cost.cached_input_cost_mode(),
+            CachedInputCostMode::Free
+        );
+        assert_eq!(cli.cache_cost.cache_read_mode(), CacheReadMode::Exclude);
+        assert_eq!(cli.command, Some(Command::Daily));
+
+        let watch_cli =
+            Cli::try_parse_from(["codexusage", "watch", "--exclude-cache-read"]).expect("cli");
+
+        assert_eq!(
+            watch_cli.cache_cost.cached_input_cost_mode(),
+            CachedInputCostMode::Free
+        );
+        assert_eq!(
+            watch_cli.cache_cost.cache_read_mode(),
+            CacheReadMode::Exclude
         );
         assert!(matches!(watch_cli.command, Some(Command::Watch { .. })));
     }

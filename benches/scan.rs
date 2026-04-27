@@ -1,5 +1,6 @@
 use codexusage::app::{
-    CachedInputCostMode, NumberFormat, ReportKind, ReportOptions, ScannerParallelism, build_report,
+    CacheReadMode, CachedInputCostMode, NumberFormat, ReportKind, ReportOptions,
+    ScannerParallelism, build_report,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use serde_json::json;
@@ -19,6 +20,7 @@ fn base_options(session_dirs: Vec<std::path::PathBuf>) -> ReportOptions {
         offline: true,
         refresh_pricing: false,
         cached_input_cost_mode: CachedInputCostMode::Priced,
+        cache_read_mode: CacheReadMode::Include,
         session_dirs,
         parallelism: ScannerParallelism::Auto,
     }
