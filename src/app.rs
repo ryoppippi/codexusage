@@ -6,9 +6,7 @@ use crate::pricing::{
 };
 use chrono::{DateTime, Days, LocalResult, NaiveDate, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
-#[cfg(debug_assertions)]
-use clap::Args;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, eyre};
 use notify::{
     Config as NotifyConfig, Event as NotifyEvent, EventKind as NotifyEventKind, PollWatcher,
@@ -54,6 +52,16 @@ const DEFAULT_CODEX_HOME_ENV: &str = "CODEX_HOME";
 const DEFAULT_FALLBACK_MODEL: &str = "gpt-5";
 /// Number of tokens in one million-token pricing unit.
 const MILLION: f64 = 1_000_000.0;
+
+/// Cached input token pricing mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CachedInputCostMode {
+    /// Use the cached-input price from the pricing catalog.
+    #[default]
+    Priced,
+    /// Treat cached input tokens as free.
+    Free,
+}
 
 /// Supported report kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +114,8 @@ pub struct ReportOptions {
     pub offline: bool,
     /// Force pricing refresh even when cache is fresh.
     pub refresh_pricing: bool,
+    /// Cached input token pricing mode.
+    pub cached_input_cost_mode: CachedInputCostMode,
     /// Session directories to scan.
     pub session_dirs: Vec<PathBuf>,
     /// Scanner worker configuration.
@@ -238,6 +248,8 @@ struct WatchOptions {
     offline: bool,
     /// Force pricing refresh even when cache is fresh.
     refresh_pricing: bool,
+    /// Cached input token pricing mode.
+    cached_input_cost_mode: CachedInputCostMode,
     /// Session directories to scan.
     session_dirs: Vec<PathBuf>,
     /// Scanner worker configuration.
@@ -249,6 +261,25 @@ struct WatchOptions {
     /// Debug-only runtime options forwarded from the CLI.
     #[cfg(debug_assertions)]
     debug: DebugRuntimeOptions,
+}
+
+/// CLI-only cache-cost flag group.
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CacheCostCliOptions {
+    /// Treat cache-read input tokens as free in cost calculations.
+    #[arg(long = "no-cache-cost", global = true)]
+    no_cache_cost: bool,
+}
+
+impl CacheCostCliOptions {
+    /// Convert the parsed CLI flags into the internal pricing mode.
+    fn cached_input_cost_mode(self) -> CachedInputCostMode {
+        if self.no_cache_cost {
+            CachedInputCostMode::Free
+        } else {
+            CachedInputCostMode::Priced
+        }
+    }
 }
 
 /// Debug-only runtime options for development builds.
@@ -348,6 +379,8 @@ struct PreparedReport {
     session_dirs: Vec<PathBuf>,
     /// Pricing catalog loaded for the final render.
     pricing: PricingCatalog,
+    /// Cached input token pricing behavior.
+    cached_input_cost_mode: CachedInputCostMode,
 }
 
 /// Resolve shared report inputs before scanning.
@@ -370,6 +403,7 @@ fn prepare_report(kind: ReportKind, options: &ReportOptions) -> Result<PreparedR
             offline: options.offline,
             force_refresh: options.refresh_pricing,
         })?,
+        cached_input_cost_mode: options.cached_input_cost_mode,
     })
 }
 
@@ -448,7 +482,11 @@ where
         prepared.until,
     )?;
     builder.merge(scanned);
-    builder.finish(&prepared.pricing, missing_directories)
+    builder.finish(
+        &prepared.pricing,
+        prepared.cached_input_cost_mode,
+        missing_directories,
+    )
 }
 
 /// Build one watch snapshot at a fixed logical time.
@@ -475,7 +513,12 @@ fn build_watch_snapshot_with_pricing_at(
     let session_dirs = resolve_session_dirs(&options.session_dirs);
     let (missing_directories, selected_files) = collect_session_scan_targets(&session_dirs)?;
     let builder = scan_watch_targets(&selected_files, options.parallelism, timezone, now_utc)?;
-    Ok(builder.finish(pricing, missing_directories, options.show_model_burn_rate))
+    Ok(builder.finish(
+        pricing,
+        options.cached_input_cost_mode,
+        missing_directories,
+        options.show_model_burn_rate,
+    ))
 }
 
 /// Validate global flags that conflict with the watch contract.
@@ -814,7 +857,12 @@ fn run_watch_loop(options: &WatchOptions) -> Result<()> {
             changes,
             &refresh_scan_runner,
         )?;
-        let snapshot = runtime.snapshot(&pricing, snapshot_now, options.show_model_burn_rate)?;
+        let snapshot = runtime.snapshot(
+            &pricing,
+            options.cached_input_cost_mode,
+            snapshot_now,
+            options.show_model_burn_rate,
+        )?;
         stdout.write_all(b"\x1b[2J\x1b[H")?;
         stdout.write_all(
             render_watch_screen(
@@ -941,6 +989,7 @@ where
         number_format,
         offline,
         refresh_pricing,
+        cache_cost,
         session_dir,
         threads,
         command,
@@ -948,6 +997,7 @@ where
     } = cli;
     let timezone = timezone.unwrap_or_else(default_timezone_name);
     let parallelism = threads.map_or(ScannerParallelism::Auto, ScannerParallelism::Fixed);
+    let cached_input_cost_mode = cache_cost.cached_input_cost_mode();
 
     match command {
         Some(Command::Watch {
@@ -961,6 +1011,7 @@ where
                 number_format,
                 offline,
                 refresh_pricing,
+                cached_input_cost_mode,
                 session_dirs: session_dir,
                 parallelism,
                 interval,
@@ -983,6 +1034,7 @@ where
                 json,
                 offline,
                 refresh_pricing,
+                cached_input_cost_mode,
                 session_dirs: session_dir,
                 parallelism,
             };
@@ -1046,6 +1098,9 @@ struct Cli {
     /// Force pricing refresh even if the cache is fresh.
     #[arg(long, global = true)]
     refresh_pricing: bool,
+    /// Cache-cost pricing options.
+    #[command(flatten)]
+    cache_cost: CacheCostCliOptions,
     /// Override the session directory. May be repeated.
     #[arg(long, global = true)]
     session_dir: Vec<PathBuf>,
@@ -2070,6 +2125,7 @@ impl ReportBuilder {
     fn finish(
         self,
         pricing: &PricingCatalog,
+        cached_input_cost_mode: CachedInputCostMode,
         missing_directories: Vec<String>,
     ) -> Result<ReportOutput> {
         match self.kind {
@@ -2083,8 +2139,9 @@ impl ReportBuilder {
                         .daily
                         .get(&key)
                         .ok_or_else(|| eyre!("missing daily summary for key {key}"))?;
-                    let models = to_sorted_models(&summary.models, pricing);
-                    let cost = calculate_summary_cost(&summary.models, pricing);
+                    let models = to_sorted_models(&summary.models, pricing, cached_input_cost_mode);
+                    let cost =
+                        calculate_summary_cost(&summary.models, pricing, cached_input_cost_mode);
                     push_totals(&mut totals, &summary.totals, cost);
                     rows.push(DailyRow {
                         date: key,
@@ -2113,8 +2170,9 @@ impl ReportBuilder {
                         .monthly
                         .get(&key)
                         .ok_or_else(|| eyre!("missing monthly summary for key {key}"))?;
-                    let models = to_sorted_models(&summary.models, pricing);
-                    let cost = calculate_summary_cost(&summary.models, pricing);
+                    let models = to_sorted_models(&summary.models, pricing, cached_input_cost_mode);
+                    let cost =
+                        calculate_summary_cost(&summary.models, pricing, cached_input_cost_mode);
                     push_totals(&mut totals, &summary.totals, cost);
                     rows.push(MonthlyRow {
                         month: key,
@@ -2139,7 +2197,8 @@ impl ReportBuilder {
                 sort_session_entries(&mut entries);
                 let mut totals = Totals::default();
                 for (_session_key, summary) in entries {
-                    let cost = calculate_summary_cost(&summary.models, pricing);
+                    let cost =
+                        calculate_summary_cost(&summary.models, pricing, cached_input_cost_mode);
                     push_totals(&mut totals, &summary.totals, cost);
                     let (directory, session_file) = split_session_id(&summary.display_session_id);
                     rows.push(SessionRow {
@@ -2156,7 +2215,7 @@ impl ReportBuilder {
                         reasoning_output_tokens: summary.totals.reasoning_output,
                         total_tokens: summary.totals.total,
                         cost_usd: cost,
-                        models: to_sorted_models(&summary.models, pricing),
+                        models: to_sorted_models(&summary.models, pricing, cached_input_cost_mode),
                     });
                 }
                 Ok(ReportOutput::Session {
@@ -2228,11 +2287,14 @@ impl WatchSnapshotContext {
         current_day_summary: &GroupSummary,
         burn_window_summary: &GroupSummary,
         pricing: &PricingCatalog,
+        cached_input_cost_mode: CachedInputCostMode,
         missing_directories: Vec<String>,
         include_per_model: bool,
     ) -> WatchSnapshot {
-        let current_day_cost = calculate_summary_cost(&current_day_summary.models, pricing);
-        let burn_cost = calculate_summary_cost(&burn_window_summary.models, pricing);
+        let current_day_cost =
+            calculate_summary_cost(&current_day_summary.models, pricing, cached_input_cost_mode);
+        let burn_cost =
+            calculate_summary_cost(&burn_window_summary.models, pricing, cached_input_cost_mode);
         let totals = Totals {
             input_tokens: current_day_summary.totals.input,
             cached_input_tokens: current_day_summary.totals.cached_input,
@@ -2242,7 +2304,7 @@ impl WatchSnapshotContext {
             cost_usd: current_day_cost,
         };
         let per_model = if include_per_model {
-            to_sorted_models(&burn_window_summary.models, pricing)
+            to_sorted_models(&burn_window_summary.models, pricing, cached_input_cost_mode)
         } else {
             BTreeMap::new()
         };
@@ -2357,6 +2419,7 @@ impl WatchBuilder {
     fn finish(
         self,
         pricing: &PricingCatalog,
+        cached_input_cost_mode: CachedInputCostMode,
         missing_directories: Vec<String>,
         include_per_model: bool,
     ) -> WatchSnapshot {
@@ -2364,6 +2427,7 @@ impl WatchBuilder {
             &self.current_day_summary,
             &self.burn_window_summary,
             pricing,
+            cached_input_cost_mode,
             missing_directories,
             include_per_model,
         )
@@ -2790,6 +2854,7 @@ impl WatchRuntimeState {
     fn snapshot(
         &self,
         pricing: &PricingCatalog,
+        cached_input_cost_mode: CachedInputCostMode,
         now_utc: DateTime<Utc>,
         include_per_model: bool,
     ) -> Result<WatchSnapshot> {
@@ -2798,6 +2863,7 @@ impl WatchRuntimeState {
             &self.current_day_summary,
             &self.burn_window_summary,
             pricing,
+            cached_input_cost_mode,
             self.missing_directories.clone(),
             include_per_model,
         ))
@@ -3251,16 +3317,23 @@ fn remove_usage_from_breakdown(
 fn to_sorted_models(
     models: &HashMap<String, ModelBreakdown>,
     pricing: &PricingCatalog,
+    cached_input_cost_mode: CachedInputCostMode,
 ) -> BTreeMap<String, ModelBreakdown> {
     models
         .iter()
         .map(|(model, usage)| {
             let mut breakdown = usage.clone();
             let resolved_pricing = pricing.resolve(model);
-            breakdown.cost_usd =
-                calculate_cost_from_usage(&explicit_usage(&breakdown), &resolved_pricing);
-            breakdown.fallback_cost_usd =
-                calculate_cost_from_usage(&breakdown.fallback_usage, &resolved_pricing);
+            breakdown.cost_usd = calculate_cost_from_usage(
+                &explicit_usage(&breakdown),
+                &resolved_pricing,
+                cached_input_cost_mode,
+            );
+            breakdown.fallback_cost_usd = calculate_cost_from_usage(
+                &breakdown.fallback_usage,
+                &resolved_pricing,
+                cached_input_cost_mode,
+            );
             (model.clone(), breakdown)
         })
         .collect()
@@ -3280,10 +3353,13 @@ fn push_totals(totals: &mut Totals, usage: &UsageTotals, cost: f64) {
 fn calculate_summary_cost(
     models: &HashMap<String, ModelBreakdown>,
     pricing: &PricingCatalog,
+    cached_input_cost_mode: CachedInputCostMode,
 ) -> f64 {
     models
         .iter()
-        .map(|(model, usage)| calculate_cost(usage, &pricing.resolve(model)))
+        .map(|(model, usage)| {
+            calculate_cost(usage, &pricing.resolve(model), cached_input_cost_mode)
+        })
         .sum()
 }
 
@@ -4028,7 +4104,11 @@ fn subtract_usage(current: RawUsage, previous: Option<RawUsage>) -> RawUsage {
     clippy::cast_precision_loss,
     reason = "Codex token counters are orders of magnitude below f64 precision limits"
 )]
-fn calculate_cost(usage: &ModelBreakdown, pricing: &Pricing) -> f64 {
+fn calculate_cost(
+    usage: &ModelBreakdown,
+    pricing: &Pricing,
+    cached_input_cost_mode: CachedInputCostMode,
+) -> f64 {
     calculate_cost_from_usage(
         &UsageTotals {
             input: usage.input_tokens,
@@ -4038,6 +4118,7 @@ fn calculate_cost(usage: &ModelBreakdown, pricing: &Pricing) -> f64 {
             total: usage.total_tokens,
         },
         pricing,
+        cached_input_cost_mode,
     )
 }
 
@@ -4046,11 +4127,20 @@ fn calculate_cost(usage: &ModelBreakdown, pricing: &Pricing) -> f64 {
     clippy::cast_precision_loss,
     reason = "Codex token counters are orders of magnitude below f64 precision limits"
 )]
-fn calculate_cost_from_usage(usage: &UsageTotals, pricing: &Pricing) -> f64 {
+fn calculate_cost_from_usage(
+    usage: &UsageTotals,
+    pricing: &Pricing,
+    cached_input_cost_mode: CachedInputCostMode,
+) -> f64 {
     let cached_input = usage.cached_input.min(usage.input);
     let non_cached_input = usage.input.saturating_sub(cached_input);
     let input_cost = (non_cached_input as f64 / MILLION) * pricing.input_cost_per_mtoken;
-    let cached_cost = (cached_input as f64 / MILLION) * pricing.cached_input_cost_per_mtoken;
+    let cached_cost = match cached_input_cost_mode {
+        CachedInputCostMode::Priced => {
+            (cached_input as f64 / MILLION) * pricing.cached_input_cost_per_mtoken
+        }
+        CachedInputCostMode::Free => 0.0,
+    };
     let output_cost = (usage.output as f64 / MILLION) * pricing.output_cost_per_mtoken;
     input_cost + cached_cost + output_cost
 }
@@ -4545,10 +4635,50 @@ mod tests {
             cached_input_cost_per_mtoken: 0.125,
             output_cost_per_mtoken: 10.0,
         };
-        let cost = calculate_cost(&usage, &pricing);
+        let cost = calculate_cost(&usage, &pricing, CachedInputCostMode::Priced);
         let expected = (800.0 / 1_000_000.0) * 1.25
             + (200.0 / 1_000_000.0) * 0.125
             + (500.0 / 1_000_000.0) * 10.0;
+        assert!((cost - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn calculate_cost_can_treat_cached_input_as_free() {
+        let usage = UsageTotals {
+            input: 1_000,
+            cached_input: 200,
+            output: 500,
+            reasoning_output: 0,
+            total: 1_500,
+        };
+        let pricing = Pricing {
+            input_cost_per_mtoken: 1.25,
+            cached_input_cost_per_mtoken: 0.125,
+            output_cost_per_mtoken: 10.0,
+        };
+
+        let cost = calculate_cost_from_usage(&usage, &pricing, CachedInputCostMode::Free);
+        let expected = (800.0 / 1_000_000.0) * 1.25 + (500.0 / 1_000_000.0) * 10.0;
+        assert!((cost - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn calculate_cost_clamps_cached_input_to_avoid_double_accounting() {
+        let usage = UsageTotals {
+            input: 100,
+            cached_input: 150,
+            output: 0,
+            reasoning_output: 0,
+            total: 100,
+        };
+        let pricing = Pricing {
+            input_cost_per_mtoken: 10.0,
+            cached_input_cost_per_mtoken: 1.0,
+            output_cost_per_mtoken: 0.0,
+        };
+
+        let cost = calculate_cost_from_usage(&usage, &pricing, CachedInputCostMode::Priced);
+        let expected = (100.0 / 1_000_000.0) * 1.0;
         assert!((cost - expected).abs() < f64::EPSILON);
     }
 
@@ -5156,7 +5286,11 @@ mod tests {
         scan_session_file(&session_file, "session", &mut builder).expect("scan");
 
         let report = builder
-            .finish(&PricingCatalog::default(), Vec::new())
+            .finish(
+                &PricingCatalog::default(),
+                CachedInputCostMode::Priced,
+                Vec::new(),
+            )
             .expect("report");
         let ReportOutput::Session { rows, .. } = report else {
             panic!("expected session report");
@@ -5416,6 +5550,7 @@ mod tests {
                 json: true,
                 offline: true,
                 refresh_pricing: false,
+                cached_input_cost_mode: CachedInputCostMode::Priced,
                 session_dirs: vec![first_sessions, second_sessions],
                 parallelism: ScannerParallelism::Auto,
             },
@@ -5455,23 +5590,21 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-01-02T00:30:00Z")
             .expect("timestamp")
             .with_timezone(&Utc);
-        let snapshot = build_watch_snapshot_at(
-            &WatchOptions {
-                timezone: "UTC".to_string(),
-                locale: "en-US".to_string(),
-                number_format: NumberFormat::Short,
-                offline: true,
-                refresh_pricing: false,
-                session_dirs: vec![sessions],
-                parallelism: ScannerParallelism::Auto,
-                interval: Duration::from_secs(5),
-                show_model_burn_rate: true,
-                #[cfg(debug_assertions)]
-                debug: DebugRuntimeOptions::default(),
-            },
-            now,
-        )
-        .expect("watch snapshot");
+        let options = WatchOptions {
+            timezone: "UTC".to_string(),
+            locale: "en-US".to_string(),
+            number_format: NumberFormat::Short,
+            offline: true,
+            refresh_pricing: false,
+            cached_input_cost_mode: CachedInputCostMode::Priced,
+            session_dirs: vec![sessions],
+            parallelism: ScannerParallelism::Auto,
+            interval: Duration::from_secs(5),
+            show_model_burn_rate: true,
+            #[cfg(debug_assertions)]
+            debug: DebugRuntimeOptions::default(),
+        };
+        let snapshot = build_watch_snapshot_at(&options, now).expect("watch snapshot");
 
         assert_eq!(snapshot.date, "2026-01-02");
         assert_eq!(snapshot.totals.input_tokens, 50);
@@ -5490,6 +5623,25 @@ mod tests {
         assert_eq!(gpt5.input_tokens, 50);
         assert_eq!(gpt5.cached_input_tokens, 15);
         assert_eq!(gpt5.total_tokens, 60);
+
+        let mut free_cache_options = options.clone();
+        free_cache_options.cached_input_cost_mode = CachedInputCostMode::Free;
+        let free_cache_snapshot =
+            build_watch_snapshot_at(&free_cache_options, now).expect("watch snapshot");
+        assert_eq!(free_cache_snapshot.totals.input_tokens, 50);
+        assert_eq!(free_cache_snapshot.totals.cached_input_tokens, 15);
+        assert!(
+            (free_cache_snapshot.totals.cost_usd
+                - ((35.0 / 1_000_000.0) * 1.25 + (10.0 / 1_000_000.0) * 10.0))
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (free_cache_snapshot.burn_rate.cost_usd_per_hour
+                - ((70.0 / 1_000_000.0) * 1.25 + (20.0 / 1_000_000.0) * 10.0))
+                .abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]
@@ -5518,7 +5670,12 @@ mod tests {
         )
         .expect("runtime");
         let initial_snapshot = runtime
-            .snapshot(&PricingCatalog::default(), now, false)
+            .snapshot(
+                &PricingCatalog::default(),
+                CachedInputCostMode::Priced,
+                now,
+                false,
+            )
             .expect("initial snapshot");
         assert_eq!(initial_snapshot.totals.total_tokens, 23);
 
@@ -5541,7 +5698,12 @@ mod tests {
             )
             .expect("refresh");
         let refreshed_snapshot = runtime
-            .snapshot(&PricingCatalog::default(), now, false)
+            .snapshot(
+                &PricingCatalog::default(),
+                CachedInputCostMode::Priced,
+                now,
+                false,
+            )
             .expect("refreshed snapshot");
         assert_eq!(refreshed_snapshot.totals.input_tokens, 20);
         assert_eq!(refreshed_snapshot.totals.output_tokens, 3);
@@ -5574,7 +5736,12 @@ mod tests {
         .expect("runtime");
 
         let early_snapshot = runtime
-            .snapshot(&PricingCatalog::default(), loaded_at, false)
+            .snapshot(
+                &PricingCatalog::default(),
+                CachedInputCostMode::Priced,
+                loaded_at,
+                false,
+            )
             .expect("early snapshot");
         assert_eq!(early_snapshot.totals.total_tokens, 23);
         assert_eq!(early_snapshot.burn_rate.total_tokens_per_hour, 46);
@@ -5593,7 +5760,12 @@ mod tests {
             )
             .expect("advance runtime");
         let later_snapshot = runtime
-            .snapshot(&PricingCatalog::default(), later_now, false)
+            .snapshot(
+                &PricingCatalog::default(),
+                CachedInputCostMode::Priced,
+                later_now,
+                false,
+            )
             .expect("later snapshot");
         assert_eq!(later_snapshot.totals.total_tokens, 29);
         assert_eq!(later_snapshot.burn_rate.total_tokens_per_hour, 35);
@@ -5652,7 +5824,12 @@ mod tests {
             )
             .expect("refresh dirty session");
         let snapshot = runtime
-            .snapshot(&PricingCatalog::default(), now, false)
+            .snapshot(
+                &PricingCatalog::default(),
+                CachedInputCostMode::Priced,
+                now,
+                false,
+            )
             .expect("snapshot");
 
         assert_eq!(snapshot.totals.total_tokens, 29);
@@ -5713,7 +5890,12 @@ mod tests {
             )
             .expect("refresh rewritten session");
         let snapshot = runtime
-            .snapshot(&PricingCatalog::default(), now, false)
+            .snapshot(
+                &PricingCatalog::default(),
+                CachedInputCostMode::Priced,
+                now,
+                false,
+            )
             .expect("snapshot");
 
         assert_eq!(snapshot.totals.total_tokens, 62);
@@ -6623,6 +6805,26 @@ mod tests {
         };
         assert_eq!(interval, Duration::from_secs(5));
         assert!(per_model_burn_rate);
+    }
+
+    #[test]
+    fn cli_accepts_no_cache_cost_as_global_flag() {
+        let cli = Cli::try_parse_from(["codexusage", "--no-cache-cost", "daily"]).expect("cli");
+
+        assert_eq!(
+            cli.cache_cost.cached_input_cost_mode(),
+            CachedInputCostMode::Free
+        );
+        assert_eq!(cli.command, Some(Command::Daily));
+
+        let watch_cli =
+            Cli::try_parse_from(["codexusage", "watch", "--no-cache-cost"]).expect("cli");
+
+        assert_eq!(
+            watch_cli.cache_cost.cached_input_cost_mode(),
+            CachedInputCostMode::Free
+        );
+        assert!(matches!(watch_cli.command, Some(Command::Watch { .. })));
     }
 
     #[test]

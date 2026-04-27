@@ -1,5 +1,6 @@
 use codexusage::app::{
-    NumberFormat, ReportKind, ReportOptions, ReportOutput, ScannerParallelism, build_report,
+    CachedInputCostMode, NumberFormat, ReportKind, ReportOptions, ReportOutput, ScannerParallelism,
+    build_report,
 };
 use std::fs;
 use std::num::NonZeroUsize;
@@ -24,6 +25,7 @@ fn options(session_dir: &std::path::Path) -> ReportOptions {
         json: true,
         offline: true,
         refresh_pricing: false,
+        cached_input_cost_mode: CachedInputCostMode::Priced,
         session_dirs: vec![session_dir.to_path_buf()],
         parallelism: ScannerParallelism::Auto,
     }
@@ -55,6 +57,36 @@ fn monthly_report_groups_rows_by_month() {
                 "embedded pricing should price gpt-5-codex"
             );
             assert_eq!(totals.total_tokens, 2_550);
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+#[test]
+fn no_cache_cost_leaves_tokens_unchanged_and_omits_cached_input_cost() {
+    let temp = TempDir::new().expect("tempdir");
+    write_session(
+        &temp,
+        "sessions/project/session.jsonl",
+        concat!(
+            "{\"timestamp\":\"2025-09-11T18:00:00.000Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2025-09-11T18:01:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1000000,\"cached_input_tokens\":250000,\"output_tokens\":100000,\"reasoning_output_tokens\":0,\"total_tokens\":1100000}}}}\n"
+        ),
+    );
+    let mut report_options = options(&temp.path().join("sessions"));
+    report_options.cached_input_cost_mode = CachedInputCostMode::Free;
+
+    let report = build_report(ReportKind::Daily, &report_options).expect("build report");
+
+    match report {
+        ReportOutput::Daily { rows, totals, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].input_tokens, 1_000_000);
+            assert_eq!(rows[0].cached_input_tokens, 250_000);
+            assert_eq!(totals.input_tokens, 1_000_000);
+            assert_eq!(totals.cached_input_tokens, 250_000);
+            assert!((rows[0].cost_usd - 1.9375).abs() < f64::EPSILON);
+            assert!((totals.cost_usd - 1.9375).abs() < f64::EPSILON);
         }
         other => panic!("unexpected report: {other:?}"),
     }
