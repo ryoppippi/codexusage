@@ -4368,6 +4368,13 @@ mod tests {
         output
     }
 
+    fn normalized_table_lines(rendered: &str) -> Vec<String> {
+        rendered
+            .lines()
+            .map(|line| strip_ansi_sequences(line).replace('│', "|"))
+            .collect()
+    }
+
     fn watch_snapshot_with_models(models: BTreeMap<String, ModelBreakdown>) -> WatchSnapshot {
         WatchSnapshot {
             date: "2026-01-02".to_string(),
@@ -6722,8 +6729,9 @@ mod tests {
             CacheReadMode::Include,
         );
 
-        let header = rendered
-            .lines()
+        let lines = normalized_table_lines(&rendered);
+        let header = lines
+            .iter()
             .find(|line| line.contains("Metric") && line.contains("Burn Rate (/h)"))
             .expect("header");
         assert!(header.contains("Metric"));
@@ -6794,8 +6802,9 @@ mod tests {
             CacheReadMode::Include,
         );
 
-        let input_row = rendered
-            .lines()
+        let lines = normalized_table_lines(&rendered);
+        let input_row = lines
+            .iter()
             .find(|line| line.contains("| Input "))
             .expect("input row");
         let cells = input_row
@@ -6858,15 +6867,16 @@ mod tests {
             CacheReadMode::Include,
         );
 
-        let header = rendered
-            .lines()
+        let lines = normalized_table_lines(&rendered);
+        let header = lines
+            .iter()
             .find(|line| line.contains("Metric") && line.contains("Burn Rate (/h)"))
             .expect("header");
         assert!(header.contains("gpt-5 /h"));
         assert!(header.contains("gpt-5 (fallback) /h"));
 
-        let input_row = rendered
-            .lines()
+        let input_row = lines
+            .iter()
             .find(|line| line.contains("| Input "))
             .expect("input row");
         let cells = input_row
@@ -6933,8 +6943,9 @@ mod tests {
             Some(40),
         );
 
-        let header_lines = rendered
-            .lines()
+        let lines = normalized_table_lines(&rendered);
+        let header_lines = lines
+            .iter()
             .filter(|line| line.contains("Metric"))
             .collect::<Vec<_>>();
         assert_eq!(header_lines.len(), 3);
@@ -6953,8 +6964,8 @@ mod tests {
             1
         );
         assert_eq!(
-            rendered
-                .lines()
+            lines
+                .iter()
                 .filter(|line| line.contains("| Input "))
                 .count(),
             3
@@ -7006,8 +7017,9 @@ mod tests {
             Some(200),
         );
 
-        let header_lines = rendered
-            .lines()
+        let lines = normalized_table_lines(&rendered);
+        let header_lines = lines
+            .iter()
             .filter(|line| line.contains("Metric"))
             .collect::<Vec<_>>();
         assert_eq!(header_lines.len(), 1);
@@ -7016,8 +7028,8 @@ mod tests {
         assert!(header_lines[0].contains("gpt-5-codex /h"));
         assert!(header_lines[0].contains("Burn Rate (/h)"));
         assert_eq!(
-            rendered
-                .lines()
+            lines
+                .iter()
                 .filter(|line| line.contains("| Input "))
                 .count(),
             1

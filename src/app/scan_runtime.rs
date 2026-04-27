@@ -394,13 +394,14 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchScanContext, PROGRESS_RENDER_DELAY, ScanBehavior, clear_progress_line,
-        format_progress_line, progress_frame,
+        BatchScanContext, CliScanBatchRunner, PROGRESS_RENDER_DELAY, ScanBatchRunner, ScanBehavior,
+        ScanObserver, clear_progress_line, format_progress_line, progress_frame,
     };
     #[cfg(debug_assertions)]
     use super::{DEBUG_SLOW_DISK_MAX_DELAY, DEBUG_SLOW_DISK_MIN_DELAY, sample_slow_disk_delay};
     #[cfg(debug_assertions)]
     use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     #[test]
@@ -411,6 +412,14 @@ mod tests {
     #[test]
     fn progress_frame_stays_hidden_before_threshold() {
         assert!(progress_frame(Duration::from_secs(4), 0, 12).is_none());
+    }
+
+    #[test]
+    fn progress_frame_renders_at_threshold() {
+        assert_eq!(
+            progress_frame(PROGRESS_RENDER_DELAY, 3, 12).as_deref(),
+            Some("\rparsing 3/12...")
+        );
     }
 
     #[test]
@@ -435,6 +444,41 @@ mod tests {
 
         let context = BatchScanContext::new_with_terminal(5, behavior, false);
         assert!(context.observer.progress.is_none());
+    }
+
+    #[test]
+    fn batch_scan_context_tracks_completed_files_when_progress_is_enabled() {
+        #[cfg(debug_assertions)]
+        let behavior = ScanBehavior::cli(true, false);
+        #[cfg(not(debug_assertions))]
+        let behavior = ScanBehavior::cli(true);
+
+        let context = BatchScanContext::new_with_terminal(2, behavior, true);
+        let observer = context.observer();
+        let progress = observer.progress.as_ref().expect("progress state");
+
+        observer.on_file_complete();
+
+        assert_eq!(progress.total_files, 2);
+        assert_eq!(progress.completed_files.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cli_scan_batch_runner_passes_observer_to_scan() {
+        #[cfg(debug_assertions)]
+        let behavior = ScanBehavior::cli(false, false);
+        #[cfg(not(debug_assertions))]
+        let behavior = ScanBehavior::cli(false);
+
+        let runner = CliScanBatchRunner::new(behavior);
+        let result = runner
+            .run_batch(1, |observer| {
+                observer.on_file_complete();
+                Ok(observer.progress.is_none())
+            })
+            .expect("scan batch");
+
+        assert!(result);
     }
 
     #[cfg(debug_assertions)]
