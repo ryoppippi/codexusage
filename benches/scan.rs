@@ -22,6 +22,7 @@ fn base_options(session_dirs: Vec<std::path::PathBuf>) -> ReportOptions {
         cached_input_cost_mode: CachedInputCostMode::Priced,
         cache_read_mode: CacheReadMode::Include,
         session_dirs,
+        project_dir: None,
         parallelism: ScannerParallelism::Auto,
     }
 }
@@ -30,6 +31,15 @@ fn write_session_file(root: &std::path::Path, relative_path: &str, contents: &st
     let path = root.join(relative_path);
     fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
     fs::write(path, contents).expect("write fixture");
+}
+
+fn session_meta_line(cwd: &std::path::Path) -> String {
+    json!({
+        "timestamp": "2025-09-11T18:00:00.000Z",
+        "type": "session_meta",
+        "payload": {"cwd": cwd.to_string_lossy()},
+    })
+    .to_string()
 }
 
 fn event_timestamp(index: usize) -> String {
@@ -151,6 +161,39 @@ fn duplicate_root_selection_benchmark(criterion: &mut Criterion) {
     );
 }
 
+fn project_filter_discovery_benchmark(criterion: &mut Criterion) {
+    let fixture = TempDir::new().expect("tempdir");
+    let sessions_dir = fixture.path().join("sessions");
+    let project_dir = fixture.path().join("project");
+    let other_dir = fixture.path().join("project-sibling");
+    let usage_payload = concat!(
+        "{\"timestamp\":\"2025-09-11T18:00:00.000Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+        "{\"timestamp\":\"2025-09-11T18:01:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":110}}}}\n"
+    );
+    for index in 0..300 {
+        let cwd = if index % 2 == 0 {
+            project_dir.join(format!("crate-{index}"))
+        } else {
+            other_dir.join(format!("crate-{index}"))
+        };
+        let relative_path = format!("project-filter/session-{index}.jsonl");
+        write_session_file(
+            &sessions_dir,
+            &relative_path,
+            &format!("{}\n{usage_payload}", session_meta_line(&cwd)),
+        );
+    }
+
+    let mut options = base_options(vec![sessions_dir]);
+    options.project_dir = Some(project_dir);
+    criterion.bench_function("daily_report_project_filter_300_sessions", |bench| {
+        bench.iter(|| {
+            let report = build_report(ReportKind::Daily, &options).expect("build report");
+            std::hint::black_box(report);
+        });
+    });
+}
+
 fn mixed_workload_benchmark(criterion: &mut Criterion) {
     let fixture = TempDir::new().expect("tempdir");
     let sessions_dir = fixture.path().join("sessions");
@@ -231,6 +274,7 @@ criterion_group! {
         parser_benchmark,
         cumulative_usage_benchmark,
         duplicate_root_selection_benchmark,
+        project_filter_discovery_benchmark,
         mixed_workload_benchmark
 }
 criterion_main!(benches);

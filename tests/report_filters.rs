@@ -2,8 +2,10 @@ use codexusage::app::{
     CacheReadMode, CachedInputCostMode, NumberFormat, ReportKind, ReportOptions, ReportOutput,
     ScannerParallelism, build_report,
 };
+use serde_json::json;
 use std::fs;
 use std::num::NonZeroUsize;
+use std::path::Path;
 use tempfile::TempDir;
 
 fn write_session(temp: &TempDir, relative_path: &str, contents: &str) {
@@ -12,6 +14,41 @@ fn write_session(temp: &TempDir, relative_path: &str, contents: &str) {
         fs::create_dir_all(parent).expect("create parent");
     }
     fs::write(path, contents).expect("write session");
+}
+
+fn session_with_cwd(cwd: &Path, input_tokens: u64) -> String {
+    [
+        json!({
+            "timestamp": "2025-09-11T18:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"cwd": cwd.to_string_lossy()},
+        })
+        .to_string(),
+        json!({
+            "timestamp": "2025-09-11T18:00:01.000Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5"},
+        })
+        .to_string(),
+        json!({
+            "timestamp": "2025-09-11T18:01:00.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": input_tokens + 10,
+                    }
+                }
+            },
+        })
+        .to_string(),
+    ]
+    .join("\n")
 }
 
 fn options(session_dir: &std::path::Path) -> ReportOptions {
@@ -28,6 +65,7 @@ fn options(session_dir: &std::path::Path) -> ReportOptions {
         cached_input_cost_mode: CachedInputCostMode::Priced,
         cache_read_mode: CacheReadMode::Include,
         session_dirs: vec![session_dir.to_path_buf()],
+        project_dir: None,
         parallelism: ScannerParallelism::Auto,
     }
 }
@@ -58,6 +96,94 @@ fn monthly_report_groups_rows_by_month() {
                 "embedded pricing should price gpt-5-codex"
             );
             assert_eq!(totals.total_tokens, 2_550);
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+#[test]
+fn project_dir_filter_includes_exact_and_descendant_cwd_only() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let project = temp.path().join("project");
+    let sibling = temp.path().join("project-sibling");
+    write_session(
+        &temp,
+        "sessions/exact/session.jsonl",
+        &session_with_cwd(&project, 100),
+    );
+    write_session(
+        &temp,
+        "sessions/deep/session.jsonl",
+        &session_with_cwd(&project.join("crate"), 200),
+    );
+    write_session(
+        &temp,
+        "sessions/sibling/session.jsonl",
+        &session_with_cwd(&sibling, 400),
+    );
+    write_session(
+        &temp,
+        "sessions/parent/session.jsonl",
+        &session_with_cwd(temp.path(), 800),
+    );
+    write_session(
+        &temp,
+        "sessions/missing/session.jsonl",
+        concat!(
+            "{\"timestamp\":\"2025-09-11T18:00:00.000Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2025-09-11T18:01:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1600,\"cached_input_tokens\":0,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":1610}}}}\n"
+        ),
+    );
+
+    let mut report_options = options(&sessions);
+    report_options.project_dir = Some(project);
+    let report = build_report(ReportKind::Daily, &report_options).expect("build report");
+
+    match report {
+        ReportOutput::Daily { rows, totals, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].input_tokens, 300);
+            assert_eq!(rows[0].total_tokens, 320);
+            assert_eq!(totals.input_tokens, 300);
+            assert_eq!(totals.total_tokens, 320);
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+#[test]
+fn project_dir_filter_runs_before_duplicate_session_selection() {
+    let first = TempDir::new().expect("first");
+    let second = TempDir::new().expect("second");
+    let project = first.path().join("project");
+    let first_sessions = first.path().join("sessions");
+    let second_sessions = second.path().join("sessions");
+    write_session(
+        &first,
+        "sessions/project/session.jsonl",
+        &session_with_cwd(&project, 100),
+    );
+    let mut nonmatching_duplicate = session_with_cwd(&second.path().join("other-project"), 900);
+    nonmatching_duplicate
+        .push_str("\n{\"type\":\"response_item\",\"payload\":{\"text\":\"padding\"}}\n");
+    write_session(
+        &second,
+        "sessions/project/session.jsonl",
+        &nonmatching_duplicate,
+    );
+
+    let mut report_options = options(&first_sessions);
+    report_options.session_dirs = vec![first_sessions, second_sessions];
+    report_options.project_dir = Some(project);
+    let report = build_report(ReportKind::Session, &report_options).expect("build report");
+
+    match report {
+        ReportOutput::Session { rows, totals, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].session_id, "project/session");
+            assert_eq!(rows[0].input_tokens, 100);
+            assert_eq!(totals.input_tokens, 100);
         }
         other => panic!("unexpected report: {other:?}"),
     }

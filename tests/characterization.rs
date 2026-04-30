@@ -31,6 +31,7 @@ fn base_options(session_dir: &std::path::Path) -> ReportOptions {
         cached_input_cost_mode: CachedInputCostMode::Priced,
         cache_read_mode: CacheReadMode::Include,
         session_dirs: vec![session_dir.to_path_buf()],
+        project_dir: None,
         parallelism: ScannerParallelism::Auto,
     }
 }
@@ -138,6 +139,7 @@ fn duplicate_session_ids_across_roots_prefer_the_longer_file() {
                 first.path().join("sessions"),
                 second.path().join("sessions"),
             ],
+            project_dir: None,
             parallelism: ScannerParallelism::Auto,
         },
     )
@@ -182,6 +184,7 @@ fn session_last_activity_uses_selected_timezone() {
             cached_input_cost_mode: CachedInputCostMode::Priced,
             cache_read_mode: CacheReadMode::Include,
             session_dirs: vec![temp.path().join("sessions")],
+            project_dir: None,
             parallelism: ScannerParallelism::Auto,
         },
     )
@@ -328,6 +331,7 @@ fn invalid_timezone_is_rejected() {
             cached_input_cost_mode: CachedInputCostMode::Priced,
             cache_read_mode: CacheReadMode::Include,
             session_dirs: vec![temp.path().join("sessions")],
+            project_dir: None,
             parallelism: ScannerParallelism::Auto,
         },
     )

@@ -22,6 +22,9 @@ codexusage monthly --json
 # Last 7 days only
 codexusage daily --last-days 7
 
+# Current project only
+codexusage daily --current-dir
+
 # Custom session directory
 codexusage session --session-dir /path/to/sessions
 ```
@@ -44,6 +47,13 @@ JSON output for scripts and dashboards:
 
 ```bash
 codexusage daily --json
+```
+
+Limit usage to one project directory and its descendants:
+
+```bash
+codexusage daily --project-dir /path/to/project
+codexusage session --current-dir
 ```
 
 ## Watch mode
@@ -111,6 +121,8 @@ Flags:
 - `--no-cache-cost` - treat cache-read input tokens as free in cost calculations
 - `--exclude-cache-read` - subtract cache-read input tokens from reported input/total usage and hide cache-read columns
 - `--session-dir` - override session directory (repeatable)
+- `--project-dir PATH` - only include sessions whose logged working directory is under this project path
+- `--current-dir` - shortcut for `--project-dir` with the current directory
 - `--threads N` - scanner worker count
 - `--number-format full` - show full token counts instead of K/M/B/T
 - `watch --per-model-burn-rate` - show per-model burn-rate columns in the live watch table

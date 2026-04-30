@@ -130,6 +130,8 @@ pub struct ReportOptions {
     pub cache_read_mode: CacheReadMode,
     /// Session directories to scan.
     pub session_dirs: Vec<PathBuf>,
+    /// Project directory used to filter sessions by logged working directory.
+    pub project_dir: Option<PathBuf>,
     /// Scanner worker configuration.
     pub parallelism: ScannerParallelism,
 }
@@ -266,6 +268,8 @@ struct WatchOptions {
     cache_read_mode: CacheReadMode,
     /// Session directories to scan.
     session_dirs: Vec<PathBuf>,
+    /// Project directory used to filter sessions by logged working directory.
+    project_dir: Option<PathBuf>,
     /// Scanner worker configuration.
     parallelism: ScannerParallelism,
     /// Refresh interval for the live screen.
@@ -305,6 +309,35 @@ impl CacheCostCliOptions {
         } else {
             CacheReadMode::Include
         }
+    }
+}
+
+/// CLI-only project-filter flag group.
+#[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
+struct ProjectCliOptions {
+    /// Only include sessions whose logged working directory is under this project path.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        conflicts_with = "current_dir"
+    )]
+    project_dir: Option<PathBuf>,
+    /// Only include sessions whose logged working directory is under the current directory.
+    #[arg(long, global = true, conflicts_with = "project_dir")]
+    current_dir: bool,
+}
+
+impl ProjectCliOptions {
+    /// Resolve project-filter flags into one optional project path.
+    fn resolve_project_dir(self) -> Result<Option<PathBuf>> {
+        if self.current_dir {
+            return std::env::current_dir()
+                .map(Some)
+                .wrap_err("failed to resolve current directory for --current-dir");
+        }
+
+        Ok(self.project_dir)
     }
 }
 
@@ -403,6 +436,8 @@ struct PreparedReport {
     until: Option<NaiveDate>,
     /// Session roots selected for this run.
     session_dirs: Vec<PathBuf>,
+    /// Optional project working-directory filter.
+    project_filter: Option<ProjectFilter>,
     /// Pricing catalog loaded for the final render.
     pricing: PricingCatalog,
     /// Usage and cost presentation behavior.
@@ -431,6 +466,32 @@ impl UsagePresentation {
     }
 }
 
+/// Component-aware filter for sessions recorded under one project directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectFilter {
+    /// Normalized absolute project root.
+    root: PathBuf,
+}
+
+impl ProjectFilter {
+    /// Build an optional filter from an optional CLI or API path.
+    fn from_path_option(path: Option<&Path>) -> Result<Option<Self>> {
+        path.map(Self::from_path).transpose()
+    }
+
+    /// Build a filter from a CLI or API path.
+    fn from_path(path: &Path) -> Result<Self> {
+        Ok(Self {
+            root: normalize_absolute_path(path)?,
+        })
+    }
+
+    /// Return whether a logged working directory belongs to this project tree.
+    fn matches_logged_cwd(&self, cwd: &Path) -> Result<bool> {
+        Ok(normalize_absolute_path(cwd)?.starts_with(&self.root))
+    }
+}
+
 /// Resolve shared report inputs before scanning.
 fn prepare_report(kind: ReportKind, options: &ReportOptions) -> Result<PreparedReport> {
     let timezone = parse_timezone(&options.timezone)?;
@@ -447,6 +508,7 @@ fn prepare_report(kind: ReportKind, options: &ReportOptions) -> Result<PreparedR
         since,
         until,
         session_dirs: resolve_session_dirs(&options.session_dirs),
+        project_filter: ProjectFilter::from_path_option(options.project_dir.as_deref())?,
         pricing: load_pricing_catalog(&PricingLoadOptions {
             offline: options.offline,
             force_refresh: options.refresh_pricing,
@@ -523,7 +585,7 @@ where
 {
     let mut builder = ReportBuilder::new(kind, prepared.timezone, prepared.since, prepared.until);
     let (missing_directories, selected_files) =
-        collect_session_scan_targets(&prepared.session_dirs)?;
+        collect_session_scan_targets(&prepared.session_dirs, prepared.project_filter.as_ref())?;
     let scanned = scan_targets(
         &selected_files,
         parallelism,
@@ -562,7 +624,9 @@ fn build_watch_snapshot_with_pricing_at(
 ) -> Result<WatchSnapshot> {
     let timezone = parse_timezone(&options.timezone)?;
     let session_dirs = resolve_session_dirs(&options.session_dirs);
-    let (missing_directories, selected_files) = collect_session_scan_targets(&session_dirs)?;
+    let project_filter = ProjectFilter::from_path_option(options.project_dir.as_deref())?;
+    let (missing_directories, selected_files) =
+        collect_session_scan_targets(&session_dirs, project_filter.as_ref())?;
     let builder = scan_watch_targets(&selected_files, options.parallelism, timezone, now_utc)?;
     Ok(builder.finish(
         pricing,
@@ -855,6 +919,7 @@ fn run_watch_loop(options: &WatchOptions) -> Result<()> {
     })?;
     let timezone = parse_timezone(&options.timezone)?;
     let session_dirs = resolve_session_dirs(&options.session_dirs);
+    let project_filter = ProjectFilter::from_path_option(options.project_dir.as_deref())?;
     #[cfg(debug_assertions)]
     let startup_scan_behavior = cli_scan_behavior(true, options.debug.simulate_slow_disk);
     #[cfg(not(debug_assertions))]
@@ -868,6 +933,7 @@ fn run_watch_loop(options: &WatchOptions) -> Result<()> {
     let mut watch_events = WatchEventSource::new(&session_dirs)?;
     let mut runtime = WatchRuntimeState::load_with_scan_runner(
         &session_dirs,
+        project_filter.as_ref(),
         options.parallelism,
         timezone,
         Utc::now(),
@@ -902,8 +968,8 @@ fn run_watch_loop(options: &WatchOptions) -> Result<()> {
         changes.discovery_due |= discovered_new_root;
         runtime.refresh_with_scan_runner(
             &session_dirs,
+            project_filter.as_ref(),
             options.parallelism,
-            timezone,
             snapshot_now,
             changes,
             &refresh_scan_runner,
@@ -1052,12 +1118,14 @@ where
         offline,
         refresh_pricing,
         cache_cost,
+        project,
         session_dir,
         threads,
         command,
         ..
     } = cli;
     let timezone = timezone.unwrap_or_else(default_timezone_name);
+    let project_dir = project.resolve_project_dir()?;
     let parallelism = threads.map_or(ScannerParallelism::Auto, ScannerParallelism::Fixed);
     let cached_input_cost_mode = cache_cost.cached_input_cost_mode();
     let cache_read_mode = cache_cost.cache_read_mode();
@@ -1077,6 +1145,7 @@ where
                 cached_input_cost_mode,
                 cache_read_mode,
                 session_dirs: session_dir,
+                project_dir,
                 parallelism,
                 interval,
                 show_model_burn_rate: per_model_burn_rate,
@@ -1101,6 +1170,7 @@ where
                 cached_input_cost_mode,
                 cache_read_mode,
                 session_dirs: session_dir,
+                project_dir,
                 parallelism,
             };
             #[cfg(debug_assertions)]
@@ -1171,6 +1241,9 @@ struct Cli {
     /// Cache-cost pricing options.
     #[command(flatten)]
     cache_cost: CacheCostCliOptions,
+    /// Project directory filtering options.
+    #[command(flatten)]
+    project: ProjectCliOptions,
     /// Override the session directory. May be repeated.
     #[arg(long, global = true)]
     session_dir: Vec<PathBuf>,
@@ -1347,6 +1420,39 @@ fn resolve_session_dirs(session_dirs: &[PathBuf]) -> Vec<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
         .unwrap_or_else(|| PathBuf::from(".codex"));
     vec![codex_home.join("sessions")]
+}
+
+/// Convert a path into an absolute lexical form without touching the filesystem.
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .wrap_err_with(|| {
+                format!("failed to resolve current directory for {}", path.display())
+            })?
+            .join(path)
+    };
+
+    Ok(normalize_path_components(&absolute))
+}
+
+/// Collapse `.` and `..` components from an already absolute path.
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            std::path::Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+
+    normalized
 }
 
 /// Recursively collect JSONL files.
@@ -1537,6 +1643,34 @@ struct SessionLogEntry<'a> {
         deserialize_with = "deserialize_optional_object_lossy"
     )]
     payload: Option<EntryPayload<'a>>,
+}
+
+/// One parsed JSONL entry used for project-filter metadata.
+#[derive(Deserialize)]
+struct SessionMetadataLogEntry<'a> {
+    /// Entry kind.
+    #[serde(
+        rename = "type",
+        borrow,
+        default,
+        deserialize_with = "deserialize_optional_cow_lossy"
+    )]
+    entry_type: Option<Cow<'a, str>>,
+    /// Session metadata payload.
+    #[serde(
+        borrow,
+        default,
+        deserialize_with = "deserialize_optional_object_lossy"
+    )]
+    payload: Option<SessionMetadataPayload<'a>>,
+}
+
+/// Payload fields used by session metadata.
+#[derive(Deserialize)]
+struct SessionMetadataPayload<'a> {
+    /// Working directory recorded when the session started.
+    #[serde(borrow, default, deserialize_with = "deserialize_optional_cow_lossy")]
+    cwd: Option<Cow<'a, str>>,
 }
 
 /// Payload fields used by turn-context and token-count events.
@@ -2691,12 +2825,14 @@ impl WatchRuntimeState {
     #[cfg(test)]
     fn load(
         session_dirs: &[PathBuf],
+        project_filter: Option<&ProjectFilter>,
         parallelism: ScannerParallelism,
         timezone: Tz,
         now_utc: DateTime<Utc>,
     ) -> Result<Self> {
         Self::load_with_scan_runner(
             session_dirs,
+            project_filter,
             parallelism,
             timezone,
             now_utc,
@@ -2707,6 +2843,7 @@ impl WatchRuntimeState {
     /// Load the initial runtime state with the provided batch runner.
     fn load_with_scan_runner<R>(
         session_dirs: &[PathBuf],
+        project_filter: Option<&ProjectFilter>,
         parallelism: ScannerParallelism,
         timezone: Tz,
         now_utc: DateTime<Utc>,
@@ -2728,8 +2865,8 @@ impl WatchRuntimeState {
         };
         state.refresh_with_scan_runner(
             session_dirs,
+            project_filter,
             parallelism,
-            timezone,
             now_utc,
             WatchChangeSet {
                 dirty_sessions: HashMap::new(),
@@ -2745,15 +2882,15 @@ impl WatchRuntimeState {
     fn refresh(
         &mut self,
         session_dirs: &[PathBuf],
+        project_filter: Option<&ProjectFilter>,
         parallelism: ScannerParallelism,
-        timezone: Tz,
         now_utc: DateTime<Utc>,
         changes: WatchChangeSet,
     ) -> Result<()> {
         self.refresh_with_scan_runner(
             session_dirs,
+            project_filter,
             parallelism,
-            timezone,
             now_utc,
             changes,
             &NoopScanBatchRunner,
@@ -2764,8 +2901,8 @@ impl WatchRuntimeState {
     fn refresh_with_scan_runner<R>(
         &mut self,
         session_dirs: &[PathBuf],
+        project_filter: Option<&ProjectFilter>,
         parallelism: ScannerParallelism,
-        timezone: Tz,
         now_utc: DateTime<Utc>,
         mut changes: WatchChangeSet,
         scan_runner: &R,
@@ -2773,7 +2910,7 @@ impl WatchRuntimeState {
     where
         R: ScanBatchRunner,
     {
-        let current_day = now_utc.with_timezone(&timezone).date_naive();
+        let current_day = now_utc.with_timezone(&self.timezone).date_naive();
         if current_day != self.current_day {
             self.current_day = current_day;
             self.selected_targets.clear();
@@ -2793,12 +2930,13 @@ impl WatchRuntimeState {
                 .next_discovery_at
                 .is_none_or(|deadline| refresh_started_at >= deadline);
         if discovery_due {
-            let (missing_directories, selected_files) = collect_session_scan_targets(session_dirs)?;
+            let (missing_directories, selected_files) =
+                collect_session_scan_targets(session_dirs, project_filter)?;
             self.missing_directories = missing_directories;
             self.next_discovery_at = Some(refresh_started_at + WATCH_DISCOVERY_INTERVAL);
             self.refresh_discovered_targets(
                 parallelism,
-                timezone,
+                self.timezone,
                 now_utc,
                 selected_files,
                 &changes.dirty_sessions,
@@ -2807,12 +2945,13 @@ impl WatchRuntimeState {
         } else {
             self.missing_directories = collect_missing_session_dirs(session_dirs)?;
             for (session_id, dirty_kind) in changes.dirty_sessions {
-                let resolved = resolve_session_target_across_roots(session_dirs, &session_id)?;
+                let resolved =
+                    resolve_session_target_across_roots(session_dirs, project_filter, &session_id)?;
                 self.refresh_dirty_session(
                     session_id,
                     resolved,
                     dirty_kind,
-                    timezone,
+                    self.timezone,
                     now_utc,
                     scan_runner,
                 )?;
@@ -3218,6 +3357,7 @@ where
 /// Resolve the preferred file for one stable session identifier across all session roots.
 fn resolve_session_target_across_roots(
     session_dirs: &[PathBuf],
+    project_filter: Option<&ProjectFilter>,
     session_id: &str,
 ) -> Result<Option<SessionScanTarget>> {
     let mut selected = None;
@@ -3225,6 +3365,9 @@ fn resolve_session_target_across_roots(
         let path = session_file_path(directory, session_id);
         match fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => {
+                if !session_matches_project_filter(&path, project_filter)? {
+                    continue;
+                }
                 let candidate = SessionScanTarget {
                     session_id: session_id.to_string(),
                     path,
@@ -3538,16 +3681,60 @@ fn split_session_id(session_id: &str) -> (String, String) {
     }
 }
 
+/// Return whether one session file passes the optional project directory filter.
+fn session_matches_project_filter(
+    file: &Path,
+    project_filter: Option<&ProjectFilter>,
+) -> Result<bool> {
+    let Some(project_filter) = project_filter else {
+        return Ok(true);
+    };
+    let Some(cwd) = read_session_metadata_cwd(file)? else {
+        return Ok(false);
+    };
+
+    project_filter.matches_logged_cwd(&cwd)
+}
+
+/// Read the logged working directory from the first non-empty session metadata line.
+fn read_session_metadata_cwd(file: &Path) -> Result<Option<PathBuf>> {
+    let file_handle = File::open(file)
+        .wrap_err_with(|| format!("failed to open session metadata file {}", file.display()))?;
+    let mut reader = BufReader::new(file_handle);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<SessionMetadataLogEntry<'_>>(trimmed) else {
+            return Ok(None);
+        };
+        if entry.entry_type.as_deref() != Some("session_meta") {
+            return Ok(None);
+        }
+        return Ok(entry
+            .payload
+            .and_then(|payload| payload.cwd.map(|cwd| PathBuf::from(cwd.as_ref()))));
+    }
+}
+
 /// Discover selected session files and collect missing roots.
 fn collect_session_scan_targets(
     session_dirs: &[PathBuf],
+    project_filter: Option<&ProjectFilter>,
 ) -> Result<(Vec<String>, Vec<SessionScanTarget>)> {
     let mut missing_directories = Vec::new();
     let mut selected_files = HashMap::new();
     for directory in session_dirs {
         match fs::metadata(directory) {
             Ok(metadata) if metadata.is_dir() => {
-                scan_session_tree(directory, directory, &mut selected_files)?;
+                scan_session_tree(directory, directory, project_filter, &mut selected_files)?;
             }
             Ok(_) => missing_directories.push(directory.display().to_string()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3787,6 +3974,7 @@ fn resolve_scan_worker_count(parallelism: ScannerParallelism, selected_files: us
 fn scan_session_tree(
     root: &Path,
     directory: &Path,
+    project_filter: Option<&ProjectFilter>,
     selected_files: &mut HashMap<String, SessionScanTarget>,
 ) -> Result<()> {
     let mut entries =
@@ -3797,14 +3985,14 @@ fn scan_session_tree(
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            scan_session_tree(root, &path, selected_files)?;
+            scan_session_tree(root, &path, project_filter, selected_files)?;
         } else if file_type.is_file()
             && path
                 .extension()
                 .and_then(std::ffi::OsStr::to_str)
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
         {
-            register_session_target(root, &entry, selected_files)?;
+            register_session_target(root, &entry, project_filter, selected_files)?;
         }
     }
 
@@ -3815,9 +4003,13 @@ fn scan_session_tree(
 fn register_session_target(
     root: &Path,
     entry: &std::fs::DirEntry,
+    project_filter: Option<&ProjectFilter>,
     selected_files: &mut HashMap<String, SessionScanTarget>,
 ) -> Result<()> {
     let path = entry.path();
+    if !session_matches_project_filter(&path, project_filter)? {
+        return Ok(());
+    }
     let metadata = entry.metadata()?;
     let modified = metadata.modified().ok();
     let session_id = session_file_id(root, &path);
@@ -4375,6 +4567,40 @@ mod tests {
             .collect()
     }
 
+    fn session_payload_with_cwd(cwd: &Path, input_tokens: u64) -> String {
+        [
+            json!({
+                "timestamp": "2026-01-02T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"cwd": cwd.to_string_lossy()},
+            })
+            .to_string(),
+            json!({
+                "type": "turn_context",
+                "payload": {"model": "gpt-5"},
+            })
+            .to_string(),
+            json!({
+                "timestamp": "2026-01-02T00:05:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": input_tokens,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 3,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": input_tokens + 3,
+                        }
+                    }
+                },
+            })
+            .to_string(),
+        ]
+        .join("\n")
+    }
+
     fn watch_snapshot_with_models(models: BTreeMap<String, ModelBreakdown>) -> WatchSnapshot {
         WatchSnapshot {
             date: "2026-01-02".to_string(),
@@ -4455,6 +4681,40 @@ mod tests {
     fn resolve_session_dirs_prefers_explicit_paths() {
         let explicit = vec![PathBuf::from("/tmp/custom-sessions")];
         assert_eq!(resolve_session_dirs(&explicit), explicit);
+    }
+
+    #[test]
+    fn project_filter_normalizes_relative_paths_against_process_cwd() {
+        let filter = ProjectFilter::from_path(Path::new(".")).expect("filter");
+        let current_dir = std::env::current_dir().expect("current dir");
+
+        assert!(
+            filter
+                .matches_logged_cwd(&current_dir.join("nested"))
+                .expect("match cwd")
+        );
+        assert!(
+            !filter
+                .matches_logged_cwd(current_dir.parent().expect("parent"))
+                .expect("parent cwd")
+        );
+    }
+
+    #[test]
+    fn project_filter_matches_path_components_not_string_prefixes() {
+        let temp = TempDir::new().expect("tempdir");
+        let filter = ProjectFilter::from_path(&temp.path().join("app")).expect("filter");
+
+        assert!(
+            filter
+                .matches_logged_cwd(&temp.path().join("app").join("crate"))
+                .expect("nested match")
+        );
+        assert!(
+            !filter
+                .matches_logged_cwd(&temp.path().join("app-sibling"))
+                .expect("sibling match")
+        );
     }
 
     #[test]
@@ -5780,6 +6040,7 @@ mod tests {
                 cached_input_cost_mode: CachedInputCostMode::Priced,
                 cache_read_mode: CacheReadMode::Include,
                 session_dirs: vec![first_sessions, second_sessions],
+                project_dir: None,
                 parallelism: ScannerParallelism::Auto,
             },
         )
@@ -5827,6 +6088,7 @@ mod tests {
             cached_input_cost_mode: CachedInputCostMode::Priced,
             cache_read_mode: CacheReadMode::Include,
             session_dirs: vec![sessions],
+            project_dir: None,
             parallelism: ScannerParallelism::Auto,
             interval: Duration::from_secs(5),
             show_model_burn_rate: true,
@@ -5890,6 +6152,51 @@ mod tests {
     }
 
     #[test]
+    fn build_watch_snapshot_respects_project_dir_filter() {
+        let temp = TempDir::new().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        let project = temp.path().join("project");
+        let matching_file = sessions.join("matching").join("session.jsonl");
+        let sibling_file = sessions.join("sibling").join("session.jsonl");
+        fs::create_dir_all(matching_file.parent().expect("matching parent")).expect("mkdir");
+        fs::create_dir_all(sibling_file.parent().expect("sibling parent")).expect("mkdir");
+        fs::write(
+            &matching_file,
+            session_payload_with_cwd(&project.join("crate"), 20),
+        )
+        .expect("write matching");
+        fs::write(
+            &sibling_file,
+            session_payload_with_cwd(&temp.path().join("project-sibling"), 100),
+        )
+        .expect("write sibling");
+
+        let now = DateTime::parse_from_rfc3339("2026-01-02T00:30:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let options = WatchOptions {
+            timezone: "UTC".to_string(),
+            locale: "en-US".to_string(),
+            number_format: NumberFormat::Short,
+            offline: true,
+            refresh_pricing: false,
+            cached_input_cost_mode: CachedInputCostMode::Priced,
+            cache_read_mode: CacheReadMode::Include,
+            session_dirs: vec![sessions],
+            project_dir: Some(project),
+            parallelism: ScannerParallelism::Auto,
+            interval: Duration::from_secs(5),
+            show_model_burn_rate: false,
+            #[cfg(debug_assertions)]
+            debug: DebugRuntimeOptions::default(),
+        };
+        let snapshot = build_watch_snapshot_at(&options, now).expect("watch snapshot");
+
+        assert_eq!(snapshot.totals.input_tokens, 20);
+        assert_eq!(snapshot.totals.total_tokens, 23);
+    }
+
+    #[test]
     fn watch_runtime_refresh_reuses_unchanged_file_cache() {
         let temp = TempDir::new().expect("tempdir");
         let sessions = temp.path().join("sessions");
@@ -5909,6 +6216,7 @@ mod tests {
         let timezone = chrono_tz::UTC;
         let mut runtime = WatchRuntimeState::load(
             std::slice::from_ref(&sessions),
+            None,
             ScannerParallelism::Auto,
             timezone,
             now,
@@ -5936,8 +6244,8 @@ mod tests {
         runtime
             .refresh(
                 &[sessions],
+                None,
                 ScannerParallelism::Auto,
-                timezone,
                 now,
                 WatchChangeSet::default(),
             )
@@ -5974,6 +6282,7 @@ mod tests {
             .with_timezone(&Utc);
         let runtime = WatchRuntimeState::load(
             std::slice::from_ref(&sessions),
+            None,
             ScannerParallelism::Auto,
             timezone,
             loaded_at,
@@ -5998,8 +6307,8 @@ mod tests {
         runtime
             .refresh(
                 std::slice::from_ref(&sessions),
+                None,
                 ScannerParallelism::Auto,
-                timezone,
                 later_now,
                 WatchChangeSet::default(),
             )
@@ -6037,6 +6346,7 @@ mod tests {
             .with_timezone(&Utc);
         let mut runtime = WatchRuntimeState::load(
             std::slice::from_ref(&sessions),
+            None,
             ScannerParallelism::Auto,
             timezone,
             now,
@@ -6056,8 +6366,8 @@ mod tests {
         runtime
             .refresh(
                 std::slice::from_ref(&sessions),
+                None,
                 ScannerParallelism::Auto,
-                timezone,
                 now,
                 WatchChangeSet {
                     dirty_sessions: HashMap::from([(
@@ -6103,6 +6413,7 @@ mod tests {
             .with_timezone(&Utc);
         let mut runtime = WatchRuntimeState::load(
             std::slice::from_ref(&sessions),
+            None,
             ScannerParallelism::Auto,
             timezone,
             now,
@@ -6122,8 +6433,8 @@ mod tests {
         runtime
             .refresh(
                 std::slice::from_ref(&sessions),
+                None,
                 ScannerParallelism::Auto,
-                timezone,
                 now,
                 WatchChangeSet {
                     dirty_sessions: HashMap::from([(
@@ -6166,7 +6477,7 @@ mod tests {
         fs::write(&removed_file, "gone").expect("write removed");
 
         let session_dirs = vec![first_sessions.clone(), second_sessions.clone()];
-        let original = resolve_session_target_across_roots(&session_dirs, "project/session")
+        let original = resolve_session_target_across_roots(&session_dirs, None, "project/session")
             .expect("resolve selected")
             .expect("selected target");
         assert_eq!(original.path, selected_file);
@@ -6174,14 +6485,14 @@ mod tests {
         fs::remove_file(&selected_file).expect("remove selected");
         fs::remove_file(&removed_file).expect("remove file");
 
-        let refreshed = resolve_session_target_across_roots(&session_dirs, "project/session")
+        let refreshed = resolve_session_target_across_roots(&session_dirs, None, "project/session")
             .expect("refresh")
             .expect("fallback target");
         assert_eq!(refreshed.session_id, "project/session");
         assert_eq!(refreshed.path, duplicate_file);
         assert_eq!(refreshed.bytes, 6);
         assert!(
-            resolve_session_target_across_roots(&session_dirs, "gone/session")
+            resolve_session_target_across_roots(&session_dirs, None, "gone/session")
                 .expect("missing session")
                 .is_none()
         );
@@ -7159,6 +7470,50 @@ mod tests {
             CacheReadMode::Exclude
         );
         assert!(matches!(watch_cli.command, Some(Command::Watch { .. })));
+    }
+
+    #[test]
+    fn cli_accepts_project_dir_as_global_flag() {
+        let cli = Cli::try_parse_from(["codexusage", "--project-dir", "/tmp/project", "daily"])
+            .expect("cli");
+
+        assert_eq!(cli.project.project_dir, Some(PathBuf::from("/tmp/project")));
+        assert!(!cli.project.current_dir);
+        assert_eq!(cli.command, Some(Command::Daily));
+
+        let watch_cli =
+            Cli::try_parse_from(["codexusage", "watch", "--project-dir", "/tmp/project"])
+                .expect("watch cli");
+        assert_eq!(
+            watch_cli.project.project_dir,
+            Some(PathBuf::from("/tmp/project"))
+        );
+        assert!(matches!(watch_cli.command, Some(Command::Watch { .. })));
+    }
+
+    #[test]
+    fn cli_accepts_current_dir_project_shortcut() {
+        let cli = Cli::try_parse_from(["codexusage", "--current-dir", "monthly"]).expect("cli");
+
+        assert!(cli.project.current_dir);
+        assert_eq!(cli.project.project_dir, None);
+        assert_eq!(cli.command, Some(Command::Monthly));
+    }
+
+    #[test]
+    fn cli_rejects_project_dir_with_current_dir() {
+        let error = Cli::try_parse_from([
+            "codexusage",
+            "--project-dir",
+            "/tmp/project",
+            "--current-dir",
+            "daily",
+        ])
+        .expect_err("conflicting project filters should fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("--project-dir"));
+        assert!(rendered.contains("--current-dir"));
     }
 
     #[test]
