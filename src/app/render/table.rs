@@ -424,7 +424,14 @@ fn should_left_align(header: &str, display: &str) -> bool {
     }
     matches!(
         header,
-        "Date" | "Month" | "Metric" | "Directory" | "Session" | "Model" | "Last Activity"
+        "Date"
+            | "Month"
+            | "Metric"
+            | "Directory"
+            | "Session"
+            | "Model"
+            | "Last Activity"
+            | "Burn Rate History"
     )
 }
 

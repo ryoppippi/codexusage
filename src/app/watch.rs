@@ -1,8 +1,8 @@
 //! Watch-mode runtime and incremental refresh helpers.
 
 use super::model::{
-    BurnRateSnapshot, ScannerParallelism, Totals, UsagePresentation, UsageTotals, WatchOptions,
-    WatchSnapshot,
+    BurnRateHistoryPoint, BurnRateSnapshot, ScannerParallelism, Totals, UsagePresentation,
+    UsageTotals, WatchOptions, WatchSnapshot,
 };
 use super::render::render_watch_screen;
 use super::report::{
@@ -45,6 +45,8 @@ use std::time::{Duration, Instant, SystemTime};
 const WATCH_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 /// Polling cadence used when native filesystem notifications are unavailable.
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Sliding window used by the compact cost burn-rate graph.
+const WATCH_GRAPH_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 #[cfg(test)]
 pub(in crate::app) fn build_watch_snapshot_at(
@@ -556,6 +558,20 @@ pub(in crate::app) struct WatchSnapshotContext {
     window_duration: Duration,
 }
 
+/// Aggregated inputs used to finish one watch snapshot.
+struct WatchSnapshotParts<'a> {
+    /// Current-day cumulative usage.
+    current_day_summary: &'a GroupSummary,
+    /// Bounded rolling-window usage.
+    burn_window_summary: &'a GroupSummary,
+    /// Cost burn-rate samples for the compact graph.
+    burn_history: Vec<BurnRateHistoryPoint>,
+    /// Missing directories encountered during scan.
+    missing_directories: Vec<String>,
+    /// Whether to include per-model burn-rate columns.
+    include_per_model: bool,
+}
+
 impl WatchSnapshotContext {
     /// Build the snapshot context for one logical watch timestamp.
     fn new(timezone: Tz, now_utc: DateTime<Utc>) -> Result<Self> {
@@ -576,20 +592,20 @@ impl WatchSnapshotContext {
     /// Build one rendered snapshot from already aggregated summaries.
     fn finish(
         &self,
-        current_day_summary: &GroupSummary,
-        burn_window_summary: &GroupSummary,
+        parts: WatchSnapshotParts<'_>,
         pricing: &PricingCatalog,
         presentation: UsagePresentation,
-        missing_directories: Vec<String>,
-        include_per_model: bool,
     ) -> WatchSnapshot {
         let current_day_cost =
-            calculate_summary_cost(&current_day_summary.models, pricing, presentation);
-        let burn_cost = calculate_summary_cost(&burn_window_summary.models, pricing, presentation);
-        let current_day_totals = current_day_summary
+            calculate_summary_cost(&parts.current_day_summary.models, pricing, presentation);
+        let burn_cost =
+            calculate_summary_cost(&parts.burn_window_summary.models, pricing, presentation);
+        let current_day_totals = parts
+            .current_day_summary
             .totals
             .with_cache_read_mode(presentation.cache_read_mode);
-        let burn_window_totals = burn_window_summary
+        let burn_window_totals = parts
+            .burn_window_summary
             .totals
             .with_cache_read_mode(presentation.cache_read_mode);
         let totals = Totals {
@@ -600,8 +616,8 @@ impl WatchSnapshotContext {
             total_tokens: current_day_totals.total,
             cost_usd: current_day_cost,
         };
-        let per_model = if include_per_model {
-            to_sorted_models(&burn_window_summary.models, pricing, presentation)
+        let per_model = if parts.include_per_model {
+            to_sorted_models(&parts.burn_window_summary.models, pricing, presentation)
         } else {
             BTreeMap::new()
         };
@@ -634,8 +650,9 @@ impl WatchSnapshotContext {
                 ),
                 cost_usd_per_hour: scale_cost_per_hour(burn_cost, self.window_duration),
             },
+            burn_history: parts.burn_history,
             per_model,
-            missing_directories,
+            missing_directories: parts.missing_directories,
             updated_time: self
                 .now_utc
                 .with_timezone(&self.timezone)
@@ -652,10 +669,14 @@ pub(in crate::app) struct WatchBuilder {
     snapshot_context: WatchSnapshotContext,
     /// Inclusive UTC lower bound for the rolling window.
     window_start_utc: DateTime<Utc>,
+    /// Earliest retained event needed for current-day totals and graph history.
+    history_start_utc: DateTime<Utc>,
     /// Current-day cumulative usage.
     current_day_summary: GroupSummary,
     /// Bounded rolling-window usage.
     burn_window_summary: GroupSummary,
+    /// Visible events retained for graph sample aggregation.
+    history_events: Vec<OwnedWatchEvent>,
 }
 
 #[cfg(test)]
@@ -665,8 +686,10 @@ impl WatchBuilder {
         Ok(Self {
             snapshot_context: WatchSnapshotContext::new(timezone, now_utc)?,
             window_start_utc: watch_window_start_utc(timezone, now_utc)?,
+            history_start_utc: watch_history_start_utc(timezone, now_utc)?,
             current_day_summary: GroupSummary::default(),
             burn_window_summary: GroupSummary::default(),
+            history_events: Vec::new(),
         })
     }
 
@@ -675,6 +698,17 @@ impl WatchBuilder {
         if event.timestamp_utc > self.snapshot_context.now_utc {
             return;
         }
+        if event.timestamp_utc < self.history_start_utc {
+            return;
+        }
+
+        let owned_event = OwnedWatchEvent {
+            timestamp_utc: event.timestamp_utc,
+            model: event.model.to_string(),
+            is_fallback_model: event.is_fallback_model,
+            usage: event.usage.clone(),
+        };
+        self.history_events.push(owned_event.clone());
 
         let local = event
             .timestamp_utc
@@ -683,9 +717,9 @@ impl WatchBuilder {
             return;
         }
 
-        super::report::push_event_into_summary(&mut self.current_day_summary, event);
+        push_owned_watch_event_into_summary(&mut self.current_day_summary, &owned_event);
         if event.timestamp_utc >= self.window_start_utc {
-            super::report::push_event_into_summary(&mut self.burn_window_summary, event);
+            push_owned_watch_event_into_summary(&mut self.burn_window_summary, &owned_event);
         }
     }
 
@@ -704,6 +738,10 @@ impl WatchBuilder {
             "parallel scan chunks must preserve watch window start",
         );
         debug_assert_eq!(
+            self.history_start_utc, other.history_start_utc,
+            "parallel scan chunks must preserve watch history start",
+        );
+        debug_assert_eq!(
             self.snapshot_context.now_utc, other.snapshot_context.now_utc,
             "parallel scan chunks must preserve watch now",
         );
@@ -716,6 +754,7 @@ impl WatchBuilder {
             &mut self.burn_window_summary,
             other.burn_window_summary,
         );
+        self.history_events.extend(other.history_events);
     }
 
     /// Finish the snapshot.
@@ -726,13 +765,23 @@ impl WatchBuilder {
         missing_directories: Vec<String>,
         include_per_model: bool,
     ) -> WatchSnapshot {
-        self.snapshot_context.finish(
-            &self.current_day_summary,
-            &self.burn_window_summary,
+        let history_event_refs = self.history_events.iter().collect::<Vec<_>>();
+        let burn_history = build_burn_history(
+            &history_event_refs,
+            &self.snapshot_context,
             pricing,
             presentation,
-            missing_directories,
-            include_per_model,
+        );
+        self.snapshot_context.finish(
+            WatchSnapshotParts {
+                current_day_summary: &self.current_day_summary,
+                burn_window_summary: &self.burn_window_summary,
+                burn_history,
+                missing_directories,
+                include_per_model,
+            },
+            pricing,
+            presentation,
         )
     }
 }
@@ -745,6 +794,58 @@ fn watch_window_start_utc(timezone: Tz, now_utc: DateTime<Utc>) -> Result<DateTi
         .checked_sub_signed(TimeDelta::hours(1))
         .ok_or_else(|| eyre!("watch window underflowed the supported timestamp range"))?;
     Ok(hour_ago.max(day_start_utc))
+}
+
+/// Resolve the earliest event needed for watch-mode current-day totals and graph history.
+fn watch_history_start_utc(timezone: Tz, now_utc: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let current_day = now_utc.with_timezone(&timezone).date_naive();
+    let day_start_utc = resolve_local_midnight_utc(timezone, current_day)?;
+    let graph_history_start = now_utc
+        .checked_sub_signed(TimeDelta::hours(8) + TimeDelta::minutes(30))
+        .ok_or_else(|| eyre!("watch graph history underflowed the supported timestamp range"))?;
+    Ok(day_start_utc.min(graph_history_start))
+}
+
+/// Build fixed 30-minute cost burn-rate samples for the compact watch graph.
+fn build_burn_history(
+    events: &[&OwnedWatchEvent],
+    context: &WatchSnapshotContext,
+    pricing: &PricingCatalog,
+    presentation: UsagePresentation,
+) -> Vec<BurnRateHistoryPoint> {
+    let Some(mut sample_end) = context.now_utc.checked_sub_signed(TimeDelta::hours(8)) else {
+        return Vec::new();
+    };
+    let mut points = Vec::with_capacity(33);
+    while sample_end <= context.now_utc {
+        let Some(window_start) = sample_end.checked_sub_signed(TimeDelta::minutes(30)) else {
+            break;
+        };
+        let mut summary = GroupSummary::default();
+        for event in events {
+            if event.timestamp_utc >= window_start && event.timestamp_utc <= sample_end {
+                push_owned_watch_event_into_summary(&mut summary, event);
+            }
+        }
+        let cost = calculate_summary_cost(&summary.models, pricing, presentation);
+        points.push(BurnRateHistoryPoint {
+            end_time: sample_end
+                .with_timezone(&context.timezone)
+                .format("%H:%M")
+                .to_string(),
+            cost_usd_per_hour: scale_cost_per_hour(cost, WATCH_GRAPH_WINDOW),
+        });
+        let Some(next_sample_end) = sample_end.checked_add_signed(TimeDelta::minutes(15)) else {
+            break;
+        };
+        sample_end = next_sample_end;
+    }
+    points
+}
+
+/// Return whether one cached event contributes to the current local day.
+fn event_is_current_day(event: &OwnedWatchEvent, timezone: Tz, current_day: NaiveDate) -> bool {
+    event.timestamp_utc.with_timezone(&timezone).date_naive() == current_day
 }
 
 /// One owned usage event cached for watch-mode refreshes.
@@ -760,16 +861,16 @@ pub(in crate::app) struct OwnedWatchEvent {
     pub(in crate::app) usage: UsageTotals,
 }
 
-/// Cached current-day contribution for one selected session file.
+/// Cached watch contribution for one selected session file.
 #[derive(Clone, Debug)]
 pub(in crate::app) struct CachedWatchFile {
     /// Metadata used to detect whether the file changed since the previous refresh.
     pub(in crate::app) target: SessionScanTarget,
-    /// Current-day events already parsed from the file.
-    pub(in crate::app) current_day_events: Vec<OwnedWatchEvent>,
+    /// Retained events already parsed from the file.
+    pub(in crate::app) cached_events: Vec<OwnedWatchEvent>,
     /// Incremental parser state at the end of the file.
     pub(in crate::app) parser_checkpoint: SessionParseCheckpoint,
-    /// Number of cached current-day events that are visible at the current watch timestamp.
+    /// Number of cached events that are visible at the current watch timestamp.
     pub(in crate::app) visible_end: usize,
     /// Index of the first event still inside the rolling burn window.
     pub(in crate::app) burn_start: usize,
@@ -780,14 +881,14 @@ impl CachedWatchFile {
     fn from_full_scan(
         target: SessionScanTarget,
         parser_checkpoint: SessionParseCheckpoint,
-        mut current_day_events: Vec<OwnedWatchEvent>,
+        mut cached_events: Vec<OwnedWatchEvent>,
         window_start_utc: DateTime<Utc>,
         now_utc: DateTime<Utc>,
     ) -> Self {
-        current_day_events.sort_unstable_by_key(|event| event.timestamp_utc);
+        cached_events.sort_unstable_by_key(|event| event.timestamp_utc);
         let mut cached = Self {
             target,
-            current_day_events,
+            cached_events,
             parser_checkpoint,
             visible_end: 0,
             burn_start: 0,
@@ -798,12 +899,12 @@ impl CachedWatchFile {
 
     /// Return the current-day events visible at the current watch timestamp.
     pub(in crate::app) fn visible_events(&self) -> &[OwnedWatchEvent] {
-        &self.current_day_events[..self.visible_end]
+        &self.cached_events[..self.visible_end]
     }
 
     /// Return only the visible events that still fall inside the rolling watch window.
     pub(in crate::app) fn burn_events(&self) -> &[OwnedWatchEvent] {
-        &self.current_day_events[self.burn_start..self.visible_end]
+        &self.cached_events[self.burn_start..self.visible_end]
     }
 
     /// Recompute visibility and burn-window bounds for the provided logical timestamp.
@@ -813,9 +914,9 @@ impl CachedWatchFile {
         now_utc: DateTime<Utc>,
     ) {
         self.visible_end = self
-            .current_day_events
+            .cached_events
             .partition_point(|event| event.timestamp_utc <= now_utc);
-        self.burn_start = self.current_day_events[..self.visible_end]
+        self.burn_start = self.cached_events[..self.visible_end]
             .partition_point(|event| event.timestamp_utc < window_start_utc);
     }
 }
@@ -1000,17 +1101,15 @@ impl WatchRuntimeState {
             let previous_burn_start = cached_file.burn_start;
             cached_file.recompute_bounds(window_start_utc, now_utc);
 
-            for event in
-                &cached_file.current_day_events[previous_visible_end..cached_file.visible_end]
-            {
-                push_owned_watch_event_into_summary(&mut self.current_day_summary, event);
+            for event in &cached_file.cached_events[previous_visible_end..cached_file.visible_end] {
+                if event_is_current_day(event, self.timezone, self.current_day) {
+                    push_owned_watch_event_into_summary(&mut self.current_day_summary, event);
+                }
                 if event.timestamp_utc >= window_start_utc {
                     push_owned_watch_event_into_summary(&mut self.burn_window_summary, event);
                 }
             }
-            for event in
-                &cached_file.current_day_events[previous_burn_start..cached_file.burn_start]
-            {
+            for event in &cached_file.cached_events[previous_burn_start..cached_file.burn_start] {
                 remove_owned_watch_event_from_summary(&mut self.burn_window_summary, event);
             }
         }
@@ -1026,7 +1125,9 @@ impl WatchRuntimeState {
         for cached_file in self.cached_files.values_mut() {
             cached_file.recompute_bounds(window_start_utc, now_utc);
             for event in cached_file.visible_events() {
-                push_owned_watch_event_into_summary(&mut self.current_day_summary, event);
+                if event_is_current_day(event, self.timezone, self.current_day) {
+                    push_owned_watch_event_into_summary(&mut self.current_day_summary, event);
+                }
             }
             for event in cached_file.burn_events() {
                 push_owned_watch_event_into_summary(&mut self.burn_window_summary, event);
@@ -1072,7 +1173,6 @@ impl WatchRuntimeState {
                 &full_rebuild_targets,
                 parallelism,
                 timezone,
-                self.current_day,
                 now_utc,
                 observer,
             )
@@ -1115,7 +1215,6 @@ impl WatchRuntimeState {
                         &mut cached,
                         target,
                         timezone,
-                        self.current_day,
                         window_start_utc,
                         now_utc,
                         observer,
@@ -1129,13 +1228,7 @@ impl WatchRuntimeState {
             }
             (_existing, Some(target), _) => {
                 let cached = scan_runner.run_batch(1, |observer| {
-                    build_cached_watch_file_with_observer(
-                        &target,
-                        timezone,
-                        self.current_day,
-                        now_utc,
-                        observer,
-                    )
+                    build_cached_watch_file_with_observer(&target, timezone, now_utc, observer)
                 })?;
                 add_cached_watch_file_to_runtime(self, &cached);
                 self.selected_targets.insert(session_id, target);
@@ -1158,13 +1251,23 @@ impl WatchRuntimeState {
         include_per_model: bool,
     ) -> Result<WatchSnapshot> {
         let snapshot_context = WatchSnapshotContext::new(self.timezone, now_utc)?;
+        let history_events = self
+            .cached_files
+            .values()
+            .flat_map(CachedWatchFile::visible_events)
+            .collect::<Vec<_>>();
+        let burn_history =
+            build_burn_history(&history_events, &snapshot_context, pricing, presentation);
         Ok(snapshot_context.finish(
-            &self.current_day_summary,
-            &self.burn_window_summary,
+            WatchSnapshotParts {
+                current_day_summary: &self.current_day_summary,
+                burn_window_summary: &self.burn_window_summary,
+                burn_history,
+                missing_directories: self.missing_directories.clone(),
+                include_per_model,
+            },
             pricing,
             presentation,
-            self.missing_directories.clone(),
-            include_per_model,
         ))
     }
 }
@@ -1174,12 +1277,11 @@ fn same_watch_target(left: &SessionScanTarget, right: &SessionScanTarget) -> boo
     left.path == right.path && left.bytes == right.bytes && left.modified == right.modified
 }
 
-/// Parse all current-day events from one session file for watch-mode caching.
+/// Parse all retained graph/current-day events from one session file for watch-mode caching.
 fn scan_watch_file_delta_with_observer<O>(
     file: &Path,
     session_id: &str,
-    timezone: Tz,
-    current_day: NaiveDate,
+    history_start_utc: DateTime<Utc>,
     checkpoint: &SessionParseCheckpoint,
     observer: &O,
 ) -> Result<(SessionParseCheckpoint, Vec<OwnedWatchEvent>)>
@@ -1193,7 +1295,7 @@ where
         checkpoint,
         observer,
         |event| {
-            if event.timestamp_utc.with_timezone(&timezone).date_naive() != current_day {
+            if event.timestamp_utc < history_start_utc {
                 return;
             }
             events.push(OwnedWatchEvent {
@@ -1211,18 +1313,16 @@ where
 fn build_cached_watch_file_with_observer<O>(
     target: &SessionScanTarget,
     timezone: Tz,
-    current_day: NaiveDate,
     now_utc: DateTime<Utc>,
     observer: &O,
 ) -> Result<CachedWatchFile>
 where
     O: ScanObserver,
 {
-    let (checkpoint, current_day_events) = scan_watch_file_delta_with_observer(
+    let (checkpoint, cached_events) = scan_watch_file_delta_with_observer(
         &target.path,
         &target.session_id,
-        timezone,
-        current_day,
+        watch_history_start_utc(timezone, now_utc)?,
         &SessionParseCheckpoint::default(),
         observer,
     )?;
@@ -1230,7 +1330,7 @@ where
     Ok(CachedWatchFile::from_full_scan(
         target.clone(),
         checkpoint,
-        current_day_events,
+        cached_events,
         watch_window_start_utc(timezone, now_utc)?,
         now_utc,
     ))
@@ -1241,7 +1341,6 @@ fn append_cached_watch_file_with_observer<O>(
     cached: &mut CachedWatchFile,
     target: SessionScanTarget,
     timezone: Tz,
-    current_day: NaiveDate,
     window_start_utc: DateTime<Utc>,
     now_utc: DateTime<Utc>,
     observer: &O,
@@ -1252,17 +1351,16 @@ where
     let (checkpoint, appended_events) = scan_watch_file_delta_with_observer(
         &target.path,
         &target.session_id,
-        timezone,
-        current_day,
+        watch_history_start_utc(timezone, now_utc)?,
         &cached.parser_checkpoint,
         observer,
     )?;
     observer.on_file_complete();
     cached.target = target;
     cached.parser_checkpoint = checkpoint;
-    cached.current_day_events.extend(appended_events);
+    cached.cached_events.extend(appended_events);
     cached
-        .current_day_events
+        .cached_events
         .sort_unstable_by_key(|event| event.timestamp_utc);
     cached.recompute_bounds(window_start_utc, now_utc);
     Ok(())
@@ -1271,7 +1369,9 @@ where
 /// Add one cached file's visible contributions into the runtime aggregates.
 fn add_cached_watch_file_to_runtime(runtime: &mut WatchRuntimeState, cached: &CachedWatchFile) {
     for event in cached.visible_events() {
-        push_owned_watch_event_into_summary(&mut runtime.current_day_summary, event);
+        if event_is_current_day(event, runtime.timezone, runtime.current_day) {
+            push_owned_watch_event_into_summary(&mut runtime.current_day_summary, event);
+        }
     }
     for event in cached.burn_events() {
         push_owned_watch_event_into_summary(&mut runtime.burn_window_summary, event);
@@ -1284,7 +1384,9 @@ fn remove_cached_watch_file_from_runtime(
     cached: &CachedWatchFile,
 ) {
     for event in cached.visible_events() {
-        remove_owned_watch_event_from_summary(&mut runtime.current_day_summary, event);
+        if event_is_current_day(event, runtime.timezone, runtime.current_day) {
+            remove_owned_watch_event_from_summary(&mut runtime.current_day_summary, event);
+        }
     }
     for event in cached.burn_events() {
         remove_owned_watch_event_from_summary(&mut runtime.burn_window_summary, event);
@@ -1296,7 +1398,6 @@ fn load_cached_watch_files_with_observer<O>(
     selected_files: &[SessionScanTarget],
     parallelism: ScannerParallelism,
     timezone: Tz,
-    current_day: NaiveDate,
     now_utc: DateTime<Utc>,
     observer: &O,
 ) -> Result<Vec<CachedWatchFile>>
@@ -1309,13 +1410,7 @@ where
 
     let worker_count = resolve_scan_worker_count(parallelism, selected_files.len());
     if worker_count == 1 {
-        return scan_watch_file_chunk_with_observer(
-            selected_files,
-            timezone,
-            current_day,
-            now_utc,
-            observer,
-        );
+        return scan_watch_file_chunk_with_observer(selected_files, timezone, now_utc, observer);
     }
 
     let chunk_size = selected_files.len().div_ceil(worker_count);
@@ -1328,24 +1423,13 @@ where
             .map(|chunk| {
                 let observer = observer.clone();
                 scope.spawn(move || {
-                    scan_watch_file_chunk_with_observer(
-                        chunk,
-                        timezone,
-                        current_day,
-                        now_utc,
-                        &observer,
-                    )
+                    scan_watch_file_chunk_with_observer(chunk, timezone, now_utc, &observer)
                 })
             })
             .collect::<Vec<_>>();
 
-        let mut cached_files = scan_watch_file_chunk_with_observer(
-            first_chunk,
-            timezone,
-            current_day,
-            now_utc,
-            observer,
-        )?;
+        let mut cached_files =
+            scan_watch_file_chunk_with_observer(first_chunk, timezone, now_utc, observer)?;
         for handle in handles {
             cached_files.extend(
                 handle
@@ -1361,7 +1445,6 @@ where
 fn scan_watch_file_chunk_with_observer<O>(
     selected_files: &[SessionScanTarget],
     timezone: Tz,
-    current_day: NaiveDate,
     now_utc: DateTime<Utc>,
     observer: &O,
 ) -> Result<Vec<CachedWatchFile>>
@@ -1370,9 +1453,7 @@ where
 {
     selected_files
         .iter()
-        .map(|target| {
-            build_cached_watch_file_with_observer(target, timezone, current_day, now_utc, observer)
-        })
+        .map(|target| build_cached_watch_file_with_observer(target, timezone, now_utc, observer))
         .collect()
 }
 

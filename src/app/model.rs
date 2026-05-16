@@ -271,6 +271,15 @@ pub(in crate::app) struct BurnRateSnapshot {
     pub(in crate::app) cost_usd_per_hour: f64,
 }
 
+/// One cost burn-rate sample rendered by the live watch graph.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::app) struct BurnRateHistoryPoint {
+    /// Local sample end time shown on the graph axis.
+    pub(in crate::app) end_time: String,
+    /// Cost in USD per hour for the sample's trailing window.
+    pub(in crate::app) cost_usd_per_hour: f64,
+}
+
 /// One rendered watch snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::app) struct WatchSnapshot {
@@ -280,6 +289,8 @@ pub(in crate::app) struct WatchSnapshot {
     pub(in crate::app) totals: Totals,
     /// Rolling burn-rate summary.
     pub(in crate::app) burn_rate: BurnRateSnapshot,
+    /// Cost burn-rate samples for the compact watch graph.
+    pub(in crate::app) burn_history: Vec<BurnRateHistoryPoint>,
     /// Per-model rolling burn-window detail.
     pub(in crate::app) per_model: BTreeMap<String, ModelBreakdown>,
     /// Missing directories encountered during scan.

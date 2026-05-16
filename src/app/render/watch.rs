@@ -1,6 +1,6 @@
 //! Live watch screen rendering.
 
-use super::super::model::explicit_usage;
+use super::super::model::{BurnRateHistoryPoint, explicit_usage};
 use super::super::{
     CacheReadMode, NumberFormat, UsageTotals, WatchSnapshot, scale_cost_per_hour,
     scale_usage_per_hour,
@@ -12,7 +12,18 @@ use super::table::{
     table_rule, table_rule_element, write_table_header, write_table_row, write_table_rule,
 };
 use std::fmt::Write as _;
-use terminal_size::{Width, terminal_size};
+use terminal_size::{Height, Width, terminal_size};
+
+/// Number of terminal rows used by the watch cost graph body.
+const WATCH_GRAPH_BODY_HEIGHT: usize = 4;
+/// Number of terminal graph body rows as an exact floating point denominator.
+const WATCH_GRAPH_BODY_HEIGHT_F64: f64 = 4.0;
+/// Number of vertical subunits represented by one graph body row.
+const WATCH_GRAPH_ROW_UNITS: usize = 8;
+/// Total vertical subunits represented by the graph body.
+const WATCH_GRAPH_VERTICAL_UNITS: usize = WATCH_GRAPH_BODY_HEIGHT * WATCH_GRAPH_ROW_UNITS;
+/// Total vertical subunits as an exact floating point denominator.
+const WATCH_GRAPH_VERTICAL_UNITS_F64: f64 = 32.0;
 
 /// Render one live watch snapshot.
 pub(in crate::app) fn render_watch_screen(
@@ -22,24 +33,48 @@ pub(in crate::app) fn render_watch_screen(
     show_model_burn_rate: bool,
     cache_read_mode: CacheReadMode,
 ) -> String {
-    render_watch_screen_with_width(
+    let terminal_size = detect_terminal_size();
+    render_watch_screen_with_size(
         snapshot,
         locale,
         number_format,
         show_model_burn_rate,
         cache_read_mode,
-        detect_terminal_width(),
+        terminal_size.map(|(width, _height)| width),
+        terminal_size.map(|(_width, height)| height),
     )
 }
 
 /// Render one live watch snapshot with an explicit terminal width override.
+#[cfg(test)]
 pub(in crate::app) fn render_watch_screen_with_width(
+    snapshot: &WatchSnapshot,
+    locale: &str,
+    number_format: NumberFormat,
+    show_model_burn_rate: bool,
+    cache_read_mode: CacheReadMode,
+    terminal_width: Option<usize>,
+) -> String {
+    render_watch_screen_with_size(
+        snapshot,
+        locale,
+        number_format,
+        show_model_burn_rate,
+        cache_read_mode,
+        terminal_width,
+        None,
+    )
+}
+
+/// Render one live watch snapshot with explicit terminal dimensions.
+pub(in crate::app) fn render_watch_screen_with_size(
     snapshot: &WatchSnapshot,
     _locale: &str,
     number_format: NumberFormat,
     show_model_burn_rate: bool,
     cache_read_mode: CacheReadMode,
     terminal_width: Option<usize>,
+    terminal_height: Option<usize>,
 ) -> String {
     let render_config = TableRenderConfig {
         style: detect_table_style(),
@@ -72,12 +107,21 @@ pub(in crate::app) fn render_watch_screen_with_width(
         terminal_width,
     );
 
-    if !snapshot.missing_directories.is_empty() {
-        let mut warning = String::from("Warning: missing session directories\n");
-        for directory in &snapshot.missing_directories {
-            let _ = writeln!(&mut warning, "- {directory}");
-        }
-        warning.push('\n');
+    let warning = watch_missing_directory_warning(snapshot);
+    let reserved_lines =
+        rendered_line_count(&output) + warning.as_deref().map_or(0, rendered_line_count);
+    if let Some(graph) = render_watch_graph(
+        snapshot,
+        render_config,
+        terminal_width,
+        terminal_height,
+        reserved_lines,
+    ) {
+        let _ = writeln!(&mut output);
+        output.push_str(&graph);
+    }
+
+    if let Some(mut warning) = warning {
         warning.push_str(&output);
         return warning;
     }
@@ -85,9 +129,311 @@ pub(in crate::app) fn render_watch_screen_with_width(
     output
 }
 
-/// Detect the current terminal width for live watch-mode wrapping.
-fn detect_terminal_width() -> Option<usize> {
-    terminal_size().map(|(Width(width), _height)| usize::from(width))
+/// Build the missing-directory warning prefix for one watch snapshot.
+fn watch_missing_directory_warning(snapshot: &WatchSnapshot) -> Option<String> {
+    if snapshot.missing_directories.is_empty() {
+        return None;
+    }
+
+    let mut warning = String::from("Warning: missing session directories\n");
+    for directory in &snapshot.missing_directories {
+        let _ = writeln!(&mut warning, "- {directory}");
+    }
+    warning.push('\n');
+    Some(warning)
+}
+
+/// Detect the current terminal size for live watch-mode wrapping.
+fn detect_terminal_size() -> Option<(usize, usize)> {
+    terminal_size().map(|(Width(width), Height(height))| (usize::from(width), usize::from(height)))
+}
+
+/// Cost graph horizon selected by available terminal space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchGraphHorizon {
+    /// Render the past eight hours.
+    EightHours,
+    /// Render the past four hours.
+    FourHours,
+}
+
+impl WatchGraphHorizon {
+    /// Return the expected number of 15-minute samples including both endpoints.
+    const fn point_count(self) -> usize {
+        match self {
+            Self::EightHours => 33,
+            Self::FourHours => 17,
+        }
+    }
+}
+
+/// Render the compact cost burn-rate graph when terminal space allows it.
+fn render_watch_graph(
+    snapshot: &WatchSnapshot,
+    render_config: TableRenderConfig,
+    terminal_width: Option<usize>,
+    terminal_height: Option<usize>,
+    reserved_lines: usize,
+) -> Option<String> {
+    for horizon in [WatchGraphHorizon::EightHours, WatchGraphHorizon::FourHours] {
+        let Some(points) = burn_history_for_horizon(&snapshot.burn_history, horizon) else {
+            continue;
+        };
+        let Some(graph) = format_watch_graph(points, render_config) else {
+            continue;
+        };
+        if graph_fits(&graph, terminal_width, terminal_height, reserved_lines) {
+            return Some(graph);
+        }
+    }
+    None
+}
+
+/// Return the suffix of graph history needed for one horizon.
+fn burn_history_for_horizon(
+    history: &[BurnRateHistoryPoint],
+    horizon: WatchGraphHorizon,
+) -> Option<&[BurnRateHistoryPoint]> {
+    let count = horizon.point_count();
+    let start = history.len().checked_sub(count)?;
+    history.get(start..).filter(|points| points.len() == count)
+}
+
+/// Format one graph block.
+fn format_watch_graph(
+    points: &[BurnRateHistoryPoint],
+    render_config: TableRenderConfig,
+) -> Option<String> {
+    let first = points.first()?;
+    let last = points.last()?;
+    let max_cost = max_graph_cost(points);
+    let plot_rows = cost_plot_rows(points, max_cost, render_config.borders);
+    let axis = graph_axis_line(first, last, points.len(), render_config.borders);
+    let headers = ["Burn Rate History"];
+    let cost_labels = cost_legend_labels(max_cost, render_config.borders);
+    let cost_label_width = cost_labels
+        .iter()
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let rows = plot_rows
+        .into_iter()
+        .zip(cost_labels)
+        .map(|(row, label)| DisplayRow {
+            cells: vec![append_cost_legend(&row, &label, cost_label_width)],
+            kind: DisplayRowKind::Subtotal,
+        })
+        .collect::<Vec<_>>();
+    let axis_row = DisplayRow {
+        cells: vec![axis],
+        kind: DisplayRowKind::Subtotal,
+    };
+    let widths = column_widths(&headers, &rows, &axis_row, render_config.number_format);
+    let mut output = String::new();
+
+    write_table_header(&mut output, render_config, &headers, &widths);
+    for row in &rows {
+        write_table_row(
+            &mut output,
+            render_config,
+            &headers,
+            &widths,
+            &row.cells,
+            row_table_element(row.kind),
+        );
+    }
+    write_table_row(
+        &mut output,
+        render_config,
+        &headers,
+        &widths,
+        &axis_row.cells,
+        row_table_element(axis_row.kind),
+    );
+    write_table_rule(
+        &mut output,
+        render_config.style,
+        table_rule_element(TableRuleKind::Bottom),
+        &table_rule(TableRuleKind::Bottom, render_config.borders, &widths),
+    );
+    if output.ends_with('\n') {
+        output.pop();
+    }
+
+    Some(output)
+}
+
+/// Build right-side cost scale labels for the fixed-height graph.
+fn cost_legend_labels(max_cost: f64, borders: super::table::BorderStyle) -> Vec<String> {
+    (1..=WATCH_GRAPH_BODY_HEIGHT)
+        .rev()
+        .map(|level| {
+            let level_f64 = u32::try_from(level).map_or(0.0, f64::from);
+            let cost = max_cost * level_f64 / WATCH_GRAPH_BODY_HEIGHT_F64;
+            cost_legend_label(cost, borders)
+        })
+        .collect()
+}
+
+/// Build one right-side cost scale label.
+fn cost_legend_label(cost: f64, borders: super::table::BorderStyle) -> String {
+    let marker = match borders {
+        super::table::BorderStyle::Unicode => '─',
+        super::table::BorderStyle::Ascii => '-',
+    };
+    format!("{marker} {}/h", format_currency(cost))
+}
+
+/// Append one left-aligned cost label after the graph plot area.
+fn append_cost_legend(line: &str, label: &str, label_width: usize) -> String {
+    format!("{line}  {label:<label_width$}")
+}
+
+/// Return whether the graph block fits the available terminal area.
+fn graph_fits(
+    graph: &str,
+    terminal_width: Option<usize>,
+    terminal_height: Option<usize>,
+    reserved_lines: usize,
+) -> bool {
+    if let Some(width) = terminal_width
+        && graph.lines().any(|line| rendered_width(line) > width)
+    {
+        return false;
+    }
+    if let Some(height) = terminal_height {
+        let needed_lines = reserved_lines
+            .saturating_add(1)
+            .saturating_add(rendered_line_count(graph));
+        if needed_lines > height {
+            return false;
+        }
+    }
+    true
+}
+
+/// Return the largest finite cost in a graph point set.
+fn max_graph_cost(points: &[BurnRateHistoryPoint]) -> f64 {
+    points
+        .iter()
+        .map(|point| point.cost_usd_per_hour)
+        .filter(|value| value.is_finite())
+        .fold(0.0, f64::max)
+}
+
+/// Render graph points as fixed-height high-resolution bar plot rows.
+fn cost_plot_rows(
+    points: &[BurnRateHistoryPoint],
+    max_cost: f64,
+    borders: super::table::BorderStyle,
+) -> Vec<String> {
+    (1..=WATCH_GRAPH_BODY_HEIGHT)
+        .rev()
+        .map(|level| {
+            points
+                .iter()
+                .map(|point| {
+                    graph_column_glyph(
+                        graph_column_height(point.cost_usd_per_hour, max_cost),
+                        level,
+                        borders,
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Return the graph glyph for one high-resolution bar column at one text row.
+fn graph_column_glyph(
+    column_height: usize,
+    row_level: usize,
+    borders: super::table::BorderStyle,
+) -> char {
+    match borders {
+        super::table::BorderStyle::Ascii => {
+            let glyphs = [' ', '.', ':', '-', '=', '+', '*', '#', '%'];
+            let filled_units = graph_row_filled_units(column_height, row_level);
+            glyphs[filled_units]
+        }
+        super::table::BorderStyle::Unicode => {
+            let glyphs = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+            let filled_units = graph_row_filled_units(column_height, row_level);
+            glyphs[filled_units]
+        }
+    }
+}
+
+/// Return how many vertical subunits are filled inside one text row.
+fn graph_row_filled_units(column_height: usize, row_level: usize) -> usize {
+    let row_bottom_units = row_level.saturating_sub(1) * WATCH_GRAPH_ROW_UNITS;
+    column_height
+        .saturating_sub(row_bottom_units)
+        .min(WATCH_GRAPH_ROW_UNITS)
+}
+
+/// Map a cost value onto the fixed graph height.
+fn graph_column_height(value: f64, max_value: f64) -> usize {
+    if !value.is_finite() || !max_value.is_finite() || value <= 0.0 || max_value <= 0.0 {
+        return 0;
+    }
+    for height in 1..=WATCH_GRAPH_VERTICAL_UNITS {
+        let height_f64 = u32::try_from(height).map_or(WATCH_GRAPH_VERTICAL_UNITS_F64, f64::from);
+        let threshold = max_value * height_f64 / WATCH_GRAPH_VERTICAL_UNITS_F64;
+        if value <= threshold {
+            return height;
+        }
+    }
+    WATCH_GRAPH_VERTICAL_UNITS
+}
+
+/// Build the graph axis row with start and end labels aligned on one line.
+fn graph_axis_line(
+    first: &BurnRateHistoryPoint,
+    last: &BurnRateHistoryPoint,
+    point_count: usize,
+    borders: super::table::BorderStyle,
+) -> String {
+    let horizontal = match borders {
+        super::table::BorderStyle::Unicode => '─',
+        super::table::BorderStyle::Ascii => '-',
+    };
+    let first_width = first.end_time.chars().count();
+    let last_width = last.end_time.chars().count();
+    let separator_width = point_count
+        .saturating_sub(first_width)
+        .saturating_sub(last_width)
+        .saturating_sub(2);
+    format!(
+        "{} {} {}",
+        first.end_time,
+        horizontal.to_string().repeat(separator_width),
+        last.end_time
+    )
+}
+
+/// Count rendered lines in one output block.
+fn rendered_line_count(value: &str) -> usize {
+    value.lines().count()
+}
+
+/// Return the terminal-column width of one rendered graph line.
+fn rendered_width(value: &str) -> usize {
+    let mut width = 0;
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for sequence_character in chars.by_ref() {
+                if sequence_character.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += 1;
+    }
+    width
 }
 
 /// Render the watch metrics table.
@@ -522,6 +868,7 @@ mod tests {
                 total_tokens_per_hour: 6,
                 cost_usd_per_hour: 0.06,
             },
+            burn_history: Vec::new(),
             per_model: BTreeMap::new(),
             missing_directories: Vec::new(),
             updated_time: "00:30:00".to_string(),
@@ -535,6 +882,43 @@ mod tests {
             per_model: vec!["1".to_string(), "1".to_string(), "1".to_string()],
             burn_rate: "6".to_string(),
         }]
+    }
+
+    fn graph_points(values: &[f64]) -> Vec<BurnRateHistoryPoint> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| BurnRateHistoryPoint {
+                end_time: format!("{index:02}:00"),
+                cost_usd_per_hour: *value,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cost_plot_rows_use_border_specific_height_palettes() {
+        let points = graph_points(&[0.0, 0.25, 2.0]);
+
+        assert_eq!(
+            cost_plot_rows(&points, 2.0, BorderStyle::Ascii),
+            vec!["  %", "  %", "  %", " =%"]
+        );
+        assert_eq!(
+            cost_plot_rows(&points, 2.0, BorderStyle::Unicode),
+            vec!["  █", "  █", "  █", " ▄█"]
+        );
+    }
+
+    #[test]
+    fn append_cost_legend_left_aligns_varying_label_widths() {
+        assert_eq!(
+            append_cost_legend("plot", "- $9.00/h", 10),
+            "plot  - $9.00/h "
+        );
+        assert_eq!(
+            append_cost_legend("plot", "- $10.00/h", 10),
+            "plot  - $10.00/h"
+        );
     }
 
     #[test]

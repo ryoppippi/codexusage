@@ -112,10 +112,45 @@ fn watch_snapshot_with_models(models: BTreeMap<String, ModelBreakdown>) -> Watch
             total_tokens_per_hour: 144,
             cost_usd_per_hour: 3.60,
         },
+        burn_history: Vec::new(),
         per_model: models,
         missing_directories: Vec::new(),
         updated_time: "00:30:00".to_string(),
     }
+}
+
+fn watch_burn_history(point_count: usize) -> Vec<BurnRateHistoryPoint> {
+    (0..point_count)
+        .map(|index| BurnRateHistoryPoint {
+            end_time: format!("{:02}:00", index % 24),
+            cost_usd_per_hour: f64::from(u32::try_from(index + 1).expect("test index fits u32")),
+        })
+        .collect()
+}
+
+fn assert_latest_burn_history_matches_table(
+    snapshot: &WatchSnapshot,
+    first_end_time: &str,
+    latest_end_time: &str,
+) {
+    assert_eq!(snapshot.burn_history.len(), 33);
+    assert_eq!(
+        snapshot
+            .burn_history
+            .first()
+            .expect("first burn history point")
+            .end_time,
+        first_end_time
+    );
+    let latest_burn_history = snapshot
+        .burn_history
+        .last()
+        .expect("latest burn history point");
+    assert_eq!(latest_burn_history.end_time, latest_end_time);
+    assert!(
+        (latest_burn_history.cost_usd_per_hour - snapshot.burn_rate.cost_usd_per_hour).abs()
+            < f64::EPSILON
+    );
 }
 
 #[test]
@@ -1596,6 +1631,7 @@ fn build_watch_snapshot_tracks_current_day_totals_and_bounded_hourly_burn() {
     assert_eq!(snapshot.burn_rate.output_tokens_per_hour, 20);
     assert_eq!(snapshot.burn_rate.reasoning_output_tokens_per_hour, 6);
     assert_eq!(snapshot.burn_rate.total_tokens_per_hour, 120);
+    assert_latest_burn_history_matches_table(&snapshot, "16:30", "00:30");
     assert_eq!(snapshot.updated_time, "00:30:00");
     let gpt5 = snapshot.per_model.get("gpt-5").expect("gpt-5 model");
     assert_eq!(gpt5.input_tokens, 50);
@@ -1636,6 +1672,64 @@ fn build_watch_snapshot_tracks_current_day_totals_and_bounded_hourly_burn() {
         0
     );
     assert_eq!(exclude_cache_snapshot.burn_rate.total_tokens_per_hour, 90);
+    assert!(
+        (exclude_cache_snapshot
+            .burn_history
+            .last()
+            .expect("latest exclude-cache burn history point")
+            .cost_usd_per_hour
+            - exclude_cache_snapshot.burn_rate.cost_usd_per_hour)
+            .abs()
+            < f64::EPSILON
+    );
+}
+
+#[test]
+fn build_watch_snapshot_graph_uses_true_past_horizon_across_midnight() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    fs::create_dir_all(session_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &session_file,
+        [
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-01-01T23:55:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000000,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1000000}}}}"#,
+            r#"{"timestamp":"2026-01-02T00:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000000,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1000000}}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write session");
+
+    let now = DateTime::parse_from_rfc3339("2026-01-02T00:20:00Z")
+        .expect("timestamp")
+        .with_timezone(&Utc);
+    let options = WatchOptions {
+        timezone: "UTC".to_string(),
+        locale: "en-US".to_string(),
+        number_format: NumberFormat::Short,
+        offline: true,
+        refresh_pricing: false,
+        cached_input_cost_mode: CachedInputCostMode::Priced,
+        cache_read_mode: CacheReadMode::Include,
+        session_dirs: vec![sessions],
+        project_dir: None,
+        parallelism: ScannerParallelism::Auto,
+        interval: Duration::from_secs(5),
+        show_model_burn_rate: false,
+        #[cfg(debug_assertions)]
+        debug: DebugRuntimeOptions::default(),
+    };
+    let snapshot = build_watch_snapshot_at(&options, now).expect("watch snapshot");
+
+    assert_eq!(snapshot.totals.input_tokens, 1_000_000);
+    assert!((snapshot.totals.cost_usd - 1.25).abs() < f64::EPSILON);
+    let latest_burn_history = snapshot
+        .burn_history
+        .last()
+        .expect("latest burn history point");
+    assert_eq!(latest_burn_history.end_time, "00:20");
+    assert!((latest_burn_history.cost_usd_per_hour - 5.0).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -2135,7 +2229,7 @@ fn cached_watch_file_burn_events_skip_older_history() {
             modified: None,
         },
         parser_checkpoint: SessionParseCheckpoint::default(),
-        current_day_events: vec![
+        cached_events: vec![
             event("2026-01-02T00:05:00Z", 5),
             event("2026-01-02T00:30:00Z", 7),
             event("2026-01-02T00:45:00Z", 11),
@@ -2182,6 +2276,7 @@ fn render_watch_screen_includes_totals_and_burn_rate_columns() {
                 total_tokens_per_hour: 120,
                 cost_usd_per_hour: 2.5,
             },
+            burn_history: Vec::new(),
             per_model: BTreeMap::new(),
             missing_directories: vec!["/tmp/missing".to_string()],
             updated_time: "00:30:00".to_string(),
@@ -2200,6 +2295,66 @@ fn render_watch_screen_includes_totals_and_burn_rate_columns() {
     assert!(rendered.contains("Input"));
     assert!(rendered.contains("$2.50"));
     assert!(rendered.contains("/tmp/missing"));
+}
+
+#[test]
+fn render_watch_screen_shows_eight_hour_cost_graph_when_space_allows() {
+    let mut snapshot = watch_snapshot_with_models(BTreeMap::new());
+    snapshot.burn_history = watch_burn_history(33);
+
+    let rendered = render_watch_screen_with_size(
+        &snapshot,
+        "en-US",
+        NumberFormat::Full,
+        false,
+        CacheReadMode::Include,
+        Some(80),
+        Some(40),
+    );
+
+    assert!(rendered.contains("Burn Rate History"));
+    assert!(rendered.contains("- $33.00/h"));
+    assert!(!rendered.contains("$0.00/h"));
+    assert!(!rendered.contains("Max Burn Rate"));
+    assert!(rendered.contains("00:00 --------------------- 08:00"));
+}
+
+#[test]
+fn render_watch_screen_falls_back_to_four_hour_cost_graph_when_width_is_tight() {
+    let mut snapshot = watch_snapshot_with_models(BTreeMap::new());
+    snapshot.burn_history = watch_burn_history(33);
+
+    let rendered = render_watch_screen_with_size(
+        &snapshot,
+        "en-US",
+        NumberFormat::Full,
+        false,
+        CacheReadMode::Include,
+        Some(45),
+        Some(40),
+    );
+
+    assert!(rendered.contains("Burn Rate History"));
+    assert!(rendered.contains("16:00 ----- 08:00"));
+    assert!(!rendered.contains("00:00 --------------------- 08:00"));
+}
+
+#[test]
+fn render_watch_screen_omits_cost_graph_when_height_is_tight() {
+    let mut snapshot = watch_snapshot_with_models(BTreeMap::new());
+    snapshot.burn_history = watch_burn_history(33);
+
+    let rendered = render_watch_screen_with_size(
+        &snapshot,
+        "en-US",
+        NumberFormat::Full,
+        false,
+        CacheReadMode::Include,
+        Some(80),
+        Some(5),
+    );
+
+    assert!(!rendered.contains("Burn Rate History"));
 }
 
 #[test]
@@ -2225,6 +2380,7 @@ fn render_watch_screen_omits_cache_metric_when_cache_read_is_excluded() {
                 total_tokens_per_hour: 90,
                 cost_usd_per_hour: 2.5,
             },
+            burn_history: Vec::new(),
             per_model: BTreeMap::new(),
             missing_directories: Vec::new(),
             updated_time: "00:30:00".to_string(),
@@ -2262,6 +2418,7 @@ fn render_watch_screen_honors_number_format() {
             total_tokens_per_hour: 107_000,
             cost_usd_per_hour: 12.5,
         },
+        burn_history: Vec::new(),
         per_model: BTreeMap::new(),
         missing_directories: Vec::new(),
         updated_time: "00:30:00".to_string(),
@@ -2310,6 +2467,7 @@ fn render_watch_screen_omits_per_model_columns_when_flag_is_disabled() {
                 total_tokens_per_hour: 120,
                 cost_usd_per_hour: 2.5,
             },
+            burn_history: Vec::new(),
             per_model: BTreeMap::from([(
                 "gpt-5".to_string(),
                 ModelBreakdown {
@@ -2359,6 +2517,7 @@ fn render_watch_screen_includes_per_model_columns_and_skips_zero_usage_models() 
                 total_tokens_per_hour: 120,
                 cost_usd_per_hour: 2.5,
             },
+            burn_history: Vec::new(),
             per_model: BTreeMap::from([
                 (
                     "gpt-5".to_string(),
@@ -2499,6 +2658,7 @@ fn render_watch_screen_places_burn_rate_column_last() {
                 total_tokens_per_hour: 24,
                 cost_usd_per_hour: 0.5,
             },
+            burn_history: Vec::new(),
             per_model: BTreeMap::from([(
                 "gpt-5".to_string(),
                 ModelBreakdown {
@@ -2556,6 +2716,7 @@ fn render_watch_screen_scales_each_model_burn_column_independently() {
                 total_tokens_per_hour: 2,
                 cost_usd_per_hour: 0.02,
             },
+            burn_history: Vec::new(),
             per_model: BTreeMap::from([
                 (
                     "gpt-5".to_string(),
@@ -2631,6 +2792,7 @@ fn render_watch_screen_includes_fallback_model_columns() {
                 total_tokens_per_hour: 4,
                 cost_usd_per_hour: 0.04,
             },
+            burn_history: Vec::new(),
             per_model: BTreeMap::from([(
                 "gpt-5".to_string(),
                 ModelBreakdown {

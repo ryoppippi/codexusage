@@ -17,4 +17,4 @@ pub(super) use table::{
     write_table_row,
 };
 #[cfg(test)]
-pub(super) use watch::render_watch_screen_with_width;
+pub(super) use watch::{render_watch_screen_with_size, render_watch_screen_with_width};

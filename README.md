@@ -93,6 +93,16 @@ Date: 2026-03-11  Window: 60 minutes
 | Cost      |      $0.85 |          $0.11 |
 | Updated   | 2026-03-11 |       14:32:23 |
 +-----------+------------+----------------+
+
++------------------------------------+
+| Burn Rate History                  |
++------------------------------------+
+|         ▆                ─ $0.16/h |
+|       ▆███▆              ─ $0.12/h |
+|   ▂▅███████▅▃            ─ $0.08/h |
+| ▁▄███████████▃▁          ─ $0.04/h |
+| 10:30 ───── 14:30                  |
++------------------------------------+
 ```
 
 Watch mode does not support `--json`, `--since`, `--until`, or `--last-days`.
@@ -100,6 +110,9 @@ Use `--per-model-burn-rate` to append one burn-rate column per active model, wit
 When the terminal is too narrow to fit every per-model column in one table, watch mode automatically
 stacks multiple table blocks vertically, repeating the `Metric` column in each block while keeping
 `Today` in the first block and aggregate `Burn Rate (/h)` in the final block.
+When enough terminal space is available, watch mode also shows a compact cost burn-rate graph built
+from trailing 30-minute windows sampled every 15 minutes. The graph uses the past 8 hours on larger
+terminals and falls back to the past 4 hours on tighter screens.
 
 ## Options
 

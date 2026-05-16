@@ -56,7 +56,9 @@ use model::WatchSnapshot;
 #[cfg(test)]
 use model::is_false;
 #[cfg(test)]
-use model::{BurnRateSnapshot, DEFAULT_FALLBACK_MODEL, UsagePresentation, WatchOptions};
+use model::{
+    BurnRateHistoryPoint, BurnRateSnapshot, DEFAULT_FALLBACK_MODEL, UsagePresentation, WatchOptions,
+};
 pub use model::{
     CacheReadMode, CachedInputCostMode, DailyRow, ModelBreakdown, MonthlyRow, NumberFormat,
     ReportKind, ReportOptions, ReportOutput, ScannerParallelism, SessionRow, Totals, UsageTotals,
@@ -87,7 +89,7 @@ use model::DebugRuntimeOptions;
 use render::{
     BorderStyle, TableElement, TableRenderConfig, TableRuleKind, TableStyle,
     detect_border_style_for, detect_table_style_for, format_currency, format_data_row, format_u64,
-    format_u64_with, paint, table_rule, write_table_row,
+    format_u64_with, paint, render_watch_screen_with_size, table_rule, write_table_row,
 };
 #[cfg(test)]
 use report::SessionSummary;
