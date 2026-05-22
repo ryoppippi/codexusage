@@ -71,12 +71,12 @@ use render::{render_report, render_watch_screen};
 pub use report::build_report;
 #[cfg(test)]
 use report::{
-    ProjectFilter, ReportBuilder, SessionScanTarget, calculate_cost, calculate_cost_from_usage,
-    collect_session_files, normalize_filter_date, normalize_timezone_name, parse_timezone,
-    resolve_report_date_filters, resolve_scan_worker_count, resolve_session_dirs,
-    resolve_session_target_across_roots, scan_session_file, session_file_id, session_file_path,
-    sort_session_entries, split_session_id, timezone_from_etc_timezone_contents,
-    timezone_from_localtime_target,
+    ProjectFilter, ReportBuilder, SessionScanTarget, balanced_scan_chunks, calculate_cost,
+    calculate_cost_from_usage, collect_session_files, normalize_filter_date,
+    normalize_timezone_name, parse_timezone, resolve_report_date_filters,
+    resolve_scan_worker_count, resolve_session_dirs, resolve_session_target_across_roots,
+    scan_session_file, session_file_id, session_file_path, sort_session_entries, split_session_id,
+    timezone_from_etc_timezone_contents, timezone_from_localtime_target,
 };
 #[cfg(test)]
 use session_log::{RawUsage, SessionParseCheckpoint};

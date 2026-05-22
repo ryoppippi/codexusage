@@ -4,12 +4,27 @@ use super::model::{DEFAULT_FALLBACK_MODEL, UsageTotals};
 use super::scan_runtime::ScanObserver;
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
+use memchr::memmem::Finder;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::LazyLock;
+
+/// Direct marker for turn-context records.
+static TURN_CONTEXT_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(b"turn_context"));
+/// Direct marker for token-count records.
+static TOKEN_COUNT_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(b"token_count"));
+/// JSON Unicode escape introducer.
+static UNICODE_ESCAPE_FINDER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\\u"));
+/// Usage-bearing turn-context marker.
+const TURN_CONTEXT_MARKER: &[u8] = b"turn_context";
+/// Usage-bearing token-count marker.
+const TOKEN_COUNT_MARKER: &[u8] = b"token_count";
 
 /// Raw token counters as they appear in session log payloads.
 #[derive(Clone, Copy, Debug, Default)]
@@ -760,7 +775,7 @@ fn scan_session_file_from_checkpoint_inner(
     let mut file = File::open(file)?;
     file.seek(SeekFrom::Start(checkpoint.offset))?;
     let reader = BufReader::new(file);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut previous_totals = checkpoint.previous_totals;
     let mut current_model = checkpoint.current_model.clone();
     let mut current_model_is_fallback = checkpoint.current_model_is_fallback;
@@ -769,24 +784,27 @@ fn scan_session_file_from_checkpoint_inner(
     loop {
         line.clear();
         let line_start_offset = offset;
-        let bytes_read = reader.read_line(&mut line)?;
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
         if bytes_read == 0 {
             break;
         }
         let next_offset = offset.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
-        let trimmed = line.trim();
+        let trimmed = trim_ascii_whitespace(&line);
         if trimmed.is_empty() {
             offset = next_offset;
             continue;
         }
-        if !line.ends_with('\n') && serde_json::from_str::<SessionLogEntry<'_>>(trimmed).is_err() {
+        if !line.ends_with(b"\n") && serde_json::from_slice::<SessionLogEntry<'_>>(trimmed).is_err()
+        {
             offset = line_start_offset;
             break;
         }
-        if !line_might_affect_usage(trimmed) {
+        if !line_might_affect_usage_bytes(trimmed) {
             offset = next_offset;
             continue;
         }
+        let trimmed =
+            std::str::from_utf8(trimmed).wrap_err("session log line is not valid UTF-8")?;
         if let Some(event) = parse_token_usage_line(
             trimmed,
             session_id,
@@ -808,9 +826,86 @@ fn scan_session_file_from_checkpoint_inner(
 }
 
 /// Return whether one JSONL line might affect usage aggregation.
+#[cfg(test)]
 pub(in crate::app) fn line_might_affect_usage(line: &str) -> bool {
-    // Fail open for escaped JSON strings because relevant event types may be unicode-escaped.
-    line.contains("\\u") || line.contains("turn_context") || line.contains("token_count")
+    line_might_affect_usage_bytes(line.as_bytes())
+}
+
+/// Return whether one JSONL byte record might affect usage aggregation.
+fn line_might_affect_usage_bytes(line: &[u8]) -> bool {
+    TURN_CONTEXT_FINDER.find(line).is_some()
+        || TOKEN_COUNT_FINDER.find(line).is_some()
+        || contains_escaped_usage_marker(line)
+}
+
+/// Return whether a line contains an escaped form of a usage-bearing marker.
+fn contains_escaped_usage_marker(line: &[u8]) -> bool {
+    if UNICODE_ESCAPE_FINDER.find(line).is_none() {
+        return false;
+    }
+
+    memchr::memchr2_iter(b't', b'\\', line).any(|offset| {
+        let candidate = &line[offset..];
+        escaped_marker_matches(candidate, TURN_CONTEXT_MARKER)
+            || escaped_marker_matches(candidate, TOKEN_COUNT_MARKER)
+    })
+}
+
+/// Return whether a candidate starts with a marker that contains at least one JSON Unicode escape.
+fn escaped_marker_matches(mut candidate: &[u8], marker: &[u8]) -> bool {
+    let mut escaped = false;
+    for &expected in marker {
+        if candidate.first() == Some(&expected) {
+            candidate = &candidate[1..];
+            continue;
+        }
+        if let Some(remainder) = consume_json_ascii_escape(candidate, expected) {
+            candidate = remainder;
+            escaped = true;
+            continue;
+        }
+        return false;
+    }
+    escaped
+}
+
+/// Consume a `\u00XX` escape that represents the expected ASCII byte.
+fn consume_json_ascii_escape(candidate: &[u8], expected: u8) -> Option<&[u8]> {
+    let [slash, prefix, first, second, third, fourth] = candidate.get(..6)?.try_into().ok()?;
+    if slash != b'\\' || prefix != b'u' {
+        return None;
+    }
+    let value = (u16::from(hex_value(first)?) << 12)
+        | (u16::from(hex_value(second)?) << 8)
+        | (u16::from(hex_value(third)?) << 4)
+        | u16::from(hex_value(fourth)?);
+    if value == u16::from(expected) {
+        Some(&candidate[6..])
+    } else {
+        None
+    }
+}
+
+/// Convert one ASCII hexadecimal digit into its value.
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Trim JSONL record whitespace without converting the line to UTF-8.
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let Some(start) = bytes.iter().position(|byte| !byte.is_ascii_whitespace()) else {
+        return &[];
+    };
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |position| position + 1);
+    &bytes[start..end]
 }
 
 /// Parse one JSONL line into a token-usage event when applicable.

@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::SystemTime;
 
+/// Multiplier applied to automatic report-scan worker selection.
+const AUTO_WORKER_MULTIPLIER: usize = 3;
+
 /// Shared report inputs resolved once before scanning begins.
 pub(in crate::app) struct PreparedReport {
     /// Timezone used for grouping and date filters.
@@ -1109,9 +1112,9 @@ where
         return scan_chunk(selected_files);
     }
 
-    let chunk_size = selected_files.len().div_ceil(worker_count);
+    let chunks = balanced_scan_chunks(selected_files, worker_count);
     thread::scope(|scope| -> Result<ReportBuilder> {
-        let mut chunks = selected_files.chunks(chunk_size);
+        let mut chunks = chunks.iter();
         let first_chunk = chunks
             .next()
             .ok_or_else(|| eyre!("missing initial scan chunk"))?;
@@ -1201,11 +1204,60 @@ pub(in crate::app) fn resolve_scan_worker_count(
     }
 
     let configured = match parallelism {
-        ScannerParallelism::Auto => thread::available_parallelism().map_or(1, NonZeroUsize::get),
+        ScannerParallelism::Auto => thread::available_parallelism().map_or(1, |threads| {
+            threads.get().saturating_mul(AUTO_WORKER_MULTIPLIER)
+        }),
         ScannerParallelism::Fixed(threads) => threads.get(),
     };
 
     configured.clamp(1, selected_files)
+}
+
+/// Split selected session targets into worker chunks balanced by byte size.
+pub(in crate::app) fn balanced_scan_chunks(
+    selected_files: &[SessionScanTarget],
+    worker_count: usize,
+) -> Vec<Vec<SessionScanTarget>> {
+    if selected_files.is_empty() {
+        return Vec::new();
+    }
+
+    let worker_count = worker_count.clamp(1, selected_files.len());
+    let mut chunks = (0..worker_count)
+        .map(|_| WeightedScanChunk::default())
+        .collect::<Vec<_>>();
+    let mut ordered = selected_files.iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    for target in ordered {
+        let chunk = chunks
+            .iter_mut()
+            .min_by_key(|chunk| (chunk.bytes, chunk.targets.len()))
+            .expect("worker count is at least one");
+        chunk.bytes = chunk.bytes.saturating_add(target.bytes);
+        chunk.targets.push(target.clone());
+    }
+
+    chunks
+        .into_iter()
+        .map(|chunk| chunk.targets)
+        .filter(|chunk| !chunk.is_empty())
+        .collect()
+}
+
+/// One worker chunk with accumulated scheduling weight.
+#[derive(Default)]
+struct WeightedScanChunk {
+    /// Selected targets assigned to this chunk.
+    targets: Vec<SessionScanTarget>,
+    /// Sum of target file sizes.
+    bytes: u64,
 }
 
 /// Discover the best session file for each session identifier.

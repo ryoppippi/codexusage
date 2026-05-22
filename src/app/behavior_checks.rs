@@ -1273,7 +1273,23 @@ fn line_might_affect_usage_fails_open_for_escaped_json_strings() {
         r#"{"type":"turn\u005fcontext","payload":{"model":"gpt-5"}}"#
     ));
     assert!(line_might_affect_usage(
+        r#"{"type":"\u0074urn_context","payload":{"model":"gpt-5"}}"#
+    ));
+    assert!(line_might_affect_usage(
         r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token\u005fcount"}}"#
+    ));
+    assert!(line_might_affect_usage(
+        r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token\u005Fcount"}}"#
+    ));
+    assert!(line_might_affect_usage(
+        r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"tok\u0065n_count"}}"#
+    ));
+}
+
+#[test]
+fn line_might_affect_usage_rejects_irrelevant_escaped_text() {
+    assert!(!line_might_affect_usage(
+        r#"{"type":"response_item","payload":{"text":"hello\u0020world"}}"#
     ));
 }
 
@@ -3335,4 +3351,44 @@ fn resolve_scan_worker_count_caps_explicit_threads_to_workload() {
         ),
         2
     );
+}
+
+#[test]
+fn resolve_scan_worker_count_uses_auto_worker_multiplier() {
+    let expected =
+        std::thread::available_parallelism().map_or(1, |threads| threads.get().saturating_mul(3));
+    let selected_files = expected.saturating_add(5);
+
+    assert_eq!(
+        resolve_scan_worker_count(ScannerParallelism::Auto, selected_files),
+        expected.min(selected_files)
+    );
+}
+
+#[test]
+fn balanced_scan_chunks_spreads_targets_by_byte_size() {
+    let targets = [
+        scan_target("small-a", 50),
+        scan_target("large-a", 100),
+        scan_target("small-b", 60),
+        scan_target("large-b", 90),
+        scan_target("small-c", 70),
+        scan_target("large-c", 80),
+    ];
+
+    let chunk_totals = balanced_scan_chunks(&targets, 3)
+        .into_iter()
+        .map(|chunk| chunk.iter().map(|target| target.bytes).sum::<u64>())
+        .collect::<Vec<_>>();
+
+    assert_eq!(chunk_totals, vec![150, 150, 150]);
+}
+
+fn scan_target(session_id: &str, bytes: u64) -> SessionScanTarget {
+    SessionScanTarget {
+        session_id: session_id.to_string(),
+        path: PathBuf::from(format!("{session_id}.jsonl")),
+        bytes,
+        modified: None,
+    }
 }

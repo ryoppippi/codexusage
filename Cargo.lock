@@ -319,6 +319,7 @@ dependencies = [
  "dirs",
  "eyre",
  "filetime",
+ "memchr",
  "notify",
  "reqwest",
  "serde",
