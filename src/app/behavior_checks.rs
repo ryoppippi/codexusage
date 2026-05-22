@@ -128,6 +128,10 @@ fn watch_burn_history(point_count: usize) -> Vec<BurnRateHistoryPoint> {
         .collect()
 }
 
+fn normalized_watch_graph_markers(rendered: &str) -> String {
+    rendered.replace('─', "-")
+}
+
 fn assert_latest_burn_history_matches_table(
     snapshot: &WatchSnapshot,
     first_end_time: &str,
@@ -2312,11 +2316,12 @@ fn render_watch_screen_shows_eight_hour_cost_graph_when_space_allows() {
         Some(40),
     );
 
+    let graph_markers = normalized_watch_graph_markers(&rendered);
     assert!(rendered.contains("Burn Rate History"));
-    assert!(rendered.contains("- $33.00/h"));
+    assert!(graph_markers.contains("- $33.00/h"));
     assert!(!rendered.contains("$0.00/h"));
     assert!(!rendered.contains("Max Burn Rate"));
-    assert!(rendered.contains("00:00 --------------------- 08:00"));
+    assert!(graph_markers.contains("00:00 --------------------- 08:00"));
 }
 
 #[test]
@@ -2334,9 +2339,10 @@ fn render_watch_screen_falls_back_to_four_hour_cost_graph_when_width_is_tight() 
         Some(40),
     );
 
+    let graph_markers = normalized_watch_graph_markers(&rendered);
     assert!(rendered.contains("Burn Rate History"));
-    assert!(rendered.contains("16:00 ----- 08:00"));
-    assert!(!rendered.contains("00:00 --------------------- 08:00"));
+    assert!(graph_markers.contains("16:00 ----- 08:00"));
+    assert!(!graph_markers.contains("00:00 --------------------- 08:00"));
 }
 
 #[test]
