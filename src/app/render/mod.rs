@@ -6,7 +6,7 @@ mod table;
 mod watch;
 
 pub(super) use report::render_report;
-pub(super) use watch::render_watch_screen;
+pub(super) use watch::render_watch_screen_with_limits;
 
 #[cfg(test)]
 pub(super) use number::{format_currency, format_u64, format_u64_with};
@@ -17,4 +17,6 @@ pub(super) use table::{
     write_table_row,
 };
 #[cfg(test)]
-pub(super) use watch::{render_watch_screen_with_size, render_watch_screen_with_width};
+pub(super) use watch::{
+    render_watch_screen, render_watch_screen_with_size, render_watch_screen_with_width,
+};

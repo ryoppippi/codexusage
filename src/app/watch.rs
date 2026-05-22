@@ -1,10 +1,13 @@
 //! Watch-mode runtime and incremental refresh helpers.
 
+use super::codex_limits::{
+    CodexLimitStatus, codex_limit_status_for_watch_start, fetch_codex_limits,
+};
 use super::model::{
     BurnRateHistoryPoint, BurnRateSnapshot, ScannerParallelism, Totals, UsagePresentation,
     UsageTotals, WatchOptions, WatchSnapshot,
 };
-use super::render::render_watch_screen;
+use super::render::render_watch_screen_with_limits;
 use super::report::{
     GroupSummary, ProjectFilter, SessionScanTarget, calculate_summary_cost,
     collect_missing_session_dirs, collect_session_scan_targets, ensure_model_breakdown,
@@ -47,6 +50,8 @@ const WATCH_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Sliding window used by the compact cost burn-rate graph.
 const WATCH_GRAPH_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// Minimum time between Codex account limit refresh attempts.
+const WATCH_LIMITS_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60);
 
 #[cfg(test)]
 pub(in crate::app) fn build_watch_snapshot_at(
@@ -391,6 +396,8 @@ pub(in crate::app) fn run_watch_loop(options: &WatchOptions) -> Result<()> {
         &startup_scan_runner,
     )?;
     let mut last_pricing_refresh_attempt_at = startup_refresh_attempted.then_some(now);
+    let (mut codex_limit_status, mut last_codex_limit_refresh_attempt_at) =
+        initial_codex_limit_watch_state(options.offline);
     let should_clear = supports_watch_screen_clear(std::env::var("TERM").ok().as_deref());
     if !should_clear {
         return Err(eyre!(
@@ -403,18 +410,19 @@ pub(in crate::app) fn run_watch_loop(options: &WatchOptions) -> Result<()> {
         let now = SystemTime::now();
         let snapshot_now = Utc::now();
         let discovered_new_root = watch_events.sync_session_dirs(&session_dirs)?;
-        if watch_pricing_refresh_due(
+        refresh_watch_pricing_if_due(
+            &mut pricing,
             &pricing_cache_path,
             now,
             options.offline,
-            last_pricing_refresh_attempt_at,
-        )? {
-            pricing = load_pricing_catalog(&PricingLoadOptions {
-                offline: options.offline,
-                force_refresh: false,
-            })?;
-            last_pricing_refresh_attempt_at = Some(now);
-        }
+            &mut last_pricing_refresh_attempt_at,
+        )?;
+        refresh_codex_limits_if_due(
+            &mut codex_limit_status,
+            &mut last_codex_limit_refresh_attempt_at,
+            now,
+            options.offline,
+        );
         let mut changes = watch_events.drain_changes(&session_dirs);
         changes.discovery_due |= discovered_new_root;
         runtime.refresh_with_scan_runner(
@@ -431,11 +439,56 @@ pub(in crate::app) fn run_watch_loop(options: &WatchOptions) -> Result<()> {
             snapshot_now,
             options.show_model_burn_rate,
         )?;
-        write_watch_snapshot(&mut stdout, &snapshot, options)?;
+        write_watch_snapshot(
+            &mut stdout,
+            &snapshot,
+            options,
+            &codex_limit_status,
+            snapshot_now.timestamp(),
+        )?;
         thread::sleep(remaining_watch_sleep(
             options.interval,
             loop_started_at.elapsed(),
         ));
+    }
+}
+
+/// Refresh watch pricing data when the cache policy says it is due.
+fn refresh_watch_pricing_if_due(
+    pricing: &mut PricingCatalog,
+    pricing_cache_path: &Path,
+    now: SystemTime,
+    offline: bool,
+    last_refresh_attempt_at: &mut Option<SystemTime>,
+) -> Result<()> {
+    if watch_pricing_refresh_due(pricing_cache_path, now, offline, *last_refresh_attempt_at)? {
+        *pricing = load_pricing_catalog(&PricingLoadOptions {
+            offline,
+            force_refresh: false,
+        })?;
+        *last_refresh_attempt_at = Some(now);
+    }
+    Ok(())
+}
+
+/// Build the initial watch-mode Codex limit state.
+fn initial_codex_limit_watch_state(offline: bool) -> (CodexLimitStatus, Option<SystemTime>) {
+    (
+        codex_limit_status_for_watch_start(offline, fetch_codex_limits),
+        (!offline).then_some(SystemTime::now()),
+    )
+}
+
+/// Refresh Codex limit status when the watch refresh interval has elapsed.
+fn refresh_codex_limits_if_due(
+    codex_limit_status: &mut CodexLimitStatus,
+    last_refresh_attempt_at: &mut Option<SystemTime>,
+    now: SystemTime,
+    offline: bool,
+) {
+    if watch_codex_limits_refresh_due(now, offline, *last_refresh_attempt_at) {
+        *codex_limit_status = fetch_codex_limits();
+        *last_refresh_attempt_at = Some(now);
     }
 }
 
@@ -444,20 +497,37 @@ fn write_watch_snapshot(
     output: &mut impl Write,
     snapshot: &WatchSnapshot,
     options: &WatchOptions,
+    codex_limit_status: &CodexLimitStatus,
+    now_epoch_seconds: i64,
 ) -> Result<()> {
     output.write_all(b"\x1b[2J\x1b[H")?;
     output.write_all(
-        render_watch_screen(
+        render_watch_screen_with_limits(
             snapshot,
             &options.locale,
             options.number_format,
             options.show_model_burn_rate,
             options.cache_read_mode,
+            codex_limit_status,
+            now_epoch_seconds,
         )
         .as_bytes(),
     )?;
     output.flush()?;
     Ok(())
+}
+
+/// Decide whether watch mode should refresh Codex account limits before redraw.
+pub(in crate::app) fn watch_codex_limits_refresh_due(
+    now: SystemTime,
+    offline: bool,
+    last_refresh_attempt_at: Option<SystemTime>,
+) -> bool {
+    !offline
+        && last_refresh_attempt_at.is_none_or(|attempted_at| {
+            now.duration_since(attempted_at)
+                .is_ok_and(|elapsed| elapsed >= WATCH_LIMITS_REFRESH_INTERVAL)
+        })
 }
 
 /// Decide whether the terminal should receive ANSI clear-screen sequences.

@@ -3022,6 +3022,24 @@ fn watch_pricing_refresh_due_uses_cache_age_and_retry_backoff() {
 }
 
 #[test]
+fn watch_codex_limits_refresh_due_uses_offline_and_interval() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(240);
+
+    assert!(watch_codex_limits_refresh_due(now, false, None));
+    assert!(!watch_codex_limits_refresh_due(now, true, None));
+    assert!(!watch_codex_limits_refresh_due(
+        now,
+        false,
+        Some(now - Duration::from_secs(179)),
+    ));
+    assert!(watch_codex_limits_refresh_due(
+        now,
+        false,
+        Some(now - Duration::from_secs(180)),
+    ));
+}
+
+#[test]
 fn resolve_local_midnight_utc_handles_midnight_dst_skip() {
     let day = NaiveDate::from_ymd_opt(2024, 4, 26).expect("day");
     let resolved = resolve_local_midnight_utc(chrono_tz::Africa::Cairo, day).expect("start");

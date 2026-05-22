@@ -39,6 +39,9 @@ mod report;
 /// CLI-only scan progress and debug runtime helpers.
 mod scan_runtime;
 
+/// Codex account limit fetching for watch mode.
+mod codex_limits;
+
 /// Watch-mode runtime and incremental refresh helpers.
 mod watch;
 
@@ -105,8 +108,8 @@ use watch::{
     CachedWatchFile, OwnedWatchEvent, WatchChangeSet, WatchDirtyKind, WatchEventSource,
     WatchRuntimeState, build_watch_snapshot_at, display_window_minutes, path_is_under_roots,
     remaining_watch_sleep, resolve_local_midnight_utc, supports_watch_screen_clear,
-    supports_watch_screen_clear_with_platform, watch_dirty_kind, watch_event_session_ids,
-    watch_pricing_refresh_due,
+    supports_watch_screen_clear_with_platform, watch_codex_limits_refresh_due, watch_dirty_kind,
+    watch_event_session_ids, watch_pricing_refresh_due,
 };
 
 #[cfg(test)]

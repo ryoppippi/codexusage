@@ -432,6 +432,7 @@ fn should_left_align(header: &str, display: &str) -> bool {
             | "Model"
             | "Last Activity"
             | "Burn Rate History"
+            | "Codex Limits"
     )
 }
 

@@ -1,5 +1,8 @@
 //! Live watch screen rendering.
 
+#[cfg(test)]
+use super::super::codex_limits::CodexLimits;
+use super::super::codex_limits::{CodexLimitStatus, CodexLimitUnavailableReason, CodexLimitWindow};
 use super::super::model::{BurnRateHistoryPoint, explicit_usage};
 use super::super::{
     CacheReadMode, NumberFormat, UsageTotals, WatchSnapshot, scale_cost_per_hour,
@@ -24,8 +27,11 @@ const WATCH_GRAPH_ROW_UNITS: usize = 8;
 const WATCH_GRAPH_VERTICAL_UNITS: usize = WATCH_GRAPH_BODY_HEIGHT * WATCH_GRAPH_ROW_UNITS;
 /// Total vertical subunits as an exact floating point denominator.
 const WATCH_GRAPH_VERTICAL_UNITS_F64: f64 = 32.0;
+/// Horizontal cells used by Codex limit bars.
+const CODEX_LIMIT_BAR_WIDTH: usize = 20;
 
 /// Render one live watch snapshot.
+#[cfg(test)]
 pub(in crate::app) fn render_watch_screen(
     snapshot: &WatchSnapshot,
     locale: &str,
@@ -43,6 +49,29 @@ pub(in crate::app) fn render_watch_screen(
         terminal_size.map(|(width, _height)| width),
         terminal_size.map(|(_width, height)| height),
     )
+}
+
+/// Render one live watch snapshot with Codex account limits.
+pub(in crate::app) fn render_watch_screen_with_limits(
+    snapshot: &WatchSnapshot,
+    _locale: &str,
+    number_format: NumberFormat,
+    show_model_burn_rate: bool,
+    cache_read_mode: CacheReadMode,
+    codex_limit_status: &CodexLimitStatus,
+    now_epoch_seconds: i64,
+) -> String {
+    let terminal_size = detect_terminal_size();
+    render_watch_screen_with_request(&WatchRenderRequest {
+        snapshot,
+        number_format,
+        show_model_burn_rate,
+        cache_read_mode,
+        terminal_width: terminal_size.map(|(width, _height)| width),
+        terminal_height: terminal_size.map(|(_width, height)| height),
+        codex_limit_status: Some(codex_limit_status),
+        now_epoch_seconds,
+    })
 }
 
 /// Render one live watch snapshot with an explicit terminal width override.
@@ -67,6 +96,7 @@ pub(in crate::app) fn render_watch_screen_with_width(
 }
 
 /// Render one live watch snapshot with explicit terminal dimensions.
+#[cfg(test)]
 pub(in crate::app) fn render_watch_screen_with_size(
     snapshot: &WatchSnapshot,
     _locale: &str,
@@ -76,10 +106,44 @@ pub(in crate::app) fn render_watch_screen_with_size(
     terminal_width: Option<usize>,
     terminal_height: Option<usize>,
 ) -> String {
+    render_watch_screen_with_request(&WatchRenderRequest {
+        snapshot,
+        number_format,
+        show_model_burn_rate,
+        cache_read_mode,
+        terminal_width,
+        terminal_height,
+        codex_limit_status: None,
+        now_epoch_seconds: 0,
+    })
+}
+
+/// Inputs for one watch screen render.
+struct WatchRenderRequest<'a> {
+    /// Usage snapshot to render.
+    snapshot: &'a WatchSnapshot,
+    /// Numeric formatting mode.
+    number_format: NumberFormat,
+    /// Whether model-level burn columns should be shown.
+    show_model_burn_rate: bool,
+    /// Cache-read reporting mode.
+    cache_read_mode: CacheReadMode,
+    /// Available terminal width, when known.
+    terminal_width: Option<usize>,
+    /// Available terminal height, when known.
+    terminal_height: Option<usize>,
+    /// Optional Codex limit status to render.
+    codex_limit_status: Option<&'a CodexLimitStatus>,
+    /// Current wall-clock time used for local reset countdown rendering.
+    now_epoch_seconds: i64,
+}
+
+/// Render one live watch snapshot from a compact request.
+fn render_watch_screen_with_request(request: &WatchRenderRequest<'_>) -> String {
     let render_config = TableRenderConfig {
         style: detect_table_style(),
         borders: detect_border_style(),
-        number_format,
+        number_format: request.number_format,
     };
     let mut output = String::new();
     let _ = writeln!(
@@ -94,27 +158,38 @@ pub(in crate::app) fn render_watch_screen_with_size(
     let _ = writeln!(
         &mut output,
         "Date: {}  Window: {} minutes",
-        snapshot.date, snapshot.burn_rate.window_minutes
+        request.snapshot.date, request.snapshot.burn_rate.window_minutes
     );
     let _ = writeln!(&mut output);
     write_watch_table(
         &mut output,
         render_config,
-        snapshot,
-        number_format,
-        show_model_burn_rate,
-        cache_read_mode,
-        terminal_width,
+        request.snapshot,
+        request.number_format,
+        request.show_model_burn_rate,
+        request.cache_read_mode,
+        request.terminal_width,
     );
 
-    let warning = watch_missing_directory_warning(snapshot);
-    let reserved_lines =
-        rendered_line_count(&output) + warning.as_deref().map_or(0, rendered_line_count);
+    let limit_block = request
+        .codex_limit_status
+        .map(|status| render_codex_limits(status, render_config, request.now_epoch_seconds));
+    let warning = watch_missing_directory_warning(request.snapshot);
+    let limit_reserved_lines = limit_block
+        .as_deref()
+        .map_or(0, |block| rendered_line_count(block).saturating_add(1));
+    let reserved_lines = rendered_line_count(&output)
+        + limit_reserved_lines
+        + warning.as_deref().map_or(0, rendered_line_count);
+    if let Some(limit_block) = &limit_block {
+        let _ = writeln!(&mut output);
+        output.push_str(limit_block);
+    }
     if let Some(graph) = render_watch_graph(
-        snapshot,
+        request.snapshot,
         render_config,
-        terminal_width,
-        terminal_height,
+        request.terminal_width,
+        request.terminal_height,
         reserved_lines,
     ) {
         let _ = writeln!(&mut output);
@@ -127,6 +202,165 @@ pub(in crate::app) fn render_watch_screen_with_size(
     }
 
     output
+}
+
+/// Render Codex account limit status as horizontal bars.
+fn render_codex_limits(
+    status: &CodexLimitStatus,
+    render_config: TableRenderConfig,
+    now_epoch_seconds: i64,
+) -> String {
+    let headers = ["Codex Limits"];
+    match status {
+        CodexLimitStatus::Available(limits) => {
+            let rows = [
+                ("5h", limits.five_hour.as_ref()),
+                ("Weekly", limits.weekly.as_ref()),
+            ]
+            .into_iter()
+            .map(|(label, window)| DisplayRow {
+                cells: vec![render_codex_limit_row(
+                    label,
+                    window,
+                    render_config.borders,
+                    now_epoch_seconds,
+                )],
+                kind: DisplayRowKind::Subtotal,
+            })
+            .collect::<Vec<_>>();
+            render_codex_limit_table(render_config, &headers, &rows)
+        }
+        CodexLimitStatus::Unavailable(reason) => {
+            render_unavailable_codex_limits(*reason, render_config)
+        }
+    }
+}
+
+/// Render the unavailable Codex account limit table.
+fn render_unavailable_codex_limits(
+    reason: CodexLimitUnavailableReason,
+    render_config: TableRenderConfig,
+) -> String {
+    let headers = ["Codex Limits"];
+    let rows = [DisplayRow {
+        cells: vec![format!("unavailable ({})", reason.as_str())],
+        kind: DisplayRowKind::Subtotal,
+    }];
+    render_codex_limit_table(render_config, &headers, &rows)
+}
+
+/// Render a one-column Codex limit table with the standard watch table frame.
+fn render_codex_limit_table(
+    render_config: TableRenderConfig,
+    headers: &[&str],
+    rows: &[DisplayRow],
+) -> String {
+    let width_row = rows
+        .last()
+        .expect("codex limit table always has at least one row");
+    let widths = column_widths(headers, rows, width_row, render_config.number_format);
+    let mut output = String::new();
+
+    write_table_header(&mut output, render_config, headers, &widths);
+    for row in rows {
+        write_table_row(
+            &mut output,
+            render_config,
+            headers,
+            &widths,
+            &row.cells,
+            row_table_element(row.kind),
+        );
+    }
+    write_table_rule(
+        &mut output,
+        render_config.style,
+        table_rule_element(TableRuleKind::Bottom),
+        &table_rule(TableRuleKind::Bottom, render_config.borders, &widths),
+    );
+    if output.ends_with('\n') {
+        output.pop();
+    }
+
+    output
+}
+
+/// Render one Codex account limit row.
+fn render_codex_limit_row(
+    label: &str,
+    window: Option<&CodexLimitWindow>,
+    borders: super::table::BorderStyle,
+    now_epoch_seconds: i64,
+) -> String {
+    let Some(window) = window else {
+        return format!("{label:<6} unavailable");
+    };
+    let left_percent = rounded_limit_percent(100.0 - window.used_percent);
+    let reset_suffix = limit_reset_countdown(window, now_epoch_seconds)
+        .map(|reset| format!(", {reset}"))
+        .unwrap_or_default();
+    format!(
+        "{label:<6} [{}] {left_percent:>3}% left{reset_suffix}",
+        format_limit_bar(100.0 - window.used_percent, borders),
+    )
+}
+
+/// Format one fixed-width Codex account limit bar.
+fn format_limit_bar(left_percent: f64, borders: super::table::BorderStyle) -> String {
+    let filled = limit_bar_filled_cells(left_percent);
+    let empty = CODEX_LIMIT_BAR_WIDTH.saturating_sub(filled);
+    match borders {
+        super::table::BorderStyle::Ascii => {
+            format!("{}{}", "#".repeat(filled), "-".repeat(empty))
+        }
+        super::table::BorderStyle::Unicode => {
+            format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+        }
+    }
+}
+
+/// Return how many cells should be filled for one limit percentage.
+fn limit_bar_filled_cells(left_percent: f64) -> usize {
+    let left_percent = left_percent.clamp(0.0, 100.0);
+    let width = u32::try_from(CODEX_LIMIT_BAR_WIDTH).map_or(20.0, f64::from);
+    let filled_units = left_percent * width / 100.0;
+    (0..CODEX_LIMIT_BAR_WIDTH)
+        .filter(|index| {
+            let index = u32::try_from(*index).map_or(0.0, f64::from);
+            index + 0.5 <= filled_units
+        })
+        .count()
+}
+
+/// Format a whole-number percentage for limit display.
+fn rounded_limit_percent(value: f64) -> String {
+    format!("{:.0}", value.clamp(0.0, 100.0))
+}
+
+/// Format the locally computed reset countdown for one limit window.
+fn limit_reset_countdown(window: &CodexLimitWindow, now_epoch_seconds: i64) -> Option<String> {
+    let resets_at = window.resets_at_epoch_seconds?;
+    Some(format_reset_countdown(
+        resets_at.saturating_sub(now_epoch_seconds).max(0),
+    ))
+}
+
+/// Format a duration as up to two non-zero major units.
+fn format_reset_countdown(total_seconds: i64) -> String {
+    let mut remaining = total_seconds.max(0);
+    let mut parts = Vec::with_capacity(2);
+    for (unit_seconds, unit_label) in [(86_400, "d"), (3_600, "h"), (60, "m"), (1, "s")] {
+        let value = remaining / unit_seconds;
+        remaining %= unit_seconds;
+        if value > 0 || (parts.is_empty() && unit_seconds == 1) {
+            parts.push(format!("{value}{unit_label}"));
+        }
+        if parts.len() == 2 {
+            break;
+        }
+    }
+
+    parts.join(" ")
 }
 
 /// Build the missing-directory warning prefix for one watch snapshot.
@@ -919,6 +1153,138 @@ mod tests {
             append_cost_legend("plot", "- $10.00/h", 10),
             "plot  - $10.00/h"
         );
+    }
+
+    #[test]
+    fn limit_bars_show_usage_left_with_border_specific_glyphs() {
+        assert_eq!(
+            format_limit_bar(50.0, BorderStyle::Ascii),
+            "##########----------"
+        );
+        assert_eq!(
+            format_limit_bar(50.0, BorderStyle::Unicode),
+            "██████████░░░░░░░░░░"
+        );
+    }
+
+    #[test]
+    fn render_codex_limits_includes_available_windows() {
+        let status = CodexLimitStatus::Available(CodexLimits {
+            five_hour: Some(CodexLimitWindow {
+                used_percent: 42.0,
+                window_minutes: Some(300),
+                resets_at_epoch_seconds: Some(100 + (3 * 86_400) + (2 * 3_600) + (15 * 60)),
+            }),
+            weekly: Some(CodexLimitWindow {
+                used_percent: 9.0,
+                window_minutes: Some(10_080),
+                resets_at_epoch_seconds: Some(100 + 45),
+            }),
+        });
+        let rendered = render_codex_limits(
+            &status,
+            TableRenderConfig {
+                style: TableStyle::Plain,
+                borders: BorderStyle::Ascii,
+                number_format: NumberFormat::Full,
+            },
+            100,
+        );
+
+        assert!(rendered.contains("Codex Limits"));
+        assert!(
+            rendered
+                .lines()
+                .next()
+                .is_some_and(|line| line.starts_with('+'))
+        );
+        assert!(rendered.contains("| 5h     [############--------]  58% left, 3d 2h |"));
+        assert!(rendered.contains("| Weekly [##################--]  91% left, 45s   |"));
+        assert!(!rendered.contains("% used"));
+    }
+
+    #[test]
+    fn render_codex_limits_includes_unavailable_reason() {
+        let rendered = render_codex_limits(
+            &CodexLimitStatus::Unavailable(CodexLimitUnavailableReason::Unauthorized),
+            TableRenderConfig {
+                style: TableStyle::Plain,
+                borders: BorderStyle::Ascii,
+                number_format: NumberFormat::Full,
+            },
+            0,
+        );
+
+        assert!(rendered.contains("+----------------------------+"));
+        assert!(rendered.contains("| Codex Limits               |"));
+        assert!(rendered.contains("| unavailable (unauthorized) |"));
+    }
+
+    #[test]
+    fn reset_countdown_uses_two_non_zero_major_units() {
+        assert_eq!(format_reset_countdown(0), "0s");
+        assert_eq!(format_reset_countdown(59), "59s");
+        assert_eq!(format_reset_countdown(62), "1m 2s");
+        assert_eq!(format_reset_countdown(3_600), "1h");
+        assert_eq!(format_reset_countdown(3_605), "1h 5s");
+        assert_eq!(
+            format_reset_countdown((3 * 86_400) + (2 * 3_600) + 300),
+            "3d 2h"
+        );
+    }
+
+    #[test]
+    fn reset_countdown_is_computed_from_current_render_time() {
+        let status = CodexLimitStatus::Available(CodexLimits {
+            five_hour: Some(CodexLimitWindow {
+                used_percent: 50.0,
+                window_minutes: Some(300),
+                resets_at_epoch_seconds: Some(130),
+            }),
+            weekly: None,
+        });
+        let render_config = TableRenderConfig {
+            style: TableStyle::Plain,
+            borders: BorderStyle::Ascii,
+            number_format: NumberFormat::Full,
+        };
+
+        let first = render_codex_limits(&status, render_config, 100);
+        let second = render_codex_limits(&status, render_config, 101);
+
+        assert!(first.contains("50% left, 30s"));
+        assert!(second.contains("50% left, 29s"));
+    }
+
+    #[test]
+    fn limit_block_counts_against_graph_fit() {
+        let mut snapshot = watch_layout_snapshot();
+        snapshot.burn_history = graph_points(&[1.0; 33]);
+        let status = CodexLimitStatus::Unavailable(CodexLimitUnavailableReason::RequestFailed);
+        let without_limits = render_watch_screen_with_size(
+            &snapshot,
+            "en-US",
+            NumberFormat::Full,
+            false,
+            CacheReadMode::Include,
+            Some(200),
+            Some(24),
+        );
+        let with_limits = render_watch_screen_with_request(&WatchRenderRequest {
+            snapshot: &snapshot,
+            number_format: NumberFormat::Full,
+            show_model_burn_rate: false,
+            cache_read_mode: CacheReadMode::Include,
+            terminal_width: Some(200),
+            terminal_height: Some(24),
+            codex_limit_status: Some(&status),
+            now_epoch_seconds: 0,
+        });
+
+        assert!(without_limits.contains("Burn Rate History"));
+        assert!(with_limits.contains("Codex Limits"));
+        assert!(with_limits.contains("unavailable (request failed)"));
+        assert!(!with_limits.contains("Burn Rate History"));
     }
 
     #[test]
