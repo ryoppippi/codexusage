@@ -736,6 +736,7 @@ pub(in crate::app) fn scan_session_file_from_checkpoint(
         session_id,
         checkpoint,
         || {},
+        |_| {},
         |event| {
             on_event(event);
         },
@@ -758,6 +759,29 @@ where
         session_id,
         checkpoint,
         || observer.before_file_open(),
+        |_| {},
+        |event| on_event(event),
+    )
+}
+
+/// Scan one JSONL session file from a stored parser checkpoint and expose consumed bytes.
+pub(in crate::app) fn scan_session_file_from_checkpoint_with_observer_and_bytes<O>(
+    file: &Path,
+    session_id: &str,
+    checkpoint: &SessionParseCheckpoint,
+    observer: &O,
+    mut on_bytes: impl FnMut(&[u8]),
+    mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
+) -> Result<SessionParseCheckpoint>
+where
+    O: ScanObserver,
+{
+    scan_session_file_from_checkpoint_inner(
+        file,
+        session_id,
+        checkpoint,
+        || observer.before_file_open(),
+        |bytes| on_bytes(bytes),
         |event| on_event(event),
     )
 }
@@ -768,6 +792,7 @@ fn scan_session_file_from_checkpoint_inner(
     session_id: &str,
     checkpoint: &SessionParseCheckpoint,
     before_file_open: impl FnOnce(),
+    mut on_bytes: impl FnMut(&[u8]),
     mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
 ) -> Result<SessionParseCheckpoint> {
     before_file_open();
@@ -791,6 +816,7 @@ fn scan_session_file_from_checkpoint_inner(
         let next_offset = offset.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
         let trimmed = trim_ascii_whitespace(&line);
         if trimmed.is_empty() {
+            on_bytes(&line);
             offset = next_offset;
             continue;
         }
@@ -800,6 +826,7 @@ fn scan_session_file_from_checkpoint_inner(
             break;
         }
         if !line_might_affect_usage_bytes(trimmed) {
+            on_bytes(&line);
             offset = next_offset;
             continue;
         }
@@ -815,6 +842,7 @@ fn scan_session_file_from_checkpoint_inner(
         )? {
             on_event(&event);
         }
+        on_bytes(&line);
         offset = next_offset;
     }
     Ok(SessionParseCheckpoint {

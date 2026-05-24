@@ -5,7 +5,10 @@ use super::model::{
     ReportKind, ReportOptions, ReportOutput, ScannerParallelism, SessionRow, Totals,
     UsagePresentation, UsageTotals, explicit_usage,
 };
-use super::scan_runtime::{CliScanBatchRunner, ScanBatchRunner, ScanBehavior, ScanObserver};
+use super::scan_index::{
+    IndexedScanRequest, ScanIndexConfig, scan_selected_session_targets_with_index,
+};
+use super::scan_runtime::{CliScanBatchRunner, ScanBehavior, ScanObserver};
 use super::session_log::{
     SessionParseCheckpoint, TokenUsageEvent, deserialize_optional_cow_lossy,
     deserialize_optional_object_lossy, scan_session_file_from_checkpoint,
@@ -23,7 +26,7 @@ use std::io::{BufRead, BufReader};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Multiplier applied to automatic report-scan worker selection.
 const AUTO_WORKER_MULTIPLIER: usize = 3;
@@ -126,6 +129,7 @@ pub(in crate::app) fn build_report_for_cli(
     kind: ReportKind,
     options: &ReportOptions,
     scan_behavior: ScanBehavior,
+    scan_index: &ScanIndexConfig,
 ) -> Result<ReportOutput> {
     let prepared = prepare_report(kind, options)?;
     let scan_runner = CliScanBatchRunner::new(scan_behavior);
@@ -134,16 +138,50 @@ pub(in crate::app) fn build_report_for_cli(
         &prepared,
         options.parallelism,
         |selected_files, parallelism, kind, timezone, since, until| {
-            scan_runner.run_batch(selected_files.len(), |observer| {
-                scan_selected_session_targets_with_observer(
-                    selected_files,
-                    parallelism,
-                    kind,
-                    timezone,
-                    since,
-                    until,
-                    observer,
-                )
+            scan_selected_session_targets_with_index(&IndexedScanRequest {
+                selected_files,
+                parallelism,
+                kind,
+                timezone,
+                since,
+                until,
+                scan_runner: &scan_runner,
+                config: scan_index,
+            })
+        },
+    )
+}
+
+/// Build the requested report with an explicit persistent scan-index path.
+///
+/// # Errors
+///
+/// Returns an error when normal report preparation or session parsing fails. Scan-index read and
+/// write failures are warnings and fall back to normal scanning.
+pub fn build_report_with_scan_index(
+    kind: ReportKind,
+    options: &ReportOptions,
+    scan_index_path: &Path,
+) -> Result<ReportOutput> {
+    use super::scan_runtime::NoopScanBatchRunner;
+
+    let prepared = prepare_report(kind, options)?;
+    let scan_runner = NoopScanBatchRunner;
+    let scan_index = ScanIndexConfig::with_path(scan_index_path.to_path_buf());
+    build_report_from_prepared_targets(
+        kind,
+        &prepared,
+        options.parallelism,
+        |selected_files, parallelism, kind, timezone, since, until| {
+            scan_selected_session_targets_with_index(&IndexedScanRequest {
+                selected_files,
+                parallelism,
+                kind,
+                timezone,
+                since,
+                until,
+                scan_runner: &scan_runner,
+                config: &scan_index,
             })
         },
     )
@@ -309,6 +347,13 @@ pub(in crate::app) fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(normalize_path_components(&absolute))
 }
 
+/// Convert a session file path into a stable cache key without filesystem canonicalization.
+pub(in crate::app) fn session_target_path_key(path: &Path) -> Result<String> {
+    Ok(normalize_absolute_path(path)?
+        .to_string_lossy()
+        .into_owned())
+}
+
 /// Collapse `.` and `..` components from an already absolute path.
 pub(in crate::app) fn normalize_path_components(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -325,6 +370,53 @@ pub(in crate::app) fn normalize_path_components(path: &Path) -> PathBuf {
     }
 
     normalized
+}
+
+/// Convert `SystemTime` into nanoseconds since Unix epoch.
+fn system_time_to_nanos(value: SystemTime) -> Option<i64> {
+    let nanos = value.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+    i64::try_from(nanos).ok()
+}
+
+/// Return the Unix device identifier for metadata.
+#[cfg(unix)]
+fn metadata_dev(metadata: &fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    i64::try_from(metadata.dev()).ok()
+}
+
+/// Return the Unix device identifier for metadata.
+#[cfg(not(unix))]
+fn metadata_dev(_metadata: &fs::Metadata) -> Option<i64> {
+    None
+}
+
+/// Return the Unix inode identifier for metadata.
+#[cfg(unix)]
+fn metadata_ino(metadata: &fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    i64::try_from(metadata.ino()).ok()
+}
+
+/// Return the Unix inode identifier for metadata.
+#[cfg(not(unix))]
+fn metadata_ino(_metadata: &fs::Metadata) -> Option<i64> {
+    None
+}
+
+/// Return Unix ctime in nanoseconds since epoch for metadata.
+#[cfg(unix)]
+fn metadata_ctime_ns(metadata: &fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    let seconds = i128::from(metadata.ctime());
+    let nanos = i128::from(metadata.ctime_nsec());
+    i64::try_from(seconds.saturating_mul(1_000_000_000) + nanos).ok()
+}
+
+/// Return Unix ctime in nanoseconds since epoch for metadata.
+#[cfg(not(unix))]
+fn metadata_ctime_ns(_metadata: &fs::Metadata) -> Option<i64> {
+    None
 }
 
 /// Recursively collect JSONL files.
@@ -396,6 +488,10 @@ pub(in crate::app) struct SessionScanTarget {
     pub(in crate::app) bytes: u64,
     /// Modification time used as a deterministic tie-breaker.
     pub(in crate::app) modified: Option<SystemTime>,
+    /// Metadata stamp captured during session discovery.
+    pub(in crate::app) metadata: SessionFileMetadata,
+    /// No-filesystem path key used by the persistent scan index.
+    pub(in crate::app) path_key: String,
 }
 
 impl SessionScanTarget {
@@ -405,6 +501,50 @@ impl SessionScanTarget {
             || (self.bytes == existing.bytes
                 && (self.modified > existing.modified
                     || (self.modified == existing.modified && self.path > existing.path)))
+    }
+
+    /// Return this target with a fresh metadata stamp from the selected path.
+    pub(in crate::app) fn refresh_metadata(&self) -> Result<Self> {
+        let metadata = fs::metadata(&self.path)
+            .wrap_err_with(|| format!("failed to refresh session file {}", self.path.display()))?;
+        if !metadata.is_file() {
+            return Err(eyre!(
+                "selected session path is no longer a file: {}",
+                self.path.display()
+            ));
+        }
+        let modified = metadata.modified().ok();
+        Ok(Self {
+            bytes: metadata.len(),
+            modified,
+            metadata: SessionFileMetadata::from_metadata(&metadata, modified),
+            ..self.clone()
+        })
+    }
+}
+
+/// File metadata captured while discovering a session target.
+#[derive(Clone, Debug, Default)]
+pub(in crate::app) struct SessionFileMetadata {
+    /// Modification time in nanoseconds since Unix epoch.
+    pub(in crate::app) mtime_ns: Option<i64>,
+    /// Unix device identifier.
+    pub(in crate::app) dev: Option<i64>,
+    /// Unix inode identifier.
+    pub(in crate::app) ino: Option<i64>,
+    /// Unix ctime in nanoseconds since Unix epoch.
+    pub(in crate::app) ctime_ns: Option<i64>,
+}
+
+impl SessionFileMetadata {
+    /// Build metadata fields from `std::fs::Metadata`.
+    fn from_metadata(metadata: &fs::Metadata, modified: Option<SystemTime>) -> Self {
+        Self {
+            mtime_ns: modified.and_then(system_time_to_nanos),
+            dev: metadata_dev(metadata),
+            ino: metadata_ino(metadata),
+            ctime_ns: metadata_ctime_ns(metadata),
+        }
     }
 }
 
@@ -633,6 +773,44 @@ impl ReportBuilder {
         merge_group_summaries(&mut self.monthly, other.monthly);
         merge_session_summaries(&mut self.session, other.session);
     }
+
+    /// Merge one cached file-local day summary into this report.
+    pub(in crate::app) fn merge_file_day_summary(
+        &mut self,
+        session_key: &str,
+        session_id: &str,
+        local_day: NaiveDate,
+        summary: GroupSummary,
+        last_activity: DateTime<Utc>,
+    ) {
+        if self.since.is_some_and(|since| local_day < since)
+            || self.until.is_some_and(|until| local_day > until)
+        {
+            return;
+        }
+
+        match self.kind {
+            ReportKind::Daily => {
+                let key = local_day.format("%Y-%m-%d").to_string();
+                let target = self.daily.entry(key).or_default();
+                merge_group_summary(target, summary);
+            }
+            ReportKind::Monthly => {
+                let key = local_day.format("%Y-%m").to_string();
+                let target = self.monthly.entry(key).or_default();
+                merge_group_summary(target, summary);
+            }
+            ReportKind::Session => {
+                let target = self
+                    .session
+                    .entry(session_key.to_string())
+                    .or_insert_with(|| SessionSummary::new(last_activity, session_id.to_string()));
+                target.last_activity = target.last_activity.max(last_activity);
+                target.totals.add(&summary.totals);
+                merge_model_breakdowns(&mut target.models, summary.models);
+            }
+        }
+    }
 }
 
 /// Shared report finalization inputs.
@@ -672,11 +850,14 @@ pub(in crate::app) fn resolve_session_target_across_roots(
                 if !session_matches_project_filter(&path, project_filter)? {
                     continue;
                 }
+                let modified = metadata.modified().ok();
                 let candidate = SessionScanTarget {
                     session_id: session_id.to_string(),
+                    path_key: session_target_path_key(&path)?,
                     path,
                     bytes: metadata.len(),
-                    modified: metadata.modified().ok(),
+                    modified,
+                    metadata: SessionFileMetadata::from_metadata(&metadata, modified),
                 };
                 if selected
                     .as_ref()
@@ -1305,9 +1486,11 @@ pub(in crate::app) fn register_session_target(
     let session_id = session_file_id(root, &path);
     let candidate = SessionScanTarget {
         session_id: session_id.clone(),
+        path_key: session_target_path_key(&path)?,
         path,
         bytes: metadata.len(),
         modified,
+        metadata: SessionFileMetadata::from_metadata(&metadata, modified),
     };
     let should_replace = selected_files
         .get(&session_id)

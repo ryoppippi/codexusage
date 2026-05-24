@@ -8,6 +8,7 @@ use super::model::{
 };
 use super::render::render_report;
 use super::report::{build_report_for_cli, default_timezone_name};
+use super::scan_index::ScanIndexConfig;
 use super::watch::{cli_scan_behavior, run_watch_loop, validate_watch_flags};
 use clap::{Args, Parser, Subcommand};
 use eyre::{Result, WrapErr};
@@ -76,6 +77,25 @@ impl ProjectCliOptions {
     }
 }
 
+/// CLI-only scan-index flag group.
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::app) struct ScanIndexCliOptions {
+    /// Disable the persistent scan index for report commands.
+    #[arg(long, global = true)]
+    pub(in crate::app) no_scan_index: bool,
+}
+
+impl ScanIndexCliOptions {
+    /// Convert parsed scan-index flags into report scan-index configuration.
+    pub(in crate::app) const fn config(self) -> ScanIndexConfig {
+        if self.no_scan_index {
+            ScanIndexConfig::disabled()
+        } else {
+            ScanIndexConfig::enabled()
+        }
+    }
+}
+
 /// Debug-only runtime options parsed by the CLI in development builds.
 #[cfg(debug_assertions)]
 #[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -120,6 +140,7 @@ where
         project,
         session_dir,
         threads,
+        scan_index,
         command,
         ..
     } = cli;
@@ -135,22 +156,25 @@ where
             per_model_burn_rate,
         }) => {
             validate_watch_flags(json, since.as_deref(), until.as_deref(), last_days)?;
-            run_watch_loop(&WatchOptions {
-                timezone,
-                locale,
-                number_format,
-                offline,
-                refresh_pricing,
-                cached_input_cost_mode,
-                cache_read_mode,
-                session_dirs: session_dir,
-                project_dir,
-                parallelism,
-                interval,
-                show_model_burn_rate: per_model_burn_rate,
-                #[cfg(debug_assertions)]
-                debug,
-            })
+            run_watch_loop(
+                &WatchOptions {
+                    timezone,
+                    locale,
+                    number_format,
+                    offline,
+                    refresh_pricing,
+                    cached_input_cost_mode,
+                    cache_read_mode,
+                    session_dirs: session_dir,
+                    project_dir,
+                    parallelism,
+                    interval,
+                    show_model_burn_rate: per_model_burn_rate,
+                    #[cfg(debug_assertions)]
+                    debug,
+                },
+                &scan_index.config(),
+            )
         }
         command => {
             let kind = command
@@ -176,7 +200,7 @@ where
             let scan_behavior = cli_scan_behavior(true, debug.simulate_slow_disk);
             #[cfg(not(debug_assertions))]
             let scan_behavior = cli_scan_behavior(true);
-            let output = build_report_for_cli(kind, &options, scan_behavior)?;
+            let output = build_report_for_cli(kind, &options, scan_behavior, &scan_index.config())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
@@ -249,6 +273,9 @@ pub(in crate::app) struct Cli {
     /// Scanner worker count. Use `1` for single-threaded profiling runs.
     #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(NonZeroUsize))]
     pub(in crate::app) threads: Option<NonZeroUsize>,
+    /// Persistent scan-index options.
+    #[command(flatten)]
+    pub(in crate::app) scan_index: ScanIndexCliOptions,
     /// Debug-only runtime options for development builds.
     #[cfg(debug_assertions)]
     #[command(flatten)]

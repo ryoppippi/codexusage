@@ -4,8 +4,8 @@ use super::codex_limits::{
     CodexLimitStatus, codex_limit_status_for_watch_start, fetch_codex_limits,
 };
 use super::model::{
-    BurnRateHistoryPoint, BurnRateSnapshot, ScannerParallelism, Totals, UsagePresentation,
-    UsageTotals, WatchOptions, WatchSnapshot,
+    BurnRateHistoryPoint, BurnRateSnapshot, ReportKind, ScannerParallelism, Totals,
+    UsagePresentation, UsageTotals, WatchOptions, WatchSnapshot,
 };
 use super::render::render_watch_screen_with_limits;
 use super::report::{
@@ -14,6 +14,9 @@ use super::report::{
     parse_timezone, push_usage_into_breakdown, remove_usage_from_breakdown,
     resolve_scan_worker_count, resolve_session_dirs, resolve_session_target_across_roots,
     session_file_id, to_sorted_models,
+};
+use super::scan_index::{
+    IndexedScanRequest, ScanIndexConfig, update_selected_session_targets_in_index,
 };
 #[cfg(test)]
 use super::scan_runtime::NoopScanBatchRunner;
@@ -127,6 +130,20 @@ pub(in crate::app) struct WatchChangeSet {
     pub(in crate::app) dirty_sessions: HashMap<String, WatchDirtyKind>,
     /// Whether the full session tree should be rediscovered.
     pub(in crate::app) discovery_due: bool,
+}
+
+/// Scan settings shared by one watch refresh.
+#[derive(Clone, Copy)]
+struct WatchScanContext<'a, R>
+where
+    R: ScanBatchRunner,
+{
+    /// Scanner worker configuration.
+    parallelism: ScannerParallelism,
+    /// Runtime scan observer provider.
+    scan_runner: &'a R,
+    /// Persistent scan-index configuration.
+    scan_index: &'a ScanIndexConfig,
 }
 
 /// Refresh policy selected for one dirty watched session.
@@ -349,7 +366,10 @@ pub(in crate::app) fn watch_event_session_ids(
 }
 
 /// Run the live watch loop until interrupted.
-pub(in crate::app) fn run_watch_loop(options: &WatchOptions) -> Result<()> {
+pub(in crate::app) fn run_watch_loop(
+    options: &WatchOptions,
+    scan_index: &ScanIndexConfig,
+) -> Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err(eyre!("watch mode requires a terminal stdout"));
     }
@@ -376,24 +396,14 @@ pub(in crate::app) fn run_watch_loop(options: &WatchOptions) -> Result<()> {
     let timezone = parse_timezone(&options.timezone)?;
     let session_dirs = resolve_session_dirs(&options.session_dirs);
     let project_filter = ProjectFilter::from_path_option(options.project_dir.as_deref())?;
-    #[cfg(debug_assertions)]
-    let startup_scan_behavior = cli_scan_behavior(true, options.debug.simulate_slow_disk);
-    #[cfg(not(debug_assertions))]
-    let startup_scan_behavior = cli_scan_behavior(true);
-    #[cfg(debug_assertions)]
-    let refresh_scan_behavior = cli_scan_behavior(false, options.debug.simulate_slow_disk);
-    #[cfg(not(debug_assertions))]
-    let refresh_scan_behavior = cli_scan_behavior(false);
-    let startup_scan_runner = CliScanBatchRunner::new(startup_scan_behavior);
-    let refresh_scan_runner = CliScanBatchRunner::new(refresh_scan_behavior);
+    let (startup_scan_runner, refresh_scan_runner) = watch_scan_runners(options);
     let mut watch_events = WatchEventSource::new(&session_dirs)?;
     let mut runtime = WatchRuntimeState::load_with_scan_runner(
         &session_dirs,
         project_filter.as_ref(),
-        options.parallelism,
         timezone,
         Utc::now(),
-        &startup_scan_runner,
+        &watch_scan_context(options.parallelism, &startup_scan_runner, scan_index),
     )?;
     let mut last_pricing_refresh_attempt_at = startup_refresh_attempted.then_some(now);
     let (mut codex_limit_status, mut last_codex_limit_refresh_attempt_at) =
@@ -428,10 +438,9 @@ pub(in crate::app) fn run_watch_loop(options: &WatchOptions) -> Result<()> {
         runtime.refresh_with_scan_runner(
             &session_dirs,
             project_filter.as_ref(),
-            options.parallelism,
             snapshot_now,
             changes,
-            &refresh_scan_runner,
+            &watch_scan_context(options.parallelism, &refresh_scan_runner, scan_index),
         )?;
         let snapshot = runtime.snapshot(
             &pricing,
@@ -446,10 +455,49 @@ pub(in crate::app) fn run_watch_loop(options: &WatchOptions) -> Result<()> {
             &codex_limit_status,
             snapshot_now.timestamp(),
         )?;
+        runtime.flush_pending_scan_index_updates(&watch_scan_context(
+            options.parallelism,
+            &refresh_scan_runner,
+            scan_index,
+        ));
         thread::sleep(remaining_watch_sleep(
             options.interval,
             loop_started_at.elapsed(),
         ));
+    }
+}
+
+/// Build startup and steady-state scan runners for watch mode.
+#[cfg(debug_assertions)]
+fn watch_scan_runners(options: &WatchOptions) -> (CliScanBatchRunner, CliScanBatchRunner) {
+    (
+        CliScanBatchRunner::new(cli_scan_behavior(true, options.debug.simulate_slow_disk)),
+        CliScanBatchRunner::new(cli_scan_behavior(false, options.debug.simulate_slow_disk)),
+    )
+}
+
+/// Build startup and steady-state scan runners for watch mode.
+#[cfg(not(debug_assertions))]
+fn watch_scan_runners(_options: &WatchOptions) -> (CliScanBatchRunner, CliScanBatchRunner) {
+    (
+        CliScanBatchRunner::new(cli_scan_behavior(true)),
+        CliScanBatchRunner::new(cli_scan_behavior(false)),
+    )
+}
+
+/// Build one watch scan context.
+fn watch_scan_context<'a, R>(
+    parallelism: ScannerParallelism,
+    scan_runner: &'a R,
+    scan_index: &'a ScanIndexConfig,
+) -> WatchScanContext<'a, R>
+where
+    R: ScanBatchRunner,
+{
+    WatchScanContext {
+        parallelism,
+        scan_runner,
+        scan_index,
     }
 }
 
@@ -1011,6 +1059,8 @@ pub(in crate::app) struct WatchRuntimeState {
     last_snapshot_utc: Option<DateTime<Utc>>,
     /// Next time watch mode should rediscover the session tree.
     next_discovery_at: Option<Instant>,
+    /// Watch-parsed files whose report scan-index rows should be refreshed after rendering.
+    pending_index_updates: Vec<SessionScanTarget>,
 }
 
 impl WatchRuntimeState {
@@ -1026,10 +1076,36 @@ impl WatchRuntimeState {
         Self::load_with_scan_runner(
             session_dirs,
             project_filter,
-            parallelism,
             timezone,
             now_utc,
-            &NoopScanBatchRunner,
+            &WatchScanContext {
+                parallelism,
+                scan_runner: &NoopScanBatchRunner,
+                scan_index: &ScanIndexConfig::disabled(),
+            },
+        )
+    }
+
+    /// Load the initial runtime state while using the persistent scan index.
+    #[cfg(test)]
+    pub(in crate::app) fn load_with_scan_index(
+        session_dirs: &[PathBuf],
+        project_filter: Option<&ProjectFilter>,
+        parallelism: ScannerParallelism,
+        timezone: Tz,
+        now_utc: DateTime<Utc>,
+        scan_index: &ScanIndexConfig,
+    ) -> Result<Self> {
+        Self::load_with_scan_runner(
+            session_dirs,
+            project_filter,
+            timezone,
+            now_utc,
+            &WatchScanContext {
+                parallelism,
+                scan_runner: &NoopScanBatchRunner,
+                scan_index,
+            },
         )
     }
 
@@ -1037,10 +1113,9 @@ impl WatchRuntimeState {
     fn load_with_scan_runner<R>(
         session_dirs: &[PathBuf],
         project_filter: Option<&ProjectFilter>,
-        parallelism: ScannerParallelism,
         timezone: Tz,
         now_utc: DateTime<Utc>,
-        scan_runner: &R,
+        scan: &WatchScanContext<'_, R>,
     ) -> Result<Self>
     where
         R: ScanBatchRunner,
@@ -1055,17 +1130,17 @@ impl WatchRuntimeState {
             burn_window_summary: GroupSummary::default(),
             last_snapshot_utc: None,
             next_discovery_at: None,
+            pending_index_updates: Vec::new(),
         };
         state.refresh_with_scan_runner(
             session_dirs,
             project_filter,
-            parallelism,
             now_utc,
             WatchChangeSet {
                 dirty_sessions: HashMap::new(),
                 discovery_due: true,
             },
-            scan_runner,
+            scan,
         )?;
         Ok(state)
     }
@@ -1083,11 +1158,52 @@ impl WatchRuntimeState {
         self.refresh_with_scan_runner(
             session_dirs,
             project_filter,
-            parallelism,
             now_utc,
             changes,
-            &NoopScanBatchRunner,
+            &WatchScanContext {
+                parallelism,
+                scan_runner: &NoopScanBatchRunner,
+                scan_index: &ScanIndexConfig::disabled(),
+            },
         )
+    }
+
+    /// Refresh cached file data while using the persistent scan index.
+    #[cfg(test)]
+    pub(in crate::app) fn refresh_with_scan_index(
+        &mut self,
+        session_dirs: &[PathBuf],
+        project_filter: Option<&ProjectFilter>,
+        parallelism: ScannerParallelism,
+        now_utc: DateTime<Utc>,
+        changes: WatchChangeSet,
+        scan_index: &ScanIndexConfig,
+    ) -> Result<()> {
+        self.refresh_with_scan_runner(
+            session_dirs,
+            project_filter,
+            now_utc,
+            changes,
+            &WatchScanContext {
+                parallelism,
+                scan_runner: &NoopScanBatchRunner,
+                scan_index,
+            },
+        )
+    }
+
+    /// Flush queued scan-index updates using the persistent scan index.
+    #[cfg(test)]
+    pub(in crate::app) fn flush_pending_scan_index_updates_with_scan_index(
+        &mut self,
+        parallelism: ScannerParallelism,
+        scan_index: &ScanIndexConfig,
+    ) {
+        self.flush_pending_scan_index_updates(&WatchScanContext {
+            parallelism,
+            scan_runner: &NoopScanBatchRunner,
+            scan_index,
+        });
     }
 
     /// Refresh cached file data for the current watch tick with the provided batch runner.
@@ -1095,10 +1211,9 @@ impl WatchRuntimeState {
         &mut self,
         session_dirs: &[PathBuf],
         project_filter: Option<&ProjectFilter>,
-        parallelism: ScannerParallelism,
         now_utc: DateTime<Utc>,
         mut changes: WatchChangeSet,
-        scan_runner: &R,
+        scan: &WatchScanContext<'_, R>,
     ) -> Result<()>
     where
         R: ScanBatchRunner,
@@ -1112,6 +1227,7 @@ impl WatchRuntimeState {
             self.burn_window_summary = GroupSummary::default();
             self.last_snapshot_utc = None;
             self.next_discovery_at = None;
+            self.pending_index_updates.clear();
             changes.discovery_due = true;
         }
 
@@ -1128,12 +1244,11 @@ impl WatchRuntimeState {
             self.missing_directories = missing_directories;
             self.next_discovery_at = Some(refresh_started_at + WATCH_DISCOVERY_INTERVAL);
             self.refresh_discovered_targets(
-                parallelism,
                 self.timezone,
                 now_utc,
                 selected_files,
                 &changes.dirty_sessions,
-                scan_runner,
+                scan,
             )?;
         } else {
             self.missing_directories = collect_missing_session_dirs(session_dirs)?;
@@ -1146,7 +1261,7 @@ impl WatchRuntimeState {
                     dirty_kind,
                     self.timezone,
                     now_utc,
-                    scan_runner,
+                    scan,
                 )?;
             }
         }
@@ -1210,12 +1325,11 @@ impl WatchRuntimeState {
     /// Refresh the tracked set of selected files after a full discovery pass.
     fn refresh_discovered_targets<R>(
         &mut self,
-        parallelism: ScannerParallelism,
         timezone: Tz,
         now_utc: DateTime<Utc>,
         selected_files: Vec<SessionScanTarget>,
         dirty_sessions: &HashMap<String, WatchDirtyKind>,
-        scan_runner: &R,
+        scan: &WatchScanContext<'_, R>,
     ) -> Result<()>
     where
         R: ScanBatchRunner,
@@ -1232,21 +1346,30 @@ impl WatchRuntimeState {
                 Some(cached) if !is_dirty && same_watch_target(&cached.target, &target) => {
                     next_cached_files.insert(session_id, cached);
                 }
-                Some(_) | None => {
+                Some(_) | None
+                    if watch_target_may_have_relevant_events(&target, timezone, now_utc)? =>
+                {
                     full_rebuild_targets.push(target);
                 }
+                Some(_) | None => {}
             }
         }
 
-        for cached_file in scan_runner.run_batch(full_rebuild_targets.len(), |observer| {
-            load_cached_watch_files_with_observer(
-                &full_rebuild_targets,
-                parallelism,
-                timezone,
-                now_utc,
-                observer,
-            )
-        })? {
+        for cached_file in scan
+            .scan_runner
+            .run_batch(full_rebuild_targets.len(), |observer| {
+                load_cached_watch_files_with_observer(
+                    &full_rebuild_targets,
+                    scan.parallelism,
+                    timezone,
+                    now_utc,
+                    observer,
+                )
+            })?
+        {
+            if scan.scan_index.enabled {
+                self.pending_index_updates.push(cached_file.target.clone());
+            }
             next_cached_files.insert(cached_file.target.session_id.clone(), cached_file);
         }
 
@@ -1263,7 +1386,7 @@ impl WatchRuntimeState {
         dirty_kind: WatchDirtyKind,
         timezone: Tz,
         now_utc: DateTime<Utc>,
-        scan_runner: &R,
+        scan: &WatchScanContext<'_, R>,
     ) -> Result<()>
     where
         R: ScanBatchRunner,
@@ -1280,7 +1403,7 @@ impl WatchRuntimeState {
                     && target.bytes > cached.target.bytes
                     && cached.parser_checkpoint.offset == cached.target.bytes =>
             {
-                scan_runner.run_batch(1, |observer| {
+                scan.scan_runner.run_batch(1, |observer| {
                     append_cached_watch_file_with_observer(
                         &mut cached,
                         target,
@@ -1293,15 +1416,21 @@ impl WatchRuntimeState {
                 add_cached_watch_file_to_runtime(self, &cached);
                 self.selected_targets
                     .insert(session_id, cached.target.clone());
+                if scan.scan_index.enabled {
+                    self.pending_index_updates.push(cached.target.clone());
+                }
                 self.cached_files
                     .insert(cached.target.session_id.clone(), cached);
             }
             (_existing, Some(target), _) => {
-                let cached = scan_runner.run_batch(1, |observer| {
+                let cached = scan.scan_runner.run_batch(1, |observer| {
                     build_cached_watch_file_with_observer(&target, timezone, now_utc, observer)
                 })?;
                 add_cached_watch_file_to_runtime(self, &cached);
                 self.selected_targets.insert(session_id, target);
+                if scan.scan_index.enabled {
+                    self.pending_index_updates.push(cached.target.clone());
+                }
                 self.cached_files
                     .insert(cached.target.session_id.clone(), cached);
             }
@@ -1310,6 +1439,31 @@ impl WatchRuntimeState {
             }
         }
         Ok(())
+    }
+
+    /// Flush queued scan-index writes without letting cache failures stop watch mode.
+    fn flush_pending_scan_index_updates<R>(&mut self, scan: &WatchScanContext<'_, R>)
+    where
+        R: ScanBatchRunner,
+    {
+        if !scan.scan_index.enabled || self.pending_index_updates.is_empty() {
+            self.pending_index_updates.clear();
+            return;
+        }
+
+        let mut by_session = HashMap::new();
+        for target in self.pending_index_updates.drain(..) {
+            by_session.insert(target.session_id.clone(), target);
+        }
+        let targets = by_session.into_values().collect::<Vec<_>>();
+        update_scan_index_for_watch_targets(
+            &targets,
+            scan.parallelism,
+            self.timezone,
+            self.current_day,
+            scan.scan_runner,
+            scan.scan_index,
+        );
     }
 
     /// Build one watch snapshot from the cached aggregate summaries.
@@ -1345,6 +1499,50 @@ impl WatchRuntimeState {
 /// Return whether two selected watch targets represent the same unchanged file.
 fn same_watch_target(left: &SessionScanTarget, right: &SessionScanTarget) -> bool {
     left.path == right.path && left.bytes == right.bytes && left.modified == right.modified
+}
+
+/// Return whether a selected file can contain events needed by the current watch view.
+fn watch_target_may_have_relevant_events(
+    target: &SessionScanTarget,
+    timezone: Tz,
+    now_utc: DateTime<Utc>,
+) -> Result<bool> {
+    let Some(mtime_ns) = target.metadata.mtime_ns else {
+        return Ok(true);
+    };
+    let history_start_ns = watch_history_start_utc(timezone, now_utc)?
+        .timestamp_nanos_opt()
+        .ok_or_else(|| eyre!("watch history start is outside the supported timestamp range"))?;
+    Ok(mtime_ns >= history_start_ns)
+}
+
+/// Update the persistent report scan index for files that watch mode is already parsing.
+fn update_scan_index_for_watch_targets<R>(
+    targets: &[SessionScanTarget],
+    parallelism: ScannerParallelism,
+    timezone: Tz,
+    current_day: NaiveDate,
+    scan_runner: &R,
+    scan_index: &ScanIndexConfig,
+) where
+    R: ScanBatchRunner,
+{
+    if targets.is_empty() || !scan_index.enabled {
+        return;
+    }
+
+    if let Err(error) = update_selected_session_targets_in_index(&IndexedScanRequest {
+        selected_files: targets,
+        parallelism,
+        kind: ReportKind::Daily,
+        timezone,
+        since: Some(current_day),
+        until: Some(current_day),
+        scan_runner,
+        config: scan_index,
+    }) {
+        eprintln!("Warning: failed to update scan index from watch refresh: {error:#}");
+    }
 }
 
 /// Parse all retained graph/current-day events from one session file for watch-mode caching.

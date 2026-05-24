@@ -91,6 +91,82 @@ fn session_payload_with_cwd(cwd: &Path, input_tokens: u64) -> String {
     .join("\n")
 }
 
+fn report_options_for_sessions(session_dir: &Path) -> ReportOptions {
+    ReportOptions {
+        since: None,
+        until: None,
+        last_days: None,
+        timezone: "UTC".to_string(),
+        locale: "en-US".to_string(),
+        number_format: NumberFormat::Short,
+        json: true,
+        offline: true,
+        refresh_pricing: false,
+        cached_input_cost_mode: CachedInputCostMode::Priced,
+        cache_read_mode: CacheReadMode::Include,
+        session_dirs: vec![session_dir.to_path_buf()],
+        project_dir: None,
+        parallelism: ScannerParallelism::Auto,
+    }
+}
+
+fn write_scan_index_session(session_file: &Path, total_input: u64, total_output: u64) {
+    fs::create_dir_all(session_file.parent().expect("session parent")).expect("mkdir");
+    let usage = json!({
+        "timestamp": "2026-01-02T00:05:00Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": total_input,
+                    "cached_input_tokens": 0,
+                    "output_tokens": total_output,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": total_input + total_output,
+                }
+            }
+        }
+    });
+    fs::write(
+        session_file,
+        format!("{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5\"}}}}\n{usage}\n"),
+    )
+    .expect("write session");
+}
+
+fn report_total_tokens(output: &ReportOutput) -> u64 {
+    match output {
+        ReportOutput::Daily { totals, .. }
+        | ReportOutput::Monthly { totals, .. }
+        | ReportOutput::Session { totals, .. } => totals.total_tokens,
+    }
+}
+
+fn assert_scan_index_file_totals(index_path: &Path, expected_size: u64, expected_total: i64) {
+    let connection = rusqlite::Connection::open(index_path).expect("open scan index");
+    let (size, total): (i64, i64) = connection
+        .query_row("SELECT size, total_tokens FROM files", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("indexed file row");
+    assert_eq!(
+        size,
+        i64::try_from(expected_size).expect("file size fits i64")
+    );
+    assert_eq!(total, expected_total);
+
+    let aggregate_total = connection
+        .query_row(
+            "SELECT SUM(total_tokens) FROM file_aggregates WHERE group_kind = 'day'",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .expect("indexed aggregate row")
+        .expect("aggregate total");
+    assert_eq!(aggregate_total, expected_total);
+}
+
 fn watch_snapshot_with_models(models: BTreeMap<String, ModelBreakdown>) -> WatchSnapshot {
     WatchSnapshot {
         date: "2026-01-02".to_string(),
@@ -1753,6 +1829,65 @@ fn build_watch_snapshot_graph_uses_true_past_horizon_across_midnight() {
 }
 
 #[test]
+fn build_watch_snapshot_skips_files_older_than_history_window() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let old_file = sessions.join("old").join("session.jsonl");
+    let recent_file = sessions.join("recent").join("session.jsonl");
+    fs::create_dir_all(old_file.parent().expect("old parent")).expect("mkdir old");
+    fs::create_dir_all(recent_file.parent().expect("recent parent")).expect("mkdir recent");
+    fs::write(
+        &old_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"bad-timestamp\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":999,\"output_tokens\":1,\"total_tokens\":1000}}}}\n",
+        ),
+    )
+    .expect("write old file");
+    fs::write(
+        &recent_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n",
+        ),
+    )
+    .expect("write recent file");
+    let old_mtime = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+        .expect("old mtime")
+        .timestamp();
+    let recent_mtime = DateTime::parse_from_rfc3339("2026-01-02T00:10:00Z")
+        .expect("recent mtime")
+        .timestamp();
+    filetime::set_file_mtime(&old_file, FileTime::from_unix_time(old_mtime, 0))
+        .expect("set old mtime");
+    filetime::set_file_mtime(&recent_file, FileTime::from_unix_time(recent_mtime, 0))
+        .expect("set recent mtime");
+
+    let now = DateTime::parse_from_rfc3339("2026-01-02T00:30:00Z")
+        .expect("timestamp")
+        .with_timezone(&Utc);
+    let runtime = WatchRuntimeState::load(
+        std::slice::from_ref(&sessions),
+        None,
+        ScannerParallelism::Auto,
+        chrono_tz::UTC,
+        now,
+    )
+    .expect("watch runtime");
+    let snapshot = runtime
+        .snapshot(
+            &PricingCatalog::default(),
+            UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
+            now,
+            false,
+        )
+        .expect("watch snapshot");
+
+    assert_eq!(snapshot.totals.input_tokens, 20);
+    assert_eq!(snapshot.totals.total_tokens, 23);
+}
+
+#[test]
 fn build_watch_snapshot_respects_project_dir_filter() {
     let temp = TempDir::new().expect("tempdir");
     let sessions = temp.path().join("sessions");
@@ -1994,6 +2129,74 @@ fn watch_runtime_refreshes_dirty_session_after_append() {
 }
 
 #[test]
+fn watch_runtime_updates_scan_index_on_startup_and_append() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    let session_file = sessions.join("today").join("session.jsonl");
+    fs::create_dir_all(session_file.parent().expect("parent")).expect("mkdir");
+    let initial_payload = concat!(
+        "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+        "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}}\n"
+    );
+    fs::write(&session_file, initial_payload).expect("write session");
+
+    let timezone = chrono_tz::UTC;
+    let now = DateTime::parse_from_rfc3339("2026-01-02T00:30:00Z")
+        .expect("timestamp")
+        .with_timezone(&Utc);
+    let scan_index = ScanIndexConfig::with_path(index_path.clone());
+    let mut runtime = WatchRuntimeState::load_with_scan_index(
+        std::slice::from_ref(&sessions),
+        None,
+        ScannerParallelism::Auto,
+        timezone,
+        now,
+        &scan_index,
+    )
+    .expect("runtime");
+    runtime.flush_pending_scan_index_updates_with_scan_index(ScannerParallelism::Auto, &scan_index);
+    assert_scan_index_file_totals(
+        &index_path,
+        session_file.metadata().expect("metadata").len(),
+        23,
+    );
+
+    fs::write(
+        &session_file,
+        format!(
+            "{initial_payload}{}",
+            "{\"timestamp\":\"2026-01-02T00:20:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":5,\"output_tokens\":1,\"total_tokens\":6}}}}\n"
+        ),
+    )
+    .expect("append session");
+
+    runtime
+        .refresh_with_scan_index(
+            std::slice::from_ref(&sessions),
+            None,
+            ScannerParallelism::Auto,
+            now,
+            WatchChangeSet {
+                dirty_sessions: HashMap::from([(
+                    "today/session".to_string(),
+                    WatchDirtyKind::AppendOnly,
+                )]),
+                discovery_due: false,
+            },
+            &scan_index,
+        )
+        .expect("refresh dirty session");
+    runtime.flush_pending_scan_index_updates_with_scan_index(ScannerParallelism::Auto, &scan_index);
+
+    assert_scan_index_file_totals(
+        &index_path,
+        session_file.metadata().expect("metadata").len(),
+        29,
+    );
+}
+
+#[test]
 fn watch_runtime_rebuilds_longer_rewritten_file_instead_of_appending() {
     let temp = TempDir::new().expect("tempdir");
     let sessions = temp.path().join("sessions");
@@ -2226,6 +2429,268 @@ fn scan_session_file_from_checkpoint_retries_unterminated_jsonl_record() {
 }
 
 #[test]
+fn scan_index_rebuilds_grown_file_after_prefix_rewrite() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    fs::create_dir_all(session_file.parent().expect("session parent")).expect("mkdir");
+    fs::write(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":110}}}}\n",
+        ),
+    )
+    .expect("write initial session");
+    let options = report_options_for_sessions(&sessions);
+
+    let initial = build_report_with_scan_index(ReportKind::Daily, &options, &index_path)
+        .expect("initial indexed report");
+    assert_eq!(report_total_tokens(&initial), 110);
+
+    fs::write(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":300,\"cached_input_tokens\":0,\"output_tokens\":40,\"reasoning_output_tokens\":0,\"total_tokens\":340}}}}\n",
+            "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":60,\"cached_input_tokens\":0,\"output_tokens\":7,\"reasoning_output_tokens\":0,\"total_tokens\":67}}}}\n",
+        ),
+    )
+    .expect("rewrite and grow session");
+
+    let rebuilt = build_report_with_scan_index(ReportKind::Daily, &options, &index_path)
+        .expect("rebuilt indexed report");
+    assert_eq!(report_total_tokens(&rebuilt), 407);
+}
+
+#[test]
+fn scan_index_rebuilds_rewritten_file() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    let options = report_options_for_sessions(&sessions);
+    write_scan_index_session(&session_file, 100, 10);
+    let initial = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("initial indexed report");
+    assert_eq!(report_total_tokens(&initial), 110);
+
+    write_scan_index_session(&session_file, 300, 40);
+    fs::write(
+        &session_file,
+        format!(
+            "{}{}",
+            fs::read_to_string(&session_file).expect("read session"),
+            "{\"type\":\"response_item\",\"payload\":{\"text\":\"rewrite marker\"}}\n",
+        ),
+    )
+    .expect("rewrite larger session");
+
+    let rebuilt = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("rebuilt indexed report");
+    assert_eq!(report_total_tokens(&rebuilt), 340);
+}
+
+#[test]
+fn scan_index_cached_reports_match_full_reports() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let first_file = sessions.join("project").join("first.jsonl");
+    let second_file = sessions.join("project").join("second.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    write_scan_index_session(&first_file, 100, 10);
+    fs::create_dir_all(second_file.parent().expect("second parent")).expect("mkdir");
+    fs::write(
+        &second_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-31T23:55:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":30,\"cached_input_tokens\":0,\"output_tokens\":3,\"reasoning_output_tokens\":0,\"total_tokens\":33}}}}\n",
+            "{\"timestamp\":\"2026-02-01T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":70,\"cached_input_tokens\":0,\"output_tokens\":7,\"reasoning_output_tokens\":0,\"total_tokens\":77}}}}\n",
+        ),
+    )
+    .expect("write second session");
+    let options = report_options_for_sessions(&sessions);
+
+    for kind in [ReportKind::Daily, ReportKind::Monthly, ReportKind::Session] {
+        let full = build_report(kind, &options).expect("full report");
+        let _warm =
+            build_report_with_scan_index(kind, &options, &index_path).expect("warm indexed report");
+        let cached = build_report_with_scan_index(kind, &options, &index_path)
+            .expect("cached indexed report");
+        assert_eq!(cached, full);
+    }
+}
+
+#[test]
+fn scan_index_revalidates_cached_file_after_discovery() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    write_scan_index_session(&session_file, 100, 10);
+    let options = report_options_for_sessions(&sessions);
+    let initial = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("initial indexed report");
+    assert_eq!(report_total_tokens(&initial), 110);
+
+    let (_missing, selected_files) =
+        collect_session_scan_targets(std::slice::from_ref(&sessions), None)
+            .expect("collect stale targets");
+    fs::write(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":110}}}}\n",
+            "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":160,\"cached_input_tokens\":0,\"output_tokens\":15,\"reasoning_output_tokens\":0,\"total_tokens\":175}}}}\n",
+        ),
+    )
+    .expect("append after discovery");
+
+    let scan_runner = NoopScanBatchRunner;
+    let scan_index = ScanIndexConfig::with_path(index_path);
+    let builder = scan_selected_session_targets_with_index(&IndexedScanRequest {
+        selected_files: &selected_files,
+        parallelism: ScannerParallelism::Auto,
+        kind: ReportKind::Session,
+        timezone: chrono_tz::UTC,
+        since: None,
+        until: None,
+        scan_runner: &scan_runner,
+        config: &scan_index,
+    })
+    .expect("indexed scan");
+    let report = builder
+        .finish(
+            &PricingCatalog::default(),
+            UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
+            Vec::new(),
+        )
+        .expect("finish report");
+
+    assert_eq!(report_total_tokens(&report), 175);
+}
+
+#[test]
+fn scan_index_falls_back_when_database_is_invalid() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    write_scan_index_session(&session_file, 100, 10);
+    fs::write(&index_path, "not a sqlite database").expect("write invalid database");
+    let options = report_options_for_sessions(&sessions);
+
+    let report = build_report_with_scan_index(ReportKind::Monthly, &options, &index_path)
+        .expect("report should fall back");
+
+    assert_eq!(report_total_tokens(&report), 110);
+}
+
+#[test]
+fn scan_index_rebuilds_inconsistent_checkpoint_row() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    write_scan_index_session(&session_file, 100, 10);
+    let options = report_options_for_sessions(&sessions);
+    let _warm = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("warm indexed report");
+    let connection = rusqlite::Connection::open(&index_path).expect("open index");
+    connection
+        .execute(
+            "UPDATE files SET checkpoint_offset = 0, content_hash = ?1",
+            ["cbf29ce48422232584222325cbf29ce4"],
+        )
+        .expect("corrupt checkpoint");
+    fs::write(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":110}}}}\n",
+            "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":160,\"cached_input_tokens\":0,\"output_tokens\":15,\"reasoning_output_tokens\":0,\"total_tokens\":175}}}}\n",
+        ),
+    )
+    .expect("append cumulative usage");
+
+    let rebuilt = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("rebuilt indexed report");
+
+    assert_eq!(report_total_tokens(&rebuilt), 175);
+}
+
+#[test]
+fn scan_index_rebuilds_malformed_non_ascii_hash_row() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    write_scan_index_session(&session_file, 100, 10);
+    let options = report_options_for_sessions(&sessions);
+    let _warm = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("warm indexed report");
+    let malformed_hash = format!("{}é{}", "a".repeat(15), "b".repeat(15));
+    assert_eq!(malformed_hash.len(), 32);
+    let connection = rusqlite::Connection::open(&index_path).expect("open index");
+    connection
+        .execute(
+            "UPDATE files SET content_hash = ?1",
+            rusqlite::params![malformed_hash],
+        )
+        .expect("corrupt content hash");
+    drop(connection);
+
+    let rebuilt = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("rebuilt indexed report");
+
+    assert_eq!(report_total_tokens(&rebuilt), 110);
+}
+
+#[test]
+fn scan_index_parallel_append_writers_do_not_double_apply_delta() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    write_scan_index_session(&session_file, 100, 10);
+    let options = report_options_for_sessions(&sessions);
+    let _initial = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("initial indexed report");
+    fs::write(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":110}}}}\n",
+            "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":160,\"cached_input_tokens\":0,\"output_tokens\":15,\"reasoning_output_tokens\":0,\"total_tokens\":175}}}}\n",
+        ),
+    )
+    .expect("append cumulative usage");
+
+    let first_options = options.clone();
+    let first_index = index_path.clone();
+    let first = std::thread::spawn(move || {
+        build_report_with_scan_index(ReportKind::Session, &first_options, &first_index)
+    });
+    let second_options = options.clone();
+    let second_index = index_path.clone();
+    let second = std::thread::spawn(move || {
+        build_report_with_scan_index(ReportKind::Session, &second_options, &second_index)
+    });
+    let first_report = first.join().expect("first worker").expect("first report");
+    let second_report = second
+        .join()
+        .expect("second worker")
+        .expect("second report");
+    let cached = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("cached report");
+
+    assert_eq!(report_total_tokens(&first_report), 175);
+    assert_eq!(report_total_tokens(&second_report), 175);
+    assert_eq!(report_total_tokens(&cached), 175);
+}
+
+#[test]
 fn cached_watch_file_burn_events_skip_older_history() {
     let event = |timestamp: &str, total: u64| OwnedWatchEvent {
         timestamp_utc: DateTime::parse_from_rfc3339(timestamp)
@@ -2244,9 +2709,11 @@ fn cached_watch_file_burn_events_skip_older_history() {
     let cached = CachedWatchFile {
         target: SessionScanTarget {
             path: PathBuf::from("/tmp/session.jsonl"),
+            path_key: "/tmp/session.jsonl".to_string(),
             session_id: "project/session".to_string(),
             bytes: 0,
             modified: None,
+            metadata: SessionFileMetadata::default(),
         },
         parser_checkpoint: SessionParseCheckpoint::default(),
         cached_events: vec![
@@ -3221,6 +3688,14 @@ fn cli_accepts_threads_flag() {
     assert_eq!(cli.threads, NonZeroUsize::new(1));
 }
 
+#[test]
+fn cli_accepts_no_scan_index_flag() {
+    let cli = Cli::try_parse_from(["codexusage", "--no-scan-index", "daily"]).expect("cli");
+
+    assert!(cli.scan_index.no_scan_index);
+    assert_eq!(cli.command, Some(Command::Daily));
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn cli_accepts_debug_simulate_slow_disk_flag() {
@@ -3388,7 +3863,9 @@ fn scan_target(session_id: &str, bytes: u64) -> SessionScanTarget {
     SessionScanTarget {
         session_id: session_id.to_string(),
         path: PathBuf::from(format!("{session_id}.jsonl")),
+        path_key: format!("{session_id}.jsonl"),
         bytes,
         modified: None,
+        metadata: SessionFileMetadata::default(),
     }
 }

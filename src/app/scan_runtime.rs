@@ -84,19 +84,15 @@ pub(super) trait ScanObserver: Clone + Send + Sync {
 }
 
 /// No-op observer used by tests and non-interactive scan paths.
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct NoopScanObserver;
 
-#[cfg(test)]
 impl ScanObserver for NoopScanObserver {}
 
 /// No-op batch runner used when no CLI runtime hooks are active.
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct NoopScanBatchRunner;
 
-#[cfg(test)]
 impl ScanBatchRunner for NoopScanBatchRunner {
     type Observer = NoopScanObserver;
 

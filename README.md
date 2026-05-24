@@ -147,12 +147,14 @@ Flags:
 - `--project-dir PATH` - only include sessions whose logged working directory is under this project path
 - `--current-dir` - shortcut for `--project-dir` with the current directory
 - `--threads N` - scanner worker count
+- `--no-scan-index` - disable the persistent scan index for report commands
 - `--number-format full` - show full token counts instead of K/M/B/T
 - `watch --per-model-burn-rate` - show per-model burn-rate columns in the live watch table
 
 `--last-days` cannot be combined with `--since` or `--until`.
 
 By default, `codexusage` scans `CODEX_HOME/sessions` (or `~/.codex/sessions` when `CODEX_HOME` is not set).
+Daily, monthly, and session reports maintain a local scan index under the user cache directory so repeated reports only parse changed session bytes. If the index cannot be read or written, the report still runs and emits a warning. Use `--no-scan-index` for a one-off full scan.
 
 ## Sample output
 

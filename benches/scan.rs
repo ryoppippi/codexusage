@@ -1,6 +1,6 @@
 use codexusage::app::{
     CacheReadMode, CachedInputCostMode, NumberFormat, ReportKind, ReportOptions,
-    ScannerParallelism, build_report,
+    ScannerParallelism, build_report, build_report_with_scan_index,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use serde_json::json;
@@ -82,6 +82,77 @@ fn parser_benchmark(criterion: &mut Criterion) {
     criterion.bench_function("daily_report_scan_1000_last_usage_events", |bench| {
         bench.iter(|| {
             let report = build_report(ReportKind::Daily, &options).expect("build report");
+            std::hint::black_box(report);
+        });
+    });
+}
+
+fn cached_scan_index_benchmark(criterion: &mut Criterion) {
+    let fixture = TempDir::new().expect("tempdir");
+    let sessions_dir = fixture.path().join("sessions");
+    let index_path = fixture.path().join("scan-index.sqlite3");
+    let payload = (0..1_000)
+        .map(|index| {
+            json!({
+                "timestamp": event_timestamp(index),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 1_200,
+                            "cached_input_tokens": 200,
+                            "output_tokens": 500,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 1_700
+                        }
+                    }
+                }
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fixture_contents = format!(
+        "{{\"timestamp\":\"2025-09-11T18:00:00.000Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5\"}}}}\n{payload}\n"
+    );
+    write_session_file(&sessions_dir, "project/session.jsonl", &fixture_contents);
+
+    let options = base_options(vec![sessions_dir]);
+    let _warm =
+        build_report_with_scan_index(ReportKind::Daily, &options, &index_path).expect("warm index");
+    criterion.bench_function("daily_report_scan_index_cached_1000_events", |bench| {
+        bench.iter(|| {
+            let report = build_report_with_scan_index(ReportKind::Daily, &options, &index_path)
+                .expect("build indexed report");
+            std::hint::black_box(report);
+        });
+    });
+}
+
+fn cached_many_file_scan_index_benchmark(criterion: &mut Criterion) {
+    let fixture = TempDir::new().expect("tempdir");
+    let sessions_dir = fixture.path().join("sessions");
+    let index_path = fixture.path().join("scan-index.sqlite3");
+    let fixture_contents = concat!(
+        "{\"timestamp\":\"2025-09-11T18:00:00.000Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+        "{\"timestamp\":\"2025-09-11T18:01:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1200,\"cached_input_tokens\":200,\"output_tokens\":500,\"reasoning_output_tokens\":0,\"total_tokens\":1700}}}}\n",
+    );
+    for index in 0..300 {
+        write_session_file(
+            &sessions_dir,
+            &format!("project/session-{index:03}.jsonl"),
+            fixture_contents,
+        );
+    }
+
+    let options = base_options(vec![sessions_dir]);
+    let _warm =
+        build_report_with_scan_index(ReportKind::Daily, &options, &index_path).expect("warm index");
+    criterion.bench_function("daily_report_scan_index_cached_300_files", |bench| {
+        bench.iter(|| {
+            let report = build_report_with_scan_index(ReportKind::Daily, &options, &index_path)
+                .expect("build indexed report");
             std::hint::black_box(report);
         });
     });
@@ -272,6 +343,8 @@ criterion_group! {
         .measurement_time(Duration::from_secs(10));
     targets =
         parser_benchmark,
+        cached_scan_index_benchmark,
+        cached_many_file_scan_index_benchmark,
         cumulative_usage_benchmark,
         duplicate_root_selection_benchmark,
         project_filter_discovery_benchmark,
