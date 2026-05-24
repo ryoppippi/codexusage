@@ -1190,16 +1190,8 @@ pub(in crate::app) fn collect_session_scan_targets(
             }
         }
     }
-    let mut session_ids = selected_files.keys().cloned().collect::<Vec<_>>();
-    session_ids.sort_unstable();
-    let targets = session_ids
-        .into_iter()
-        .map(|session_id| {
-            selected_files
-                .remove(&session_id)
-                .ok_or_else(|| eyre!("missing session target for key {session_id}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut targets = selected_files.into_values().collect::<Vec<_>>();
+    targets.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
     Ok((missing_directories, targets))
 }
 
@@ -1246,7 +1238,7 @@ pub(in crate::app) fn scan_selected_session_targets(
         selected_files,
         parallelism,
         || ReportBuilder::new(kind, timezone, since, until),
-        |chunk| scan_selected_session_chunk(chunk, kind, timezone, since, until),
+        |target, builder| scan_session_file(&target.path, &target.session_id, builder),
     )
 }
 
@@ -1267,22 +1259,22 @@ where
         selected_files,
         parallelism,
         || ReportBuilder::new(kind, timezone, since, until),
-        |chunk| {
-            scan_selected_session_chunk_with_observer(chunk, kind, timezone, since, until, observer)
+        |target, builder| {
+            scan_session_file_with_observer(&target.path, &target.session_id, builder, observer)
         },
     )
 }
 
-/// Scan selected session targets using the provided chunk strategy.
+/// Scan selected session targets using the provided file strategy.
 pub(in crate::app) fn scan_selected_session_targets_with<F, B>(
     selected_files: &[SessionScanTarget],
     parallelism: ScannerParallelism,
     empty_builder: B,
-    scan_chunk: F,
+    scan_file: F,
 ) -> Result<ReportBuilder>
 where
-    F: Fn(&[SessionScanTarget]) -> Result<ReportBuilder> + Copy + Send + Sync,
-    B: FnOnce() -> ReportBuilder,
+    F: Fn(&SessionScanTarget, &mut ReportBuilder) -> Result<()> + Copy + Send + Sync,
+    B: Fn() -> ReportBuilder + Copy + Send + Sync,
 {
     if selected_files.is_empty() {
         return Ok(empty_builder());
@@ -1290,7 +1282,7 @@ where
 
     let worker_count = resolve_scan_worker_count(parallelism, selected_files.len());
     if worker_count == 1 {
-        return scan_chunk(selected_files);
+        return scan_selected_session_slice_with(selected_files, empty_builder, scan_file);
     }
 
     let chunks = balanced_scan_chunks(selected_files, worker_count);
@@ -1300,10 +1292,24 @@ where
             .next()
             .ok_or_else(|| eyre!("missing initial scan chunk"))?;
         let handles = chunks
-            .map(|chunk| scope.spawn(move || scan_chunk(chunk)))
+            .map(|chunk| {
+                scope.spawn(move || {
+                    scan_selected_session_index_chunk_with(
+                        selected_files,
+                        chunk,
+                        empty_builder,
+                        scan_file,
+                    )
+                })
+            })
             .collect::<Vec<_>>();
 
-        let mut merged = scan_chunk(first_chunk)?;
+        let mut merged = scan_selected_session_index_chunk_with(
+            selected_files,
+            first_chunk,
+            empty_builder,
+            scan_file,
+        )?;
         for handle in handles {
             let partial = handle
                 .join()
@@ -1314,62 +1320,42 @@ where
     })
 }
 
-/// Scan all selected targets for watch mode, optionally across worker threads.
-pub(in crate::app) fn scan_selected_session_chunk(
+/// Scan one borrowed slice of selected targets using the provided file strategy.
+fn scan_selected_session_slice_with<F, B>(
     selected_files: &[SessionScanTarget],
-    kind: ReportKind,
-    timezone: Tz,
-    since: Option<NaiveDate>,
-    until: Option<NaiveDate>,
-) -> Result<ReportBuilder> {
-    scan_selected_session_chunk_with(
-        selected_files,
-        kind,
-        timezone,
-        since,
-        until,
-        |target, builder| scan_session_file(&target.path, &target.session_id, builder),
-    )
-}
-
-/// Scan one worker chunk of selected session files.
-pub(in crate::app) fn scan_selected_session_chunk_with_observer<O>(
-    selected_files: &[SessionScanTarget],
-    kind: ReportKind,
-    timezone: Tz,
-    since: Option<NaiveDate>,
-    until: Option<NaiveDate>,
-    observer: &O,
-) -> Result<ReportBuilder>
-where
-    O: ScanObserver,
-{
-    scan_selected_session_chunk_with(
-        selected_files,
-        kind,
-        timezone,
-        since,
-        until,
-        |target, builder| {
-            scan_session_file_with_observer(&target.path, &target.session_id, builder, observer)
-        },
-    )
-}
-
-/// Scan one worker chunk of selected session files using the provided file strategy.
-pub(in crate::app) fn scan_selected_session_chunk_with<F>(
-    selected_files: &[SessionScanTarget],
-    kind: ReportKind,
-    timezone: Tz,
-    since: Option<NaiveDate>,
-    until: Option<NaiveDate>,
+    empty_builder: B,
     mut scan_file: F,
 ) -> Result<ReportBuilder>
 where
     F: FnMut(&SessionScanTarget, &mut ReportBuilder) -> Result<()>,
+    B: FnOnce() -> ReportBuilder,
 {
-    let mut builder = ReportBuilder::new(kind, timezone, since, until);
+    let mut builder = empty_builder();
     for target in selected_files {
+        scan_file(target, &mut builder)?;
+    }
+    Ok(builder)
+}
+
+/// Scan one worker chunk of target indexes using the provided file strategy.
+fn scan_selected_session_index_chunk_with<F, B>(
+    selected_files: &[SessionScanTarget],
+    target_indexes: &[usize],
+    empty_builder: B,
+    mut scan_file: F,
+) -> Result<ReportBuilder>
+where
+    F: FnMut(&SessionScanTarget, &mut ReportBuilder) -> Result<()>,
+    B: FnOnce() -> ReportBuilder,
+{
+    let mut builder = empty_builder();
+    for &target_index in target_indexes {
+        let target = selected_files.get(target_index).ok_or_else(|| {
+            eyre!(
+                "scan chunk index {target_index} out of range for {} selected files",
+                selected_files.len()
+            )
+        })?;
         scan_file(target, &mut builder)?;
     }
     Ok(builder)
@@ -1398,7 +1384,7 @@ pub(in crate::app) fn resolve_scan_worker_count(
 pub(in crate::app) fn balanced_scan_chunks(
     selected_files: &[SessionScanTarget],
     worker_count: usize,
-) -> Vec<Vec<SessionScanTarget>> {
+) -> Vec<Vec<usize>> {
     if selected_files.is_empty() {
         return Vec::new();
     }
@@ -1407,8 +1393,8 @@ pub(in crate::app) fn balanced_scan_chunks(
     let mut chunks = (0..worker_count)
         .map(|_| WeightedScanChunk::default())
         .collect::<Vec<_>>();
-    let mut ordered = selected_files.iter().collect::<Vec<_>>();
-    ordered.sort_unstable_by(|left, right| {
+    let mut ordered = selected_files.iter().enumerate().collect::<Vec<_>>();
+    ordered.sort_unstable_by(|(_, left), (_, right)| {
         right
             .bytes
             .cmp(&left.bytes)
@@ -1416,13 +1402,13 @@ pub(in crate::app) fn balanced_scan_chunks(
             .then_with(|| left.path.cmp(&right.path))
     });
 
-    for target in ordered {
+    for (target_index, target) in ordered {
         let chunk = chunks
             .iter_mut()
             .min_by_key(|chunk| (chunk.bytes, chunk.targets.len()))
             .expect("worker count is at least one");
         chunk.bytes = chunk.bytes.saturating_add(target.bytes);
-        chunk.targets.push(target.clone());
+        chunk.targets.push(target_index);
     }
 
     chunks
@@ -1435,8 +1421,8 @@ pub(in crate::app) fn balanced_scan_chunks(
 /// One worker chunk with accumulated scheduling weight.
 #[derive(Default)]
 struct WeightedScanChunk {
-    /// Selected targets assigned to this chunk.
-    targets: Vec<SessionScanTarget>,
+    /// Selected target indexes assigned to this chunk.
+    targets: Vec<usize>,
     /// Sum of target file sizes.
     bytes: u64,
 }
@@ -1448,11 +1434,8 @@ pub(in crate::app) fn scan_session_tree(
     project_filter: Option<&ProjectFilter>,
     selected_files: &mut HashMap<String, SessionScanTarget>,
 ) -> Result<()> {
-    let mut entries =
-        fs::read_dir(directory)?.collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
-    entries.sort_by_key(std::fs::DirEntry::path);
-
-    for entry in entries {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {

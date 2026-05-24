@@ -158,6 +158,30 @@ fn cached_many_file_scan_index_benchmark(criterion: &mut Criterion) {
     });
 }
 
+fn many_file_scan_benchmark(criterion: &mut Criterion) {
+    let fixture = TempDir::new().expect("tempdir");
+    let sessions_dir = fixture.path().join("sessions");
+    let fixture_contents = concat!(
+        "{\"timestamp\":\"2025-09-11T18:00:00.000Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+        "{\"timestamp\":\"2025-09-11T18:01:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1200,\"cached_input_tokens\":200,\"output_tokens\":500,\"reasoning_output_tokens\":0,\"total_tokens\":1700}}}}\n",
+    );
+    for index in 0..1_000 {
+        write_session_file(
+            &sessions_dir,
+            &format!("project-{index:04}/session.jsonl"),
+            fixture_contents,
+        );
+    }
+
+    let options = base_options(vec![sessions_dir]);
+    criterion.bench_function("daily_report_scan_1000_files_no_index", |bench| {
+        bench.iter(|| {
+            let report = build_report(ReportKind::Daily, &options).expect("build report");
+            std::hint::black_box(report);
+        });
+    });
+}
+
 fn cumulative_usage_benchmark(criterion: &mut Criterion) {
     let fixture = TempDir::new().expect("tempdir");
     let sessions_dir = fixture.path().join("sessions");
@@ -345,6 +369,7 @@ criterion_group! {
         parser_benchmark,
         cached_scan_index_benchmark,
         cached_many_file_scan_index_benchmark,
+        many_file_scan_benchmark,
         cumulative_usage_benchmark,
         duplicate_root_selection_benchmark,
         project_filter_discovery_benchmark,

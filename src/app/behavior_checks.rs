@@ -3851,12 +3851,26 @@ fn balanced_scan_chunks_spreads_targets_by_byte_size() {
         scan_target("large-c", 80),
     ];
 
-    let chunk_totals = balanced_scan_chunks(&targets, 3)
-        .into_iter()
-        .map(|chunk| chunk.iter().map(|target| target.bytes).sum::<u64>())
+    let chunks = balanced_scan_chunks(&targets, 3);
+    let chunk_totals = chunks
+        .iter()
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|&target_index| {
+                    targets
+                        .get(target_index)
+                        .expect("chunk index must reference a target")
+                        .bytes
+                })
+                .sum::<u64>()
+        })
         .collect::<Vec<_>>();
+    let mut target_indexes = chunks.into_iter().flatten().collect::<Vec<_>>();
+    target_indexes.sort_unstable();
 
     assert_eq!(chunk_totals, vec![150, 150, 150]);
+    assert_eq!(target_indexes, vec![0, 1, 2, 3, 4, 5]);
 }
 
 fn scan_target(session_id: &str, bytes: u64) -> SessionScanTarget {
