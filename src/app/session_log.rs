@@ -13,18 +13,23 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::LazyLock;
 
-/// Direct marker for turn-context records.
-static TURN_CONTEXT_FINDER: LazyLock<Finder<'static>> =
-    LazyLock::new(|| Finder::new(b"turn_context"));
-/// Direct marker for token-count records.
-static TOKEN_COUNT_FINDER: LazyLock<Finder<'static>> =
-    LazyLock::new(|| Finder::new(b"token_count"));
+/// Compact top-level event-message type marker.
+static EVENT_MSG_TYPE_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(br#""type":"event_msg""#));
+/// Compact token-count payload type marker.
+static TOKEN_COUNT_TYPE_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(br#""type":"token_count""#));
+/// Compact turn-context entry type marker.
+static TURN_CONTEXT_TYPE_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(br#""type":"turn_context""#));
 /// JSON Unicode escape introducer.
 static UNICODE_ESCAPE_FINDER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\\u"));
 /// Usage-bearing turn-context marker.
 const TURN_CONTEXT_MARKER: &[u8] = b"turn_context";
 /// Usage-bearing token-count marker.
 const TOKEN_COUNT_MARKER: &[u8] = b"token_count";
+/// Usage-bearing event-message marker.
+const EVENT_MSG_MARKER: &[u8] = b"event_msg";
 
 /// Raw token counters as they appear in session log payloads.
 #[derive(Clone, Copy, Debug, Default)]
@@ -830,9 +835,7 @@ fn scan_session_file_from_checkpoint_inner(
             offset = next_offset;
             continue;
         }
-        let trimmed =
-            std::str::from_utf8(trimmed).wrap_err("session log line is not valid UTF-8")?;
-        if let Some(event) = parse_token_usage_line(
+        if let Some(event) = parse_token_usage_line_bytes(
             trimmed,
             session_id,
             session_id,
@@ -861,9 +864,14 @@ pub(in crate::app) fn line_might_affect_usage(line: &str) -> bool {
 
 /// Return whether one JSONL byte record might affect usage aggregation.
 fn line_might_affect_usage_bytes(line: &[u8]) -> bool {
-    TURN_CONTEXT_FINDER.find(line).is_some()
-        || TOKEN_COUNT_FINDER.find(line).is_some()
-        || contains_escaped_usage_marker(line)
+    line_has_exact_usage_type_markers(line) || contains_escaped_usage_marker(line)
+}
+
+/// Return whether one compact JSON record has exact usage-bearing type markers.
+fn line_has_exact_usage_type_markers(line: &[u8]) -> bool {
+    TURN_CONTEXT_TYPE_FINDER.find(line).is_some()
+        || (TOKEN_COUNT_TYPE_FINDER.find(line).is_some()
+            && EVENT_MSG_TYPE_FINDER.find(line).is_some())
 }
 
 /// Return whether a line contains an escaped form of a usage-bearing marker.
@@ -872,10 +880,25 @@ fn contains_escaped_usage_marker(line: &[u8]) -> bool {
         return false;
     }
 
-    memchr::memchr2_iter(b't', b'\\', line).any(|offset| {
+    if contains_escaped_marker(line, TURN_CONTEXT_MARKER) {
+        return true;
+    }
+
+    let token_count_present = TOKEN_COUNT_TYPE_FINDER.find(line).is_some()
+        || contains_escaped_marker(line, TOKEN_COUNT_MARKER);
+    token_count_present
+        && (EVENT_MSG_TYPE_FINDER.find(line).is_some()
+            || contains_escaped_marker(line, EVENT_MSG_MARKER))
+}
+
+/// Return whether a line contains an escaped form of one marker.
+fn contains_escaped_marker(line: &[u8], marker: &[u8]) -> bool {
+    let Some(&first) = marker.first() else {
+        return false;
+    };
+    memchr::memchr2_iter(first, b'\\', line).any(|offset| {
         let candidate = &line[offset..];
-        escaped_marker_matches(candidate, TURN_CONTEXT_MARKER)
-            || escaped_marker_matches(candidate, TOKEN_COUNT_MARKER)
+        escaped_marker_matches(candidate, marker)
     })
 }
 
@@ -937,6 +960,7 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
 }
 
 /// Parse one JSONL line into a token-usage event when applicable.
+#[cfg(test)]
 pub(in crate::app) fn parse_token_usage_line<'session, 'model>(
     line: &str,
     session_key: &'session str,
@@ -945,7 +969,26 @@ pub(in crate::app) fn parse_token_usage_line<'session, 'model>(
     current_model: &'model mut Option<String>,
     current_model_is_fallback: &mut bool,
 ) -> Result<Option<TokenUsageEvent<'session, 'model>>> {
-    let Ok(entry) = serde_json::from_str::<SessionLogEntry<'_>>(line) else {
+    parse_token_usage_line_bytes(
+        line.as_bytes(),
+        session_key,
+        session_id,
+        previous_totals,
+        current_model,
+        current_model_is_fallback,
+    )
+}
+
+/// Parse one JSONL byte record into a token-usage event when applicable.
+fn parse_token_usage_line_bytes<'session, 'model>(
+    line: &[u8],
+    session_key: &'session str,
+    session_id: &'session str,
+    previous_totals: &mut Option<RawUsage>,
+    current_model: &'model mut Option<String>,
+    current_model_is_fallback: &mut bool,
+) -> Result<Option<TokenUsageEvent<'session, 'model>>> {
+    let Some(entry) = parse_session_log_entry(line)? else {
         return Ok(None);
     };
     let Some(entry_type) = entry.entry_type.as_deref() else {
@@ -986,6 +1029,17 @@ pub(in crate::app) fn parse_token_usage_line<'session, 'model>(
         is_fallback_model,
         usage,
     }))
+}
+
+/// Deserialize one session entry from bytes, preserving invalid UTF-8 scan errors.
+fn parse_session_log_entry(line: &[u8]) -> Result<Option<SessionLogEntry<'_>>> {
+    match serde_json::from_slice::<SessionLogEntry<'_>>(line) {
+        Ok(entry) => Ok(Some(entry)),
+        Err(_) if std::str::from_utf8(line).is_err() => {
+            Err(eyre::eyre!("session log line is not valid UTF-8"))
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 /// Extract normalized usage from one token-count payload.

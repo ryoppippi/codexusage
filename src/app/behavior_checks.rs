@@ -1338,6 +1338,9 @@ fn line_might_affect_usage_accepts_relevant_markers() {
 fn line_might_affect_usage_rejects_irrelevant_lines() {
     assert!(!line_might_affect_usage(r#"{"type":"response_item"}"#));
     assert!(!line_might_affect_usage(
+        r#"{"type":"response_item","payload":{"text":"token_count"}}"#
+    ));
+    assert!(!line_might_affect_usage(
         r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"agent_reasoning"}}"#
     ));
     assert!(!line_might_affect_usage("not-json"));
@@ -1359,6 +1362,12 @@ fn line_might_affect_usage_fails_open_for_escaped_json_strings() {
     ));
     assert!(line_might_affect_usage(
         r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"tok\u0065n_count"}}"#
+    ));
+    assert!(line_might_affect_usage(
+        r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event\u005fmsg","payload":{"type":"token_count"}}"#
+    ));
+    assert!(line_might_affect_usage(
+        r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event\u005fmsg","payload":{"type":"token\u005fcount"}}"#
     ));
 }
 
@@ -1390,13 +1399,11 @@ fn scan_session_file_advances_cumulative_state_after_last_usage() {
     let mut builder = ReportBuilder::new(ReportKind::Session, chrono_tz::UTC, None, None);
     scan_session_file(&session_file, "session", &mut builder).expect("scan");
 
-    let report = builder
-        .finish(
-            &PricingCatalog::default(),
-            UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
-            Vec::new(),
-        )
-        .expect("report");
+    let report = builder.finish(
+        &PricingCatalog::default(),
+        UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
+        Vec::new(),
+    );
     let ReportOutput::Session { rows, .. } = report else {
         panic!("expected session report");
     };
@@ -2560,13 +2567,11 @@ fn scan_index_revalidates_cached_file_after_discovery() {
         config: &scan_index,
     })
     .expect("indexed scan");
-    let report = builder
-        .finish(
-            &PricingCatalog::default(),
-            UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
-            Vec::new(),
-        )
-        .expect("finish report");
+    let report = builder.finish(
+        &PricingCatalog::default(),
+        UsagePresentation::new(CachedInputCostMode::Priced, CacheReadMode::Include),
+        Vec::new(),
+    );
 
     assert_eq!(report_total_tokens(&report), 175);
 }

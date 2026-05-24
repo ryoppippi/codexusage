@@ -15,13 +15,14 @@ use super::session_log::{
     scan_session_file_with_callback_and_observer,
 };
 use crate::pricing::{Pricing, PricingCatalog, PricingLoadOptions, load_pricing_catalog};
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDate, Utc};
 use chrono_tz::Tz;
 use eyre::{Result, WrapErr, eyre};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
+use std::hash::Hash;
 use std::io::{BufRead, BufReader};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Multiplier applied to automatic report-scan worker selection.
 const AUTO_WORKER_MULTIPLIER: usize = 3;
+
+/// Compact calendar-month grouping key in `YYYYMM` form.
+type MonthKey = i32;
 
 /// Shared report inputs resolved once before scanning begins.
 pub(in crate::app) struct PreparedReport {
@@ -216,11 +220,11 @@ where
         prepared.until,
     )?;
     builder.merge(scanned);
-    builder.finish(
+    Ok(builder.finish(
         &prepared.pricing,
         prepared.presentation,
         missing_directories,
-    )
+    ))
 }
 
 /// Parse a timezone name.
@@ -282,6 +286,23 @@ pub(in crate::app) fn normalize_filter_date(value: &str) -> Result<NaiveDate> {
     }
     NaiveDate::parse_from_str(&compact, "%Y%m%d")
         .wrap_err_with(|| format!("failed to parse date {value}"))
+}
+
+/// Convert one local date into a compact sortable month key.
+fn month_key(date: NaiveDate) -> MonthKey {
+    date.year() * 100 + i32::try_from(date.month()).unwrap_or_default()
+}
+
+/// Format one daily report key for public output.
+fn format_day_key(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
+
+/// Format one monthly report key for public output.
+fn format_month_key(key: MonthKey) -> String {
+    let year = key.div_euclid(100);
+    let month = key.rem_euclid(100);
+    format!("{year:04}-{month:02}")
 }
 
 /// Resolve the effective date filters for the requested report.
@@ -559,9 +580,9 @@ pub(in crate::app) struct ReportBuilder {
     /// Inclusive upper bound.
     until: Option<NaiveDate>,
     /// Daily summaries.
-    daily: HashMap<String, GroupSummary>,
+    daily: HashMap<NaiveDate, GroupSummary>,
     /// Monthly summaries.
-    monthly: HashMap<String, GroupSummary>,
+    monthly: HashMap<MonthKey, GroupSummary>,
     /// Session summaries.
     session: HashMap<String, SessionSummary>,
 }
@@ -597,12 +618,11 @@ impl ReportBuilder {
 
         match self.kind {
             ReportKind::Daily => {
-                let key = date.format("%Y-%m-%d").to_string();
-                let summary = self.daily.entry(key).or_default();
+                let summary = self.daily.entry(date).or_default();
                 push_event_into_summary(summary, event);
             }
             ReportKind::Monthly => {
-                let key = local.format("%Y-%m").to_string();
+                let key = month_key(date);
                 let summary = self.monthly.entry(key).or_default();
                 push_event_into_summary(summary, event);
             }
@@ -627,7 +647,7 @@ impl ReportBuilder {
         pricing: &PricingCatalog,
         presentation: UsagePresentation,
         missing_directories: Vec<String>,
-    ) -> Result<ReportOutput> {
+    ) -> ReportOutput {
         let context = ReportFinishContext {
             pricing,
             presentation,
@@ -635,7 +655,7 @@ impl ReportBuilder {
         match self.kind {
             ReportKind::Daily => self.finish_daily(context, missing_directories),
             ReportKind::Monthly => self.finish_monthly(context, missing_directories),
-            ReportKind::Session => Ok(self.finish_session(context, missing_directories)),
+            ReportKind::Session => self.finish_session(context, missing_directories),
         }
     }
 
@@ -644,21 +664,17 @@ impl ReportBuilder {
         self,
         context: ReportFinishContext<'_>,
         missing_directories: Vec<String>,
-    ) -> Result<ReportOutput> {
+    ) -> ReportOutput {
         let mut rows = Vec::with_capacity(self.daily.len());
-        let mut keys = self.daily.keys().cloned().collect::<Vec<_>>();
-        keys.sort_unstable();
+        let mut entries = self.daily.into_iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(key, _summary)| *key);
         let mut totals = Totals::default();
-        for key in keys {
-            let summary = self
-                .daily
-                .get(&key)
-                .ok_or_else(|| eyre!("missing daily summary for key {key}"))?;
+        for (key, summary) in entries {
             let (visible_totals, cost, models) =
                 context.finish_summary(&summary.totals, &summary.models);
             push_totals(&mut totals, &visible_totals, cost);
             rows.push(DailyRow {
-                date: key,
+                date: format_day_key(key),
                 input_tokens: visible_totals.input,
                 cached_input_tokens: visible_totals.cached_input,
                 output_tokens: visible_totals.output,
@@ -668,11 +684,11 @@ impl ReportBuilder {
                 models,
             });
         }
-        Ok(ReportOutput::Daily {
+        ReportOutput::Daily {
             rows,
             totals,
             missing_directories,
-        })
+        }
     }
 
     /// Finish a monthly report.
@@ -680,21 +696,17 @@ impl ReportBuilder {
         self,
         context: ReportFinishContext<'_>,
         missing_directories: Vec<String>,
-    ) -> Result<ReportOutput> {
+    ) -> ReportOutput {
         let mut rows = Vec::with_capacity(self.monthly.len());
-        let mut keys = self.monthly.keys().cloned().collect::<Vec<_>>();
-        keys.sort_unstable();
+        let mut entries = self.monthly.into_iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(key, _summary)| *key);
         let mut totals = Totals::default();
-        for key in keys {
-            let summary = self
-                .monthly
-                .get(&key)
-                .ok_or_else(|| eyre!("missing monthly summary for key {key}"))?;
+        for (key, summary) in entries {
             let (visible_totals, cost, models) =
                 context.finish_summary(&summary.totals, &summary.models);
             push_totals(&mut totals, &visible_totals, cost);
             rows.push(MonthlyRow {
-                month: key,
+                month: format_month_key(key),
                 input_tokens: visible_totals.input,
                 cached_input_tokens: visible_totals.cached_input,
                 output_tokens: visible_totals.output,
@@ -704,11 +716,11 @@ impl ReportBuilder {
                 models,
             });
         }
-        Ok(ReportOutput::Monthly {
+        ReportOutput::Monthly {
             rows,
             totals,
             missing_directories,
-        })
+        }
     }
 
     /// Finish a session report.
@@ -791,12 +803,11 @@ impl ReportBuilder {
 
         match self.kind {
             ReportKind::Daily => {
-                let key = local_day.format("%Y-%m-%d").to_string();
-                let target = self.daily.entry(key).or_default();
+                let target = self.daily.entry(local_day).or_default();
                 merge_group_summary(target, summary);
             }
             ReportKind::Monthly => {
-                let key = local_day.format("%Y-%m").to_string();
+                let key = month_key(local_day);
                 let target = self.monthly.entry(key).or_default();
                 merge_group_summary(target, summary);
             }
@@ -1485,10 +1496,12 @@ pub(in crate::app) fn register_session_target(
 }
 
 /// Merge grouped report summaries by key.
-pub(in crate::app) fn merge_group_summaries(
-    target: &mut HashMap<String, GroupSummary>,
-    source: HashMap<String, GroupSummary>,
-) {
+pub(in crate::app) fn merge_group_summaries<K>(
+    target: &mut HashMap<K, GroupSummary>,
+    source: HashMap<K, GroupSummary>,
+) where
+    K: Eq + Hash,
+{
     for (key, source_summary) in source {
         let summary = target.entry(key).or_default();
         merge_group_summary(summary, source_summary);
