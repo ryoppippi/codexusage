@@ -42,6 +42,9 @@ mod scan_index;
 /// CLI-only scan progress and debug runtime helpers.
 mod scan_runtime;
 
+/// Session rollout path and reader helpers.
+mod session_files;
+
 /// Codex account limit fetching for watch mode.
 mod codex_limits;
 
@@ -77,14 +80,17 @@ use report::{
     calculate_cost, calculate_cost_from_usage, collect_session_files, collect_session_scan_targets,
     normalize_filter_date, normalize_timezone_name, parse_timezone, resolve_report_date_filters,
     resolve_scan_worker_count, resolve_session_dirs, resolve_session_target_across_roots,
-    scan_session_file, session_file_id, session_file_path, sort_session_entries, split_session_id,
-    timezone_from_etc_timezone_contents, timezone_from_localtime_target,
+    scan_session_file, session_file_id, session_file_path, session_target_path_key,
+    sort_session_entries, split_session_id, timezone_from_etc_timezone_contents,
+    timezone_from_localtime_target,
 };
 pub use report::{build_report, build_report_with_scan_index};
 #[cfg(test)]
 use scan_index::{IndexedScanRequest, ScanIndexConfig, scan_selected_session_targets_with_index};
 #[cfg(test)]
 use scan_runtime::NoopScanBatchRunner;
+#[cfg(test)]
+use session_files::{SessionFileFormat, is_session_file_path};
 #[cfg(test)]
 use session_log::{RawUsage, SessionParseCheckpoint};
 #[cfg(test)]

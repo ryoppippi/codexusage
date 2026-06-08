@@ -5,6 +5,7 @@ use super::metadata::{ContentHash, FileMetadata, ObservedFile};
 use super::{bool_to_i64, i64_to_u64, raw_usage_from_options, u64_to_i64, usage_from_i64};
 use crate::app::model::UsageTotals;
 use crate::app::report::SessionScanTarget;
+use crate::app::session_files::SessionFileFormat;
 use crate::app::session_log::SessionParseCheckpoint;
 use eyre::Result;
 use rusqlite::{Connection, Transaction, params, params_from_iter};
@@ -97,7 +98,9 @@ impl StoredFileRecord {
 
     /// Return whether the observed file can be considered for append validation.
     pub(super) fn can_append_to(&self, observed: &ObservedFile) -> bool {
-        observed.metadata.size > self.metadata.size
+        self.metadata.file_format == SessionFileFormat::Plain
+            && observed.file_format == SessionFileFormat::Plain
+            && observed.metadata.size > self.metadata.size
             && self.checkpoint.offset <= self.metadata.size
             && self.metadata.same_identity_as(&observed.metadata)
     }
@@ -113,6 +116,8 @@ pub(super) struct RawStoredFileRecord {
     generation: i64,
     /// Parser schema version.
     parser_version: i64,
+    /// Physical file representation.
+    file_format: String,
     /// Indexed prefix size.
     size: i64,
     /// Modification time in nanoseconds since Unix epoch.
@@ -171,30 +176,31 @@ impl RawStoredFileRecord {
             path: row.get(1)?,
             generation: row.get(2)?,
             parser_version: row.get(3)?,
-            size: row.get(4)?,
-            mtime_ns: row.get(5)?,
-            dev: row.get(6)?,
-            ino: row.get(7)?,
-            ctime_ns: row.get(8)?,
-            checkpoint_offset: row.get(9)?,
-            previous_input: row.get(10)?,
-            previous_cached_input: row.get(11)?,
-            previous_output: row.get(12)?,
-            previous_reasoning_output: row.get(13)?,
-            previous_total: row.get(14)?,
-            current_model: row.get(15)?,
-            current_model_is_fallback: row.get(16)?,
-            content_hash: row.get(17)?,
-            total_input: row.get(18)?,
-            total_cached_input: row.get(19)?,
-            total_output: row.get(20)?,
-            total_reasoning_output: row.get(21)?,
-            total_tokens: row.get(22)?,
-            fallback_input: row.get(23)?,
-            fallback_cached_input: row.get(24)?,
-            fallback_output: row.get(25)?,
-            fallback_reasoning_output: row.get(26)?,
-            fallback_total: row.get(27)?,
+            file_format: row.get(4)?,
+            size: row.get(5)?,
+            mtime_ns: row.get(6)?,
+            dev: row.get(7)?,
+            ino: row.get(8)?,
+            ctime_ns: row.get(9)?,
+            checkpoint_offset: row.get(10)?,
+            previous_input: row.get(11)?,
+            previous_cached_input: row.get(12)?,
+            previous_output: row.get(13)?,
+            previous_reasoning_output: row.get(14)?,
+            previous_total: row.get(15)?,
+            current_model: row.get(16)?,
+            current_model_is_fallback: row.get(17)?,
+            content_hash: row.get(18)?,
+            total_input: row.get(19)?,
+            total_cached_input: row.get(20)?,
+            total_output: row.get(21)?,
+            total_reasoning_output: row.get(22)?,
+            total_tokens: row.get(23)?,
+            fallback_input: row.get(24)?,
+            fallback_cached_input: row.get(25)?,
+            fallback_output: row.get(26)?,
+            fallback_reasoning_output: row.get(27)?,
+            fallback_total: row.get(28)?,
         })
     }
 
@@ -202,6 +208,7 @@ impl RawStoredFileRecord {
     pub(super) fn into_valid_record(self) -> Option<StoredFileRecord> {
         let checkpoint_offset = i64_to_u64(self.checkpoint_offset)?;
         let metadata = FileMetadata {
+            file_format: SessionFileFormat::from_str(&self.file_format)?,
             size: i64_to_u64(self.size)?,
             mtime_ns: self.mtime_ns,
             dev: self.dev,
@@ -254,8 +261,8 @@ impl RawStoredFileRecord {
 const QUERY_KEY_CHUNK_SIZE: usize = 900;
 
 /// File-row projection shared by full and selected snapshot loads.
-const FILE_RECORD_COLUMNS: &str = "session_key, path, generation, parser_version, size, mtime_ns, \
- dev, ino, ctime_ns, checkpoint_offset, previous_input, previous_cached_input, \
+const FILE_RECORD_COLUMNS: &str = "session_key, path, generation, parser_version, file_format, \
+ size, mtime_ns, dev, ino, ctime_ns, checkpoint_offset, previous_input, previous_cached_input, \
  previous_output, previous_reasoning_output, previous_total, current_model, \
  current_model_is_fallback, content_hash, total_input, total_cached_input, \
  total_output, total_reasoning_output, total_tokens, fallback_input, \
@@ -320,19 +327,20 @@ pub(super) fn update_file_record_conditionally(
     let total = aggregates.total_usage();
     let fallback_total = aggregates.fallback_usage();
     Ok(transaction.execute(
-        "UPDATE files SET generation = ?1, parser_version = ?2, size = ?3, mtime_ns = ?4, \
-         dev = ?5, ino = ?6, ctime_ns = ?7, checkpoint_offset = ?8, previous_input = ?9, \
-         previous_cached_input = ?10, previous_output = ?11, previous_reasoning_output = ?12, \
-         previous_total = ?13, current_model = ?14, current_model_is_fallback = ?15, \
-         content_hash = ?16, total_input = ?17, total_cached_input = ?18, total_output = ?19, \
-         total_reasoning_output = ?20, total_tokens = ?21, fallback_input = ?22, \
-         fallback_cached_input = ?23, fallback_output = ?24, fallback_reasoning_output = ?25, \
-         fallback_total = ?26 \
-         WHERE session_key = ?27 AND path = ?28 AND generation = ?29 AND size = ?30 \
-         AND checkpoint_offset = ?31",
+        "UPDATE files SET generation = ?1, parser_version = ?2, file_format = ?3, size = ?4, \
+         mtime_ns = ?5, dev = ?6, ino = ?7, ctime_ns = ?8, checkpoint_offset = ?9, \
+         previous_input = ?10, previous_cached_input = ?11, previous_output = ?12, \
+         previous_reasoning_output = ?13, previous_total = ?14, current_model = ?15, \
+         current_model_is_fallback = ?16, content_hash = ?17, total_input = ?18, \
+         total_cached_input = ?19, total_output = ?20, total_reasoning_output = ?21, \
+         total_tokens = ?22, fallback_input = ?23, fallback_cached_input = ?24, \
+         fallback_output = ?25, fallback_reasoning_output = ?26, fallback_total = ?27 \
+         WHERE session_key = ?28 AND path = ?29 AND generation = ?30 AND size = ?31 \
+         AND checkpoint_offset = ?32",
         params![
             generation,
             PARSER_VERSION,
+            cache_entry.metadata.file_format.as_str(),
             u64_to_i64(cache_entry.metadata.size)?,
             cache_entry.metadata.mtime_ns,
             cache_entry.metadata.dev,
@@ -397,20 +405,22 @@ pub(super) fn upsert_file_record(
     let fallback_total = aggregates.fallback_usage();
     transaction.execute(
         "INSERT INTO files (
-             session_key, path, generation, parser_version, size, mtime_ns, dev, ino, ctime_ns,
-             checkpoint_offset, previous_input, previous_cached_input, previous_output,
-             previous_reasoning_output, previous_total, current_model, current_model_is_fallback,
-             content_hash, total_input, total_cached_input, total_output, total_reasoning_output,
-             total_tokens, fallback_input, fallback_cached_input, fallback_output,
+             session_key, path, generation, parser_version, file_format, size, mtime_ns, dev,
+             ino, ctime_ns, checkpoint_offset, previous_input, previous_cached_input,
+             previous_output, previous_reasoning_output, previous_total, current_model,
+             current_model_is_fallback, content_hash, total_input, total_cached_input,
+             total_output, total_reasoning_output, total_tokens, fallback_input,
+             fallback_cached_input, fallback_output,
              fallback_reasoning_output, fallback_total
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
          )
          ON CONFLICT(session_key) DO UPDATE SET
              path = excluded.path,
              generation = excluded.generation,
              parser_version = excluded.parser_version,
+             file_format = excluded.file_format,
              size = excluded.size,
              mtime_ns = excluded.mtime_ns,
              dev = excluded.dev,
@@ -440,6 +450,7 @@ pub(super) fn upsert_file_record(
             cache_entry.path.as_str(),
             generation,
             PARSER_VERSION,
+            cache_entry.metadata.file_format.as_str(),
             u64_to_i64(cache_entry.metadata.size)?,
             cache_entry.metadata.mtime_ns,
             cache_entry.metadata.dev,

@@ -2,6 +2,7 @@
 
 use super::model::{DEFAULT_FALLBACK_MODEL, UsageTotals};
 use super::scan_runtime::ScanObserver;
+use super::session_files::{SessionFileFormat, session_file_format};
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use memchr::memmem::Finder;
@@ -709,18 +710,20 @@ pub(in crate::app) fn scan_session_file_with(
 }
 
 /// Scan one JSONL session file and feed every parsed event into the provided callback.
-pub(in crate::app) fn scan_session_file_with_callback_and_observer<O>(
+pub(in crate::app) fn scan_session_file_with_callback_and_observer_with_format<O>(
     file: &Path,
     session_id: &str,
+    file_format: SessionFileFormat,
     observer: &O,
     mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
 ) -> Result<()>
 where
     O: ScanObserver,
 {
-    let _ = scan_session_file_from_checkpoint_with_observer(
+    let _ = scan_session_file_from_checkpoint_with_observer_and_format(
         file,
         session_id,
+        file_format,
         &SessionParseCheckpoint::default(),
         observer,
         |event| on_event(event),
@@ -730,15 +733,34 @@ where
 }
 
 /// Scan one JSONL session file from a stored parser checkpoint.
+#[cfg(test)]
 pub(in crate::app) fn scan_session_file_from_checkpoint(
     file: &Path,
     session_id: &str,
     checkpoint: &SessionParseCheckpoint,
     mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
 ) -> Result<SessionParseCheckpoint> {
+    scan_session_file_from_checkpoint_with_format(
+        file,
+        session_id,
+        session_file_format(file).unwrap_or(SessionFileFormat::Plain),
+        checkpoint,
+        |event| on_event(event),
+    )
+}
+
+/// Scan one session file from a stored parser checkpoint with known physical format.
+pub(in crate::app) fn scan_session_file_from_checkpoint_with_format(
+    file: &Path,
+    session_id: &str,
+    file_format: SessionFileFormat,
+    checkpoint: &SessionParseCheckpoint,
+    mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
+) -> Result<SessionParseCheckpoint> {
     scan_session_file_from_checkpoint_inner(
         file,
         session_id,
+        file_format,
         checkpoint,
         || {},
         |_| {},
@@ -759,9 +781,32 @@ pub(in crate::app) fn scan_session_file_from_checkpoint_with_observer<O>(
 where
     O: ScanObserver,
 {
+    scan_session_file_from_checkpoint_with_observer_and_format(
+        file,
+        session_id,
+        session_file_format(file).unwrap_or(SessionFileFormat::Plain),
+        checkpoint,
+        observer,
+        |event| on_event(event),
+    )
+}
+
+/// Scan one session file from a stored parser checkpoint with known physical format.
+pub(in crate::app) fn scan_session_file_from_checkpoint_with_observer_and_format<O>(
+    file: &Path,
+    session_id: &str,
+    file_format: SessionFileFormat,
+    checkpoint: &SessionParseCheckpoint,
+    observer: &O,
+    mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
+) -> Result<SessionParseCheckpoint>
+where
+    O: ScanObserver,
+{
     scan_session_file_from_checkpoint_inner(
         file,
         session_id,
+        file_format,
         checkpoint,
         || observer.before_file_open(),
         |_| {},
@@ -769,10 +814,11 @@ where
     )
 }
 
-/// Scan one JSONL session file from a stored parser checkpoint and expose consumed bytes.
-pub(in crate::app) fn scan_session_file_from_checkpoint_with_observer_and_bytes<O>(
+/// Scan one session file from a checkpoint with known format and expose consumed bytes.
+pub(in crate::app) fn scan_session_file_from_checkpoint_with_observer_and_bytes_and_format<O>(
     file: &Path,
     session_id: &str,
+    file_format: SessionFileFormat,
     checkpoint: &SessionParseCheckpoint,
     observer: &O,
     mut on_bytes: impl FnMut(&[u8]),
@@ -784,6 +830,7 @@ where
     scan_session_file_from_checkpoint_inner(
         file,
         session_id,
+        file_format,
         checkpoint,
         || observer.before_file_open(),
         |bytes| on_bytes(bytes),
@@ -795,12 +842,30 @@ where
 fn scan_session_file_from_checkpoint_inner(
     file: &Path,
     session_id: &str,
+    file_format: SessionFileFormat,
     checkpoint: &SessionParseCheckpoint,
     before_file_open: impl FnOnce(),
     mut on_bytes: impl FnMut(&[u8]),
     mut on_event: impl FnMut(&TokenUsageEvent<'_, '_>),
 ) -> Result<SessionParseCheckpoint> {
     before_file_open();
+
+    if file_format == SessionFileFormat::Compressed {
+        let metadata = std::fs::metadata(file)
+            .wrap_err_with(|| format!("failed to read session file metadata {}", file.display()))?;
+        let file_handle = File::open(file)?;
+        let decoder = zstd::stream::read::Decoder::new(file_handle)
+            .wrap_err_with(|| format!("failed to decode compressed session {}", file.display()))?;
+        return scan_session_reader(
+            BufReader::new(decoder),
+            session_id,
+            &SessionParseCheckpoint::default(),
+            0,
+            Some(metadata.len()),
+            &mut on_bytes,
+            &mut on_event,
+        );
+    }
 
     let mut file = File::open(file)?;
     file.seek(SeekFrom::Start(checkpoint.offset))?;
@@ -850,6 +915,72 @@ fn scan_session_file_from_checkpoint_inner(
     }
     Ok(SessionParseCheckpoint {
         offset,
+        previous_totals,
+        current_model,
+        current_model_is_fallback,
+    })
+}
+
+/// Scan one decoded JSONL reader and emit normalized usage events.
+fn scan_session_reader(
+    mut reader: impl BufRead,
+    session_id: &str,
+    checkpoint: &SessionParseCheckpoint,
+    start_offset: u64,
+    complete_offset: Option<u64>,
+    on_bytes: &mut impl FnMut(&[u8]),
+    on_event: &mut impl FnMut(&TokenUsageEvent<'_, '_>),
+) -> Result<SessionParseCheckpoint> {
+    let mut line = Vec::new();
+    let mut previous_totals = checkpoint.previous_totals;
+    let mut current_model = checkpoint.current_model.clone();
+    let mut current_model_is_fallback = checkpoint.current_model_is_fallback;
+    let mut offset = start_offset;
+    let mut stopped_at_partial_record = false;
+    loop {
+        line.clear();
+        let line_start_offset = offset;
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        let next_offset = offset.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
+        let trimmed = trim_ascii_whitespace(&line);
+        if trimmed.is_empty() {
+            on_bytes(&line);
+            offset = next_offset;
+            continue;
+        }
+        if !line.ends_with(b"\n") && serde_json::from_slice::<SessionLogEntry<'_>>(trimmed).is_err()
+        {
+            offset = line_start_offset;
+            stopped_at_partial_record = true;
+            break;
+        }
+        if !line_might_affect_usage_bytes(trimmed) {
+            on_bytes(&line);
+            offset = next_offset;
+            continue;
+        }
+        if let Some(event) = parse_token_usage_line_bytes(
+            trimmed,
+            session_id,
+            session_id,
+            &mut previous_totals,
+            &mut current_model,
+            &mut current_model_is_fallback,
+        )? {
+            on_event(&event);
+        }
+        on_bytes(&line);
+        offset = next_offset;
+    }
+    Ok(SessionParseCheckpoint {
+        offset: if stopped_at_partial_record {
+            offset
+        } else {
+            complete_offset.unwrap_or(offset)
+        },
         previous_totals,
         current_model,
         current_model_is_fallback,

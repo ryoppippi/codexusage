@@ -21,6 +21,7 @@ use super::scan_index::{
 #[cfg(test)]
 use super::scan_runtime::NoopScanBatchRunner;
 use super::scan_runtime::{CliScanBatchRunner, ScanBatchRunner, ScanBehavior, ScanObserver};
+use super::session_files::{SessionFileFormat, session_file_format};
 #[cfg(test)]
 use super::session_log::TokenUsageEvent;
 #[cfg(test)]
@@ -324,7 +325,13 @@ impl WatchEventSource {
         for path in &event.paths {
             let session_ids = watch_event_session_ids(session_dirs, path);
             if !session_ids.is_empty() {
-                changes.mark_dirty_sessions(session_ids, dirty_kind);
+                let path_dirty_kind =
+                    if session_file_format(path).is_some_and(SessionFileFormat::is_compressed) {
+                        WatchDirtyKind::FullRebuild
+                    } else {
+                        dirty_kind
+                    };
+                changes.mark_dirty_sessions(session_ids, path_dirty_kind);
             } else if path_is_under_roots(session_dirs, path) {
                 changes.discovery_due = true;
             }
@@ -350,11 +357,7 @@ pub(in crate::app) fn watch_event_session_ids(
     session_dirs: &[PathBuf],
     path: &Path,
 ) -> Vec<String> {
-    if !path
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-    {
+    if session_file_format(path).is_none() {
         return Vec::new();
     }
 

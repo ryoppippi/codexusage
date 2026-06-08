@@ -135,6 +135,24 @@ fn write_scan_index_session(session_file: &Path, total_input: u64, total_output:
     .expect("write session");
 }
 
+fn compressed_session_path(path: &Path) -> std::path::PathBuf {
+    let mut file_name = path
+        .file_name()
+        .expect("session path should have a file name")
+        .to_os_string();
+    file_name.push(".zst");
+    path.with_file_name(file_name)
+}
+
+fn write_compressed_session_file(session_file: &Path, contents: &str) {
+    fs::create_dir_all(session_file.parent().expect("session parent")).expect("mkdir");
+    let output =
+        fs::File::create(compressed_session_path(session_file)).expect("create compressed session");
+    let mut encoder = zstd::stream::write::Encoder::new(output, 3).expect("create zstd encoder");
+    std::io::copy(&mut contents.as_bytes(), &mut encoder).expect("compress session");
+    encoder.finish().expect("finish compressed session");
+}
+
 fn report_total_tokens(output: &ReportOutput) -> u64 {
     match output {
         ReportOutput::Daily { totals, .. }
@@ -1290,13 +1308,155 @@ fn collect_session_files_recurses_and_filters_extensions() {
     let nested = temp.path().join("nested");
     fs::create_dir_all(&nested).expect("mkdir");
     fs::write(nested.join("a.jsonl"), "").expect("jsonl");
+    fs::write(nested.join("c.jsonl.zst"), "").expect("compressed jsonl");
     fs::write(nested.join("b.txt"), "").expect("txt");
 
     let mut files = Vec::new();
     collect_session_files(temp.path(), &mut files).expect("collect");
 
-    assert_eq!(files.len(), 1);
-    assert!(files[0].ends_with("a.jsonl"));
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().any(|path| path.ends_with("a.jsonl")));
+    assert!(files.iter().any(|path| path.ends_with("c.jsonl.zst")));
+    assert!(is_session_file_path(Path::new("session.jsonl.zst")));
+}
+
+#[test]
+fn build_report_reads_compressed_session_file() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    write_compressed_session_file(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":110}}}}\n",
+        ),
+    );
+
+    let report =
+        build_report(ReportKind::Session, &report_options_for_sessions(&sessions)).expect("report");
+
+    assert_eq!(report_total_tokens(&report), 110);
+}
+
+#[test]
+fn compressed_session_uses_logical_jsonl_identity() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let compressed_path = sessions.join("project").join("session.jsonl.zst");
+
+    assert_eq!(
+        session_file_id(&sessions, &compressed_path),
+        "project/session"
+    );
+    assert_eq!(
+        session_target_path_key(&compressed_path).expect("path key"),
+        session_target_path_key(&sessions.join("project").join("session.jsonl")).expect("path key")
+    );
+}
+
+#[test]
+fn compressed_sibling_is_ignored_when_plain_session_exists() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    fs::create_dir_all(session_file.parent().expect("session parent")).expect("mkdir");
+    fs::write(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":110}}}}\n",
+        ),
+    )
+    .expect("write plain session");
+    write_compressed_session_file(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":900,\"cached_input_tokens\":0,\"output_tokens\":90,\"reasoning_output_tokens\":0,\"total_tokens\":990}}}}\n",
+        ),
+    );
+
+    let report =
+        build_report(ReportKind::Session, &report_options_for_sessions(&sessions)).expect("report");
+
+    assert_eq!(report_total_tokens(&report), 110);
+}
+
+#[test]
+fn scan_index_caches_compressed_session_file() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    write_compressed_session_file(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":110}}}}\n",
+        ),
+    );
+    let options = report_options_for_sessions(&sessions);
+
+    let warm = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("warm indexed report");
+    let cached = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("cached indexed report");
+
+    assert_eq!(report_total_tokens(&warm), 110);
+    assert_eq!(cached, warm);
+    assert_scan_index_file_totals(
+        &index_path,
+        compressed_session_path(&session_file)
+            .metadata()
+            .expect("compressed metadata")
+            .len(),
+        110,
+    );
+}
+
+#[test]
+fn scan_index_rebuilds_changed_compressed_session_without_appending() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("session.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    write_compressed_session_file(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":110}}}}\n",
+        ),
+    );
+    let options = report_options_for_sessions(&sessions);
+    let warm = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("warm indexed report");
+    assert_eq!(report_total_tokens(&warm), 110);
+
+    write_compressed_session_file(
+        &session_file,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5\"}}\n",
+            "{\"timestamp\":\"2026-01-02T00:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":200,\"cached_input_tokens\":0,\"output_tokens\":20,\"reasoning_output_tokens\":0,\"total_tokens\":220}}}}\n",
+        ),
+    );
+
+    let rebuilt = build_report_with_scan_index(ReportKind::Session, &options, &index_path)
+        .expect("rebuilt indexed report");
+
+    assert_eq!(report_total_tokens(&rebuilt), 220);
+}
+
+#[test]
+fn watch_event_session_ids_accepts_compressed_session_files() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let path = sessions.join("today").join("session.jsonl.zst");
+
+    assert_eq!(
+        watch_event_session_ids(std::slice::from_ref(&sessions), &path),
+        vec!["today/session".to_string()]
+    );
 }
 
 #[test]
@@ -2715,6 +2875,7 @@ fn cached_watch_file_burn_events_skip_older_history() {
         target: SessionScanTarget {
             path: PathBuf::from("/tmp/session.jsonl"),
             path_key: "/tmp/session.jsonl".to_string(),
+            file_format: SessionFileFormat::Plain,
             session_id: "project/session".to_string(),
             bytes: 0,
             modified: None,
@@ -3883,6 +4044,7 @@ fn scan_target(session_id: &str, bytes: u64) -> SessionScanTarget {
         session_id: session_id.to_string(),
         path: PathBuf::from(format!("{session_id}.jsonl")),
         path_key: format!("{session_id}.jsonl"),
+        file_format: SessionFileFormat::Plain,
         bytes,
         modified: None,
         metadata: SessionFileMetadata::default(),

@@ -1,6 +1,7 @@
 //! File metadata for the scan index.
 
 use crate::app::report::SessionScanTarget;
+use crate::app::session_files::SessionFileFormat;
 use eyre::{Result, WrapErr, eyre};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -158,6 +159,8 @@ pub(super) struct ObservedFile {
     pub(super) path_key: String,
     /// File metadata stamp.
     pub(super) metadata: FileMetadata,
+    /// Physical file representation.
+    pub(super) file_format: SessionFileFormat,
 }
 
 impl ObservedFile {
@@ -166,6 +169,7 @@ impl ObservedFile {
         Self {
             path_key: target.path_key.clone(),
             metadata: FileMetadata::from_target(target),
+            file_format: target.file_format,
         }
     }
 }
@@ -173,6 +177,8 @@ impl ObservedFile {
 /// File metadata fields used to classify cache safety.
 #[derive(Clone)]
 pub(super) struct FileMetadata {
+    /// Physical file representation.
+    pub(super) file_format: SessionFileFormat,
     /// Indexed prefix size in bytes.
     pub(super) size: u64,
     /// Modification time in nanoseconds since Unix epoch.
@@ -189,6 +195,7 @@ impl FileMetadata {
     /// Build metadata fields from one selected target.
     fn from_target(target: &SessionScanTarget) -> Self {
         Self {
+            file_format: target.file_format,
             size: target.bytes,
             mtime_ns: target.metadata.mtime_ns,
             dev: target.metadata.dev,
@@ -199,7 +206,8 @@ impl FileMetadata {
 
     /// Return whether every observable content marker matches.
     pub(super) fn same_contents_as(&self, other: &Self) -> bool {
-        self.size == other.size
+        self.file_format == other.file_format
+            && self.size == other.size
             && self.mtime_ns == other.mtime_ns
             && self.dev == other.dev
             && self.ino == other.ino

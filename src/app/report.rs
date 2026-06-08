@@ -9,10 +9,16 @@ use super::scan_index::{
     IndexedScanRequest, ScanIndexConfig, scan_selected_session_targets_with_index,
 };
 use super::scan_runtime::{CliScanBatchRunner, ScanBehavior, ScanObserver};
+use super::session_files::{
+    SessionFileFormat, existing_session_path, plain_session_path, session_file_format,
+    should_skip_format,
+};
+#[cfg(test)]
+use super::session_log::scan_session_file_from_checkpoint;
 use super::session_log::{
     SessionParseCheckpoint, TokenUsageEvent, deserialize_optional_cow_lossy,
-    deserialize_optional_object_lossy, scan_session_file_from_checkpoint,
-    scan_session_file_with_callback_and_observer,
+    deserialize_optional_object_lossy, scan_session_file_from_checkpoint_with_format,
+    scan_session_file_with_callback_and_observer_with_format,
 };
 use crate::pricing::{Pricing, PricingCatalog, PricingLoadOptions, load_pricing_catalog};
 use chrono::{DateTime, Datelike, Days, NaiveDate, Utc};
@@ -369,8 +375,28 @@ pub(in crate::app) fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
 }
 
 /// Convert a session file path into a stable cache key without filesystem canonicalization.
+#[cfg(test)]
 pub(in crate::app) fn session_target_path_key(path: &Path) -> Result<String> {
-    Ok(normalize_absolute_path(path)?
+    session_target_path_key_for_format(
+        path,
+        session_file_format(path).unwrap_or(SessionFileFormat::Plain),
+    )
+}
+
+/// Convert a session file path with known format into a stable logical cache key.
+fn session_target_path_key_for_format(
+    path: &Path,
+    file_format: SessionFileFormat,
+) -> Result<String> {
+    let plain_path;
+    let logical_path = if file_format.is_compressed() {
+        plain_path = plain_session_path(path);
+        plain_path.as_path()
+    } else {
+        path
+    };
+
+    Ok(normalize_absolute_path(logical_path)?
         .to_string_lossy()
         .into_owned())
 }
@@ -449,13 +475,13 @@ pub(in crate::app) fn collect_session_files(root: &Path, files: &mut Vec<PathBuf
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             collect_session_files(&path, files)?;
-        } else if file_type.is_file()
-            && path
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-        {
-            files.push(path);
+        } else if file_type.is_file() {
+            let Some(file_format) = session_file_format(&path) else {
+                continue;
+            };
+            if !should_skip_format(&path, file_format) {
+                files.push(path);
+            }
         }
     }
     Ok(())
@@ -505,6 +531,8 @@ pub(in crate::app) struct SessionScanTarget {
     pub(in crate::app) session_id: String,
     /// Path to the selected JSONL file.
     pub(in crate::app) path: PathBuf,
+    /// Physical file representation.
+    pub(in crate::app) file_format: SessionFileFormat,
     /// File length used to detect newer copies across roots.
     pub(in crate::app) bytes: u64,
     /// Modification time used as a deterministic tie-breaker.
@@ -518,6 +546,11 @@ pub(in crate::app) struct SessionScanTarget {
 impl SessionScanTarget {
     /// Decide whether this candidate should replace an existing one.
     pub(in crate::app) fn is_preferred_over(&self, existing: &Self) -> bool {
+        if (self.file_format.is_compressed() || existing.file_format.is_compressed())
+            && self.modified != existing.modified
+        {
+            return self.modified > existing.modified;
+        }
         self.bytes > existing.bytes
             || (self.bytes == existing.bytes
                 && (self.modified > existing.modified
@@ -539,6 +572,7 @@ impl SessionScanTarget {
             bytes: metadata.len(),
             modified,
             metadata: SessionFileMetadata::from_metadata(&metadata, modified),
+            file_format: session_file_format(&self.path).unwrap_or(self.file_format),
             ..self.clone()
         })
     }
@@ -855,16 +889,21 @@ pub(in crate::app) fn resolve_session_target_across_roots(
 ) -> Result<Option<SessionScanTarget>> {
     let mut selected = None;
     for directory in session_dirs {
-        let path = session_file_path(directory, session_id);
+        let logical_path = session_file_path(directory, session_id);
+        let Some(path) = existing_session_path(&logical_path)? else {
+            continue;
+        };
         match fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => {
                 if !session_matches_project_filter(&path, project_filter)? {
                     continue;
                 }
                 let modified = metadata.modified().ok();
+                let file_format = session_file_format(&path).unwrap_or(SessionFileFormat::Plain);
                 let candidate = SessionScanTarget {
                     session_id: session_id.to_string(),
-                    path_key: session_target_path_key(&path)?,
+                    path_key: session_target_path_key_for_format(&path, file_format)?,
+                    file_format,
                     path,
                     bytes: metadata.len(),
                     modified,
@@ -878,7 +917,6 @@ pub(in crate::app) fn resolve_session_target_across_roots(
                 }
             }
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error).wrap_err_with(|| {
                     format!("failed to refresh session target {}", path.display())
@@ -1154,7 +1192,17 @@ struct SessionMetadataPayload<'a> {
 pub(in crate::app) fn read_session_metadata_cwd(file: &Path) -> Result<Option<PathBuf>> {
     let file_handle = File::open(file)
         .wrap_err_with(|| format!("failed to open session metadata file {}", file.display()))?;
-    let mut reader = BufReader::new(file_handle);
+    if session_file_format(file) == Some(SessionFileFormat::Compressed) {
+        let decoder = zstd::stream::read::Decoder::new(file_handle)
+            .wrap_err_with(|| format!("failed to decode compressed session {}", file.display()))?;
+        return read_session_metadata_cwd_from_reader(BufReader::new(decoder));
+    }
+
+    read_session_metadata_cwd_from_reader(BufReader::new(file_handle))
+}
+
+/// Read the logged working directory from an already-open decoded session reader.
+fn read_session_metadata_cwd_from_reader(mut reader: impl BufRead) -> Result<Option<PathBuf>> {
     let mut line = String::new();
 
     loop {
@@ -1207,6 +1255,7 @@ pub(in crate::app) fn collect_session_scan_targets(
 }
 
 /// Scan one JSONL session file into a report builder.
+#[cfg(test)]
 pub(in crate::app) fn scan_session_file(
     file: &Path,
     session_id: &str,
@@ -1221,19 +1270,36 @@ pub(in crate::app) fn scan_session_file(
     Ok(())
 }
 
-/// Scan one JSONL session file into a report builder with an explicit observer.
-pub(in crate::app) fn scan_session_file_with_observer<O>(
-    file: &Path,
-    session_id: &str,
+/// Scan one selected session target into a report builder.
+fn scan_session_target_file(target: &SessionScanTarget, builder: &mut ReportBuilder) -> Result<()> {
+    let _ = scan_session_file_from_checkpoint_with_format(
+        &target.path,
+        &target.session_id,
+        target.file_format,
+        &SessionParseCheckpoint::default(),
+        |event| builder.observe(event),
+    )?;
+    Ok(())
+}
+
+/// Scan one selected session target into a report builder with an explicit observer.
+fn scan_session_target_file_with_observer<O>(
+    target: &SessionScanTarget,
     builder: &mut ReportBuilder,
     observer: &O,
 ) -> Result<()>
 where
     O: ScanObserver,
 {
-    scan_session_file_with_callback_and_observer(file, session_id, observer, |event| {
-        builder.observe(event);
-    })
+    scan_session_file_with_callback_and_observer_with_format(
+        &target.path,
+        &target.session_id,
+        target.file_format,
+        observer,
+        |event| {
+            builder.observe(event);
+        },
+    )
 }
 
 /// Scan all selected targets, optionally across multiple worker threads.
@@ -1249,7 +1315,7 @@ pub(in crate::app) fn scan_selected_session_targets(
         selected_files,
         parallelism,
         || ReportBuilder::new(kind, timezone, since, until),
-        |target, builder| scan_session_file(&target.path, &target.session_id, builder),
+        scan_session_target_file,
     )
 }
 
@@ -1270,9 +1336,7 @@ where
         selected_files,
         parallelism,
         || ReportBuilder::new(kind, timezone, since, until),
-        |target, builder| {
-            scan_session_file_with_observer(&target.path, &target.session_id, builder, observer)
-        },
+        |target, builder| scan_session_target_file_with_observer(target, builder, observer),
     )
 }
 
@@ -1451,13 +1515,13 @@ pub(in crate::app) fn scan_session_tree(
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             scan_session_tree(root, &path, project_filter, selected_files)?;
-        } else if file_type.is_file()
-            && path
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-        {
-            register_session_target(root, &entry, project_filter, selected_files)?;
+        } else if file_type.is_file() {
+            let Some(file_format) = session_file_format(&path) else {
+                continue;
+            };
+            if !should_skip_format(&path, file_format) {
+                register_session_target(root, &entry, file_format, project_filter, selected_files)?;
+            }
         }
     }
 
@@ -1468,6 +1532,7 @@ pub(in crate::app) fn scan_session_tree(
 pub(in crate::app) fn register_session_target(
     root: &Path,
     entry: &std::fs::DirEntry,
+    file_format: SessionFileFormat,
     project_filter: Option<&ProjectFilter>,
     selected_files: &mut HashMap<String, SessionScanTarget>,
 ) -> Result<()> {
@@ -1477,10 +1542,11 @@ pub(in crate::app) fn register_session_target(
     }
     let metadata = entry.metadata()?;
     let modified = metadata.modified().ok();
-    let session_id = session_file_id(root, &path);
+    let session_id = session_file_id_for_format(root, &path, file_format);
     let candidate = SessionScanTarget {
         session_id: session_id.clone(),
-        path_key: session_target_path_key(&path)?,
+        path_key: session_target_path_key_for_format(&path, file_format)?,
+        file_format,
         path,
         bytes: metadata.len(),
         modified,
@@ -1552,7 +1618,26 @@ pub(in crate::app) fn merge_model_breakdowns(
 
 /// Derive the stable session identifier from a JSONL path.
 pub(in crate::app) fn session_file_id(root: &Path, file: &Path) -> String {
-    let mut relative = file.strip_prefix(root).unwrap_or(file).to_path_buf();
+    session_file_id_for_format(
+        root,
+        file,
+        session_file_format(file).unwrap_or(SessionFileFormat::Plain),
+    )
+}
+
+/// Derive the stable session identifier from a path with known format.
+fn session_file_id_for_format(root: &Path, file: &Path, file_format: SessionFileFormat) -> String {
+    let plain_file;
+    let logical_file = if file_format.is_compressed() {
+        plain_file = plain_session_path(file);
+        plain_file.as_path()
+    } else {
+        file
+    };
+    let mut relative = logical_file
+        .strip_prefix(root)
+        .unwrap_or(logical_file)
+        .to_path_buf();
     if relative.extension() == Some(std::ffi::OsStr::new("jsonl")) {
         relative.set_extension("");
     }

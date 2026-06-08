@@ -1,14 +1,36 @@
 //! Schema management for the scan index database.
 
 use eyre::Result;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// Current `SQLite` schema version.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Initialize or recreate the scan-index schema.
 pub(super) fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let transaction = connection.transaction()?;
+    reset_schema_if_needed(&transaction)?;
+    ensure_schema_tables(&transaction)?;
+    write_schema_version(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Drop advisory index tables when their schema version is stale.
+fn reset_schema_if_needed(transaction: &Transaction<'_>) -> Result<()> {
+    let existing_version = existing_schema_version(transaction)?;
+    if existing_version.as_deref() != Some(&SCHEMA_VERSION.to_string()) {
+        transaction.execute_batch(
+            "DROP TABLE IF EXISTS file_aggregates;
+             DROP TABLE IF EXISTS files;
+             DROP TABLE IF EXISTS meta;",
+        )?;
+    }
+    Ok(())
+}
+
+/// Read the stored scan-index schema version, if the meta table exists.
+fn existing_schema_version(transaction: &Transaction<'_>) -> Result<Option<String>> {
     let meta_exists = transaction
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
@@ -17,24 +39,21 @@ pub(super) fn initialize_schema(connection: &mut Connection) -> Result<()> {
         )
         .optional()?
         .is_some();
-    let existing_version = if meta_exists {
-        transaction
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-    } else {
-        None
-    };
-    if existing_version.as_deref() != Some(&SCHEMA_VERSION.to_string()) {
-        transaction.execute_batch(
-            "DROP TABLE IF EXISTS file_aggregates;
-             DROP TABLE IF EXISTS files;
-             DROP TABLE IF EXISTS meta;",
-        )?;
+    if !meta_exists {
+        return Ok(None);
     }
+
+    Ok(transaction
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+/// Ensure the current scan-index tables and indexes exist.
+fn ensure_schema_tables(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (
              key TEXT PRIMARY KEY,
@@ -45,6 +64,7 @@ pub(super) fn initialize_schema(connection: &mut Connection) -> Result<()> {
              path TEXT NOT NULL,
              generation INTEGER NOT NULL,
              parser_version INTEGER NOT NULL,
+             file_format TEXT NOT NULL,
              size INTEGER NOT NULL,
              mtime_ns INTEGER,
              dev INTEGER,
@@ -101,11 +121,15 @@ pub(super) fn initialize_schema(connection: &mut Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS file_aggregates_lookup
              ON file_aggregates(session_key, timezone, generation, group_kind);",
     )?;
+    Ok(())
+}
+
+/// Persist the current schema version into the meta table.
+fn write_schema_version(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![SCHEMA_VERSION.to_string()],
     )?;
-    transaction.commit()?;
     Ok(())
 }

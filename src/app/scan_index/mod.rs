@@ -14,7 +14,8 @@ use super::report::{
 };
 use super::scan_runtime::{ScanBatchRunner, ScanObserver};
 use super::session_log::{
-    RawUsage, SessionParseCheckpoint, scan_session_file_from_checkpoint_with_observer_and_bytes,
+    RawUsage, SessionParseCheckpoint,
+    scan_session_file_from_checkpoint_with_observer_and_bytes_and_format,
 };
 use chrono::NaiveDate;
 use chrono_tz::Tz;
@@ -743,9 +744,10 @@ where
 {
     let mut aggregates = FileAggregateSet::default();
     let mut parsed_hash = ParsedContentHash::default();
-    let checkpoint = scan_session_file_from_checkpoint_with_observer_and_bytes(
+    let checkpoint = scan_session_file_from_checkpoint_with_observer_and_bytes_and_format(
         &target.path,
         &target.session_id,
+        target.file_format,
         start_checkpoint,
         observer,
         |bytes| parsed_hash.observe(bytes),
@@ -753,7 +755,8 @@ where
     )?;
     observer.on_file_complete();
     let content_hash = if start_checkpoint.offset == 0 {
-        (parsed_hash.offset() == checkpoint.offset).then(|| parsed_hash.finish())
+        (target.file_format.is_compressed() || parsed_hash.offset() == checkpoint.offset)
+            .then(|| parsed_hash.finish())
     } else {
         content_hash_prefix(&target.path, checkpoint.offset).ok()
     };
