@@ -3,6 +3,7 @@
 use super::model::{DEFAULT_FALLBACK_MODEL, UsageTotals};
 use super::scan_runtime::ScanObserver;
 use super::session_files::{SessionFileFormat, session_file_format};
+use super::session_lineage::{is_inter_agent_communication_boundary, is_spawned_subagent_metadata};
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use memchr::memmem::Finder;
@@ -111,6 +112,41 @@ pub(in crate::app) struct SessionParseCheckpoint {
     pub(in crate::app) current_model: Option<String>,
     /// Whether the remembered model came from fallback inference.
     pub(in crate::app) current_model_is_fallback: bool,
+    /// Whether usage should be emitted or is still part of an inherited subagent replay.
+    pub(in crate::app) replay_state: ReplayState,
+}
+
+/// Usage-emission state for rollout files that may begin with inherited agent history.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::app) enum ReplayState {
+    /// The first non-empty record has not been classified yet.
+    #[default]
+    AwaitingFirstRecord,
+    /// A spawned subagent's inherited prefix is being parsed but not emitted.
+    SuppressingInherited,
+    /// Records belong to this rollout and may emit usage.
+    CountingOwn,
+}
+
+impl ReplayState {
+    /// Encode the state for the persistent scan index.
+    pub(in crate::app) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitingFirstRecord => "awaiting_first_record",
+            Self::SuppressingInherited => "suppressing_inherited",
+            Self::CountingOwn => "counting_own",
+        }
+    }
+
+    /// Decode a state stored by the persistent scan index.
+    pub(in crate::app) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "awaiting_first_record" => Some(Self::AwaitingFirstRecord),
+            "suppressing_inherited" => Some(Self::SuppressingInherited),
+            "counting_own" => Some(Self::CountingOwn),
+            _ => None,
+        }
+    }
 }
 
 /// Normalized token usage event emitted by the session parser.
@@ -874,6 +910,7 @@ fn scan_session_file_from_checkpoint_inner(
     let mut previous_totals = checkpoint.previous_totals;
     let mut current_model = checkpoint.current_model.clone();
     let mut current_model_is_fallback = checkpoint.current_model_is_fallback;
+    let mut replay_state = checkpoint.replay_state;
     let mut reader = reader;
     let mut offset = checkpoint.offset;
     loop {
@@ -895,6 +932,7 @@ fn scan_session_file_from_checkpoint_inner(
             offset = line_start_offset;
             break;
         }
+        classify_replay_record(trimmed, &mut replay_state);
         if !line_might_affect_usage_bytes(trimmed) {
             on_bytes(&line);
             offset = next_offset;
@@ -907,7 +945,8 @@ fn scan_session_file_from_checkpoint_inner(
             &mut previous_totals,
             &mut current_model,
             &mut current_model_is_fallback,
-        )? {
+        )? && replay_state == ReplayState::CountingOwn
+        {
             on_event(&event);
         }
         on_bytes(&line);
@@ -918,6 +957,7 @@ fn scan_session_file_from_checkpoint_inner(
         previous_totals,
         current_model,
         current_model_is_fallback,
+        replay_state,
     })
 }
 
@@ -935,6 +975,7 @@ fn scan_session_reader(
     let mut previous_totals = checkpoint.previous_totals;
     let mut current_model = checkpoint.current_model.clone();
     let mut current_model_is_fallback = checkpoint.current_model_is_fallback;
+    let mut replay_state = checkpoint.replay_state;
     let mut offset = start_offset;
     let mut stopped_at_partial_record = false;
     loop {
@@ -957,6 +998,7 @@ fn scan_session_reader(
             stopped_at_partial_record = true;
             break;
         }
+        classify_replay_record(trimmed, &mut replay_state);
         if !line_might_affect_usage_bytes(trimmed) {
             on_bytes(&line);
             offset = next_offset;
@@ -969,7 +1011,8 @@ fn scan_session_reader(
             &mut previous_totals,
             &mut current_model,
             &mut current_model_is_fallback,
-        )? {
+        )? && replay_state == ReplayState::CountingOwn
+        {
             on_event(&event);
         }
         on_bytes(&line);
@@ -984,7 +1027,25 @@ fn scan_session_reader(
         previous_totals,
         current_model,
         current_model_is_fallback,
+        replay_state,
     })
+}
+
+/// Advance inherited-history handling from one complete non-empty JSONL record.
+fn classify_replay_record(line: &[u8], replay_state: &mut ReplayState) {
+    match replay_state {
+        ReplayState::AwaitingFirstRecord => {
+            *replay_state = if is_spawned_subagent_metadata(line) {
+                ReplayState::SuppressingInherited
+            } else {
+                ReplayState::CountingOwn
+            };
+        }
+        ReplayState::SuppressingInherited if is_inter_agent_communication_boundary(line) => {
+            *replay_state = ReplayState::CountingOwn;
+        }
+        ReplayState::SuppressingInherited | ReplayState::CountingOwn => {}
+    }
 }
 
 /// Return whether one JSONL line might affect usage aggregation.

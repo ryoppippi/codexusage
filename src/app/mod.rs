@@ -45,6 +45,9 @@ mod scan_runtime;
 /// Session rollout path and reader helpers.
 mod session_files;
 
+/// Spawned-session metadata and lineage helpers.
+mod session_lineage;
+
 /// Codex account limit fetching for watch mode.
 mod codex_limits;
 

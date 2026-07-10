@@ -6,13 +6,13 @@ use super::{bool_to_i64, i64_to_u64, raw_usage_from_options, u64_to_i64, usage_f
 use crate::app::model::UsageTotals;
 use crate::app::report::SessionScanTarget;
 use crate::app::session_files::SessionFileFormat;
-use crate::app::session_log::SessionParseCheckpoint;
+use crate::app::session_log::{ReplayState, SessionParseCheckpoint};
 use eyre::Result;
 use rusqlite::{Connection, Transaction, params, params_from_iter};
 use std::collections::HashMap;
 
 /// Parser-state version stored with checkpoints.
-const PARSER_VERSION: i64 = 1;
+const PARSER_VERSION: i64 = 2;
 
 /// Full result of parsing one selected file.
 #[derive(Clone)]
@@ -144,6 +144,8 @@ pub(super) struct RawStoredFileRecord {
     current_model: Option<String>,
     /// Whether the current model came from fallback inference.
     current_model_is_fallback: i64,
+    /// Inherited-history handling state.
+    replay_state: String,
     /// Encoded hash of bytes up to the checkpoint offset.
     content_hash: String,
     /// Full-file input tokens.
@@ -190,17 +192,18 @@ impl RawStoredFileRecord {
             previous_total: row.get(15)?,
             current_model: row.get(16)?,
             current_model_is_fallback: row.get(17)?,
-            content_hash: row.get(18)?,
-            total_input: row.get(19)?,
-            total_cached_input: row.get(20)?,
-            total_output: row.get(21)?,
-            total_reasoning_output: row.get(22)?,
-            total_tokens: row.get(23)?,
-            fallback_input: row.get(24)?,
-            fallback_cached_input: row.get(25)?,
-            fallback_output: row.get(26)?,
-            fallback_reasoning_output: row.get(27)?,
-            fallback_total: row.get(28)?,
+            replay_state: row.get(18)?,
+            content_hash: row.get(19)?,
+            total_input: row.get(20)?,
+            total_cached_input: row.get(21)?,
+            total_output: row.get(22)?,
+            total_reasoning_output: row.get(23)?,
+            total_tokens: row.get(24)?,
+            fallback_input: row.get(25)?,
+            fallback_cached_input: row.get(26)?,
+            fallback_output: row.get(27)?,
+            fallback_reasoning_output: row.get(28)?,
+            fallback_total: row.get(29)?,
         })
     }
 
@@ -237,6 +240,7 @@ impl RawStoredFileRecord {
                 previous_totals,
                 current_model: self.current_model,
                 current_model_is_fallback: self.current_model_is_fallback != 0,
+                replay_state: ReplayState::from_str(&self.replay_state)?,
             },
             content_hash: ContentHash::decode(&self.content_hash)?,
             total: usage_from_i64(
@@ -264,7 +268,7 @@ const QUERY_KEY_CHUNK_SIZE: usize = 900;
 const FILE_RECORD_COLUMNS: &str = "session_key, path, generation, parser_version, file_format, \
  size, mtime_ns, dev, ino, ctime_ns, checkpoint_offset, previous_input, previous_cached_input, \
  previous_output, previous_reasoning_output, previous_total, current_model, \
- current_model_is_fallback, content_hash, total_input, total_cached_input, \
+ current_model_is_fallback, replay_state, content_hash, total_input, total_cached_input, \
  total_output, total_reasoning_output, total_tokens, fallback_input, \
  fallback_cached_input, fallback_output, fallback_reasoning_output, fallback_total";
 
@@ -331,12 +335,13 @@ pub(super) fn update_file_record_conditionally(
          mtime_ns = ?5, dev = ?6, ino = ?7, ctime_ns = ?8, checkpoint_offset = ?9, \
          previous_input = ?10, previous_cached_input = ?11, previous_output = ?12, \
          previous_reasoning_output = ?13, previous_total = ?14, current_model = ?15, \
-         current_model_is_fallback = ?16, content_hash = ?17, total_input = ?18, \
-         total_cached_input = ?19, total_output = ?20, total_reasoning_output = ?21, \
-         total_tokens = ?22, fallback_input = ?23, fallback_cached_input = ?24, \
-         fallback_output = ?25, fallback_reasoning_output = ?26, fallback_total = ?27 \
-         WHERE session_key = ?28 AND path = ?29 AND generation = ?30 AND size = ?31 \
-         AND checkpoint_offset = ?32",
+         current_model_is_fallback = ?16, replay_state = ?17, content_hash = ?18, \
+         total_input = ?19, total_cached_input = ?20, total_output = ?21, \
+         total_reasoning_output = ?22, total_tokens = ?23, fallback_input = ?24, \
+         fallback_cached_input = ?25, fallback_output = ?26, \
+         fallback_reasoning_output = ?27, fallback_total = ?28 \
+         WHERE session_key = ?29 AND path = ?30 AND generation = ?31 AND size = ?32 \
+         AND checkpoint_offset = ?33",
         params![
             generation,
             PARSER_VERSION,
@@ -374,6 +379,7 @@ pub(super) fn update_file_record_conditionally(
                 .transpose()?,
             cache_entry.checkpoint.current_model.as_deref(),
             bool_to_i64(cache_entry.checkpoint.current_model_is_fallback),
+            cache_entry.checkpoint.replay_state.as_str(),
             cache_entry.content_hash.encode(),
             u64_to_i64(total.input)?,
             u64_to_i64(total.cached_input)?,
@@ -408,13 +414,13 @@ pub(super) fn upsert_file_record(
              session_key, path, generation, parser_version, file_format, size, mtime_ns, dev,
              ino, ctime_ns, checkpoint_offset, previous_input, previous_cached_input,
              previous_output, previous_reasoning_output, previous_total, current_model,
-             current_model_is_fallback, content_hash, total_input, total_cached_input,
+             current_model_is_fallback, replay_state, content_hash, total_input, total_cached_input,
              total_output, total_reasoning_output, total_tokens, fallback_input,
              fallback_cached_input, fallback_output,
              fallback_reasoning_output, fallback_total
          ) VALUES (
              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
          )
          ON CONFLICT(session_key) DO UPDATE SET
              path = excluded.path,
@@ -434,6 +440,7 @@ pub(super) fn upsert_file_record(
              previous_total = excluded.previous_total,
              current_model = excluded.current_model,
              current_model_is_fallback = excluded.current_model_is_fallback,
+             replay_state = excluded.replay_state,
              content_hash = excluded.content_hash,
              total_input = excluded.total_input,
              total_cached_input = excluded.total_cached_input,
@@ -484,6 +491,7 @@ pub(super) fn upsert_file_record(
                 .transpose()?,
             cache_entry.checkpoint.current_model.as_deref(),
             bool_to_i64(cache_entry.checkpoint.current_model_is_fallback),
+            cache_entry.checkpoint.replay_state.as_str(),
             cache_entry.content_hash.encode(),
             u64_to_i64(total.input)?,
             u64_to_i64(total.cached_input)?,

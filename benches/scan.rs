@@ -225,6 +225,82 @@ fn cumulative_usage_benchmark(criterion: &mut Criterion) {
     });
 }
 
+fn spawned_replay_benchmark(criterion: &mut Criterion) {
+    let fixture = TempDir::new().expect("tempdir");
+    let sessions_dir = fixture.path().join("sessions");
+    let inherited_usage = (0..1_000)
+        .map(|index| {
+            json!({
+                "timestamp": event_timestamp(index),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 120 * (index + 1),
+                            "cached_input_tokens": 20 * (index + 1),
+                            "output_tokens": 50 * (index + 1),
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 170 * (index + 1)
+                        }
+                    }
+                }
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    let own_usage = (1..=20)
+        .map(|index| {
+            json!({
+                "timestamp": event_timestamp(1_000 + index),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 120_000 + 120 * index,
+                            "cached_input_tokens": 20_000 + 20 * index,
+                            "output_tokens": 50_000 + 50 * index,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 170_000 + 170 * index
+                        }
+                    }
+                }
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    let fixture_contents = std::iter::once(
+        r#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}}"#.to_string(),
+    )
+    .chain(std::iter::once(
+        r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#.to_string(),
+    ))
+    .chain(inherited_usage)
+    .chain(std::iter::once(
+        r#"{"type":"inter_agent_communication_metadata"}"#.to_string(),
+    ))
+    .chain(own_usage)
+    .collect::<Vec<_>>()
+    .join("\n");
+    write_session_file(
+        &sessions_dir,
+        "project/child.jsonl",
+        &format!("{fixture_contents}\n"),
+    );
+
+    let options = base_options(vec![sessions_dir]);
+    criterion.bench_function(
+        "daily_report_scan_spawned_replay_1000_inherited_20_own",
+        |bench| {
+            bench.iter(|| {
+                let report = build_report(ReportKind::Daily, &options).expect("build report");
+                std::hint::black_box(report);
+            });
+        },
+    );
+}
+
 fn duplicate_root_selection_benchmark(criterion: &mut Criterion) {
     let fixture = TempDir::new().expect("tempdir");
     let first_root = fixture.path().join("sessions-a");
@@ -371,6 +447,7 @@ criterion_group! {
         cached_many_file_scan_index_benchmark,
         many_file_scan_benchmark,
         cumulative_usage_benchmark,
+        spawned_replay_benchmark,
         duplicate_root_selection_benchmark,
         project_filter_discovery_benchmark,
         mixed_workload_benchmark

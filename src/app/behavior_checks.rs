@@ -2542,6 +2542,305 @@ fn scan_session_file_from_checkpoint_reads_only_appended_suffix() {
 }
 
 #[test]
+fn spawned_subagent_emits_only_usage_after_communication_boundary() {
+    let temp = TempDir::new().expect("tempdir");
+    let session_file = temp.path().join("child.jsonl");
+    fs::write(
+        &session_file,
+        [
+            r#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}}"#,
+            r#"{"type":"session_meta","payload":{"id":"parent","source":"user"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-01-02T00:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+            r#"{"type":"inter_agent_communication_metadata","payload":{"recipient":"child"}}"#,
+            r#"{"timestamp":"2026-01-02T00:10:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"output_tokens":12,"total_tokens":132}}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write spawned session");
+
+    let mut events = Vec::new();
+    scan_session_file_from_checkpoint(
+        &session_file,
+        "project/child",
+        &SessionParseCheckpoint::default(),
+        |event| {
+            events.push((event.usage.input, event.usage.output, event.usage.total));
+        },
+    )
+    .expect("scan spawned session");
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0], (20, 2, 22));
+}
+
+#[test]
+fn session_report_folds_spawned_subagent_usage_into_root_session() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let project = sessions.join("project");
+    fs::create_dir_all(&project).expect("mkdir");
+    fs::write(
+        project.join("parent.jsonl"),
+        [
+            r#"{"type":"session_meta","payload":{"id":"parent","source":"user"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-01-02T00:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write parent session");
+    fs::write(
+        project.join("child.jsonl"),
+        [
+            r#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}}"#,
+            r#"{"type":"session_meta","payload":{"id":"parent","source":"user"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-01-02T00:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+            r#"{"type":"inter_agent_communication_metadata"}"#,
+            r#"{"timestamp":"2026-01-02T00:10:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"output_tokens":12,"total_tokens":132}}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write child session");
+
+    let report =
+        build_report(ReportKind::Session, &report_options_for_sessions(&sessions)).expect("report");
+    let ReportOutput::Session { rows, totals, .. } = report else {
+        panic!("expected session report");
+    };
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, "project/parent");
+    assert_eq!(rows[0].total_tokens, 132);
+    assert_eq!(totals.total_tokens, 132);
+}
+
+#[test]
+fn scan_index_preserves_inherited_replay_state_across_append_scans() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("project").join("child.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    fs::create_dir_all(session_file.parent().expect("session parent")).expect("mkdir");
+    let inherited_prefix = [
+        r#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{"thread_spawn":{"parent_thread_id":"missing-parent"}}}}}"#,
+        r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        r#"{"timestamp":"2026-01-02T00:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+    ]
+    .join("\n");
+    fs::write(&session_file, format!("{inherited_prefix}\n")).expect("write inherited prefix");
+    let options = report_options_for_sessions(&sessions);
+
+    let initial = build_report_with_scan_index(ReportKind::Daily, &options, &index_path)
+        .expect("initial indexed report");
+    assert_eq!(report_total_tokens(&initial), 0);
+
+    fs::write(
+        &session_file,
+        format!(
+            "{inherited_prefix}\n{}\n",
+            r#"{"timestamp":"2026-01-02T00:06:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110,"output_tokens":11,"total_tokens":121}}}}"#,
+        ),
+    )
+    .expect("append inherited event");
+
+    let appended = build_report_with_scan_index(ReportKind::Daily, &options, &index_path)
+        .expect("appended indexed report");
+    assert_eq!(report_total_tokens(&appended), 0);
+}
+
+#[test]
+fn legacy_subagents_and_post_boundary_followups_remain_counted() {
+    let temp = TempDir::new().expect("tempdir");
+    let legacy_file = temp.path().join("legacy.jsonl");
+    fs::write(
+        &legacy_file,
+        [
+            r#"{"type":"session_meta","payload":{"id":"legacy","source":{"subagent":"review"}}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-01-02T00:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write legacy session");
+    let mut legacy_events = Vec::new();
+    scan_session_file_from_checkpoint(
+        &legacy_file,
+        "legacy",
+        &SessionParseCheckpoint::default(),
+        |event| legacy_events.push(event.usage.total),
+    )
+    .expect("scan legacy session");
+    assert_eq!(legacy_events, vec![11]);
+
+    let spawned_file = temp.path().join("spawned.jsonl");
+    fs::write(
+        &spawned_file,
+        [
+            r#"{"type":"session_meta","payload":{"id":"spawned","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-01-02T00:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+            r#"{"type":"inter_agent_communication_metadata"}"#,
+            r#"{"timestamp":"2026-01-02T00:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110,"output_tokens":11,"total_tokens":121}}}}"#,
+            r#"{"type":"inter_agent_communication_metadata"}"#,
+            r#"{"timestamp":"2026-01-02T00:04:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"output_tokens":12,"total_tokens":132}}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write spawned session");
+    let mut spawned_events = Vec::new();
+    scan_session_file_from_checkpoint(
+        &spawned_file,
+        "spawned",
+        &SessionParseCheckpoint::default(),
+        |event| spawned_events.push(event.usage.total),
+    )
+    .expect("scan spawned session");
+    assert_eq!(spawned_events, vec![11, 11]);
+}
+
+#[test]
+fn session_report_folds_nested_and_compressed_subagents_transitively() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let project = sessions.join("project");
+    fs::create_dir_all(&project).expect("mkdir");
+    fs::write(
+        project.join("root.jsonl"),
+        [
+            r#"{"type":"session_meta","payload":{"id":"root","source":"user"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-01-02T00:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write root");
+    fs::write(
+        project.join("parent.jsonl"),
+        [
+            r#"{"type":"session_meta","payload":{"id":"parent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}}}"#,
+            r#"{"type":"inter_agent_communication_metadata"}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-01-02T00:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write parent");
+    write_compressed_session_file(
+        &project.join("child.jsonl"),
+        &[
+            r#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}}"#,
+            r#"{"type":"inter_agent_communication_metadata"}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-01-02T00:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}}"#,
+        ]
+        .join("\n"),
+    );
+
+    let report =
+        build_report(ReportKind::Session, &report_options_for_sessions(&sessions)).expect("report");
+    let ReportOutput::Session { rows, totals, .. } = report else {
+        panic!("expected session report");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, "project/root");
+    assert_eq!(rows[0].total_tokens, 15);
+    assert_eq!(totals.total_tokens, 15);
+}
+
+#[test]
+fn session_report_keeps_missing_and_cyclic_parents_as_separate_rows() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    fs::create_dir_all(&sessions).expect("mkdir");
+    for (thread_id, parent_thread_id, total) in
+        [("missing", "absent", 4), ("a", "b", 5), ("b", "a", 6)]
+    {
+        fs::write(
+            sessions.join(format!("{thread_id}.jsonl")),
+            [
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {"parent_thread_id": parent_thread_id}
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                r#"{"type":"inter_agent_communication_metadata"}"#.to_string(),
+                r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#.to_string(),
+                json!({
+                    "timestamp": "2026-01-02T00:01:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": total,
+                                "output_tokens": 0,
+                                "total_tokens": total,
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write session");
+    }
+
+    let report =
+        build_report(ReportKind::Session, &report_options_for_sessions(&sessions)).expect("report");
+    let ReportOutput::Session { rows, totals, .. } = report else {
+        panic!("expected session report");
+    };
+    assert_eq!(rows.len(), 3);
+    assert_eq!(totals.total_tokens, 15);
+}
+
+#[test]
+fn scan_index_rebuilds_schema_three_before_using_cached_aggregates() {
+    let temp = TempDir::new().expect("tempdir");
+    let sessions = temp.path().join("sessions");
+    let session_file = sessions.join("session.jsonl");
+    let index_path = temp.path().join("scan-index.sqlite3");
+    write_scan_index_session(&session_file, 10, 1);
+    let connection = rusqlite::Connection::open(&index_path).expect("open old index");
+    connection
+        .execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '3');
+             CREATE TABLE files (obsolete INTEGER);",
+        )
+        .expect("create schema three index");
+    drop(connection);
+
+    let report = build_report_with_scan_index(
+        ReportKind::Daily,
+        &report_options_for_sessions(&sessions),
+        &index_path,
+    )
+    .expect("rebuild indexed report");
+    assert_eq!(report_total_tokens(&report), 11);
+
+    let connection = rusqlite::Connection::open(index_path).expect("reopen index");
+    let schema_version: String = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(schema_version, "4");
+}
+
+#[test]
 fn scan_session_file_from_checkpoint_retries_unterminated_jsonl_record() {
     let temp = TempDir::new().expect("tempdir");
     let session_file = temp.path().join("session.jsonl");

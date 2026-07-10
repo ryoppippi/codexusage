@@ -4,7 +4,7 @@ use eyre::Result;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// Current `SQLite` schema version.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Initialize or recreate the scan-index schema.
 pub(super) fn initialize_schema(connection: &mut Connection) -> Result<()> {
@@ -78,6 +78,7 @@ fn ensure_schema_tables(transaction: &Transaction<'_>) -> Result<()> {
              previous_total INTEGER,
              current_model TEXT,
              current_model_is_fallback INTEGER NOT NULL,
+             replay_state TEXT NOT NULL,
              content_hash TEXT NOT NULL,
              total_input INTEGER NOT NULL,
              total_cached_input INTEGER NOT NULL,

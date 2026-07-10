@@ -13,23 +13,20 @@ use super::session_files::{
     SessionFileFormat, existing_session_path, plain_session_path, session_file_format,
     should_skip_format,
 };
+use super::session_lineage::{SessionDescriptor, read_session_descriptor};
 #[cfg(test)]
 use super::session_log::scan_session_file_from_checkpoint;
 use super::session_log::{
-    SessionParseCheckpoint, TokenUsageEvent, deserialize_optional_cow_lossy,
-    deserialize_optional_object_lossy, scan_session_file_from_checkpoint_with_format,
+    SessionParseCheckpoint, TokenUsageEvent, scan_session_file_from_checkpoint_with_format,
     scan_session_file_with_callback_and_observer_with_format,
 };
 use crate::pricing::{Pricing, PricingCatalog, PricingLoadOptions, load_pricing_catalog};
 use chrono::{DateTime, Datelike, Days, NaiveDate, Utc};
 use chrono_tz::Tz;
 use eyre::{Result, WrapErr, eyre};
-use serde::Deserialize;
-use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 use std::hash::Hash;
-use std::io::{BufRead, BufReader};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -226,6 +223,10 @@ where
         prepared.until,
     )?;
     builder.merge(scanned);
+    if kind == ReportKind::Session {
+        let attributions = build_session_attributions(&selected_files)?;
+        builder.fold_session_summaries(&attributions);
+    }
     Ok(builder.finish(
         &prepared.pricing,
         prepared.presentation,
@@ -820,6 +821,27 @@ impl ReportBuilder {
         merge_session_summaries(&mut self.session, other.session);
     }
 
+    /// Fold spawned-agent summaries into their resolved root sessions.
+    fn fold_session_summaries(&mut self, attributions: &HashMap<String, String>) {
+        if attributions.is_empty() {
+            return;
+        }
+        let mut folded = HashMap::with_capacity(self.session.len());
+        for (session_key, mut summary) in std::mem::take(&mut self.session) {
+            let attributed_key = attributions
+                .get(&session_key)
+                .cloned()
+                .unwrap_or(session_key);
+            summary.display_session_id.clone_from(&attributed_key);
+            if let Some(existing) = folded.get_mut(&attributed_key) {
+                merge_session_summary(existing, summary);
+            } else {
+                folded.insert(attributed_key, summary);
+            }
+        }
+        self.session = folded;
+    }
+
     /// Merge one cached file-local day summary into this report.
     pub(in crate::app) fn merge_file_day_summary(
         &mut self,
@@ -1153,76 +1175,61 @@ pub(in crate::app) fn session_matches_project_filter(
     let Some(project_filter) = project_filter else {
         return Ok(true);
     };
-    let Some(cwd) = read_session_metadata_cwd(file)? else {
+    let Some(cwd) = read_session_descriptor(file)?.and_then(|descriptor| descriptor.cwd) else {
         return Ok(false);
     };
 
     project_filter.matches_logged_cwd(&cwd)
 }
 
-/// One parsed JSONL entry used for project-filter metadata.
-#[derive(Deserialize)]
-struct SessionMetadataLogEntry<'a> {
-    /// Entry kind.
-    #[serde(
-        rename = "type",
-        borrow,
-        default,
-        deserialize_with = "deserialize_optional_cow_lossy"
-    )]
-    entry_type: Option<Cow<'a, str>>,
-    /// Session metadata payload.
-    #[serde(
-        borrow,
-        default,
-        deserialize_with = "deserialize_optional_object_lossy"
-    )]
-    payload: Option<SessionMetadataPayload<'a>>,
-}
-
-/// Payload fields used by session metadata.
-#[derive(Deserialize)]
-struct SessionMetadataPayload<'a> {
-    /// Working directory recorded when the session started.
-    #[serde(borrow, default, deserialize_with = "deserialize_optional_cow_lossy")]
-    cwd: Option<Cow<'a, str>>,
-}
-
-/// Read the logged working directory from the first non-empty session metadata line.
-pub(in crate::app) fn read_session_metadata_cwd(file: &Path) -> Result<Option<PathBuf>> {
-    let file_handle = File::open(file)
-        .wrap_err_with(|| format!("failed to open session metadata file {}", file.display()))?;
-    if session_file_format(file) == Some(SessionFileFormat::Compressed) {
-        let decoder = zstd::stream::read::Decoder::new(file_handle)
-            .wrap_err_with(|| format!("failed to decode compressed session {}", file.display()))?;
-        return read_session_metadata_cwd_from_reader(BufReader::new(decoder));
+/// Resolve each spawned rollout to the highest available non-cyclic ancestor session.
+fn build_session_attributions(
+    selected_files: &[SessionScanTarget],
+) -> Result<HashMap<String, String>> {
+    let mut descriptors = HashMap::<String, SessionDescriptor>::new();
+    let mut sessions_by_thread = HashMap::<String, String>::new();
+    for target in selected_files {
+        let Some(descriptor) = read_session_descriptor(&target.path)? else {
+            continue;
+        };
+        if let Some(thread_id) = descriptor.thread_id.as_ref() {
+            sessions_by_thread.insert(thread_id.clone(), target.session_id.clone());
+        }
+        descriptors.insert(target.session_id.clone(), descriptor);
     }
 
-    read_session_metadata_cwd_from_reader(BufReader::new(file_handle))
+    let mut attributions = HashMap::new();
+    for session_id in descriptors.keys() {
+        let root = resolve_root_session_id(session_id, &descriptors, &sessions_by_thread);
+        if root != *session_id {
+            attributions.insert(session_id.clone(), root);
+        }
+    }
+    Ok(attributions)
 }
 
-/// Read the logged working directory from an already-open decoded session reader.
-fn read_session_metadata_cwd_from_reader(mut reader: impl BufRead) -> Result<Option<PathBuf>> {
-    let mut line = String::new();
-
+/// Follow parent thread identifiers while every ancestor remains selected and acyclic.
+fn resolve_root_session_id(
+    session_id: &str,
+    descriptors: &HashMap<String, SessionDescriptor>,
+    sessions_by_thread: &HashMap<String, String>,
+) -> String {
+    let mut current = session_id;
+    let mut visited = HashSet::new();
     loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(None);
+        if !visited.insert(current) {
+            return session_id.to_string();
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<SessionMetadataLogEntry<'_>>(trimmed) else {
-            return Ok(None);
+        let Some(parent_thread_id) = descriptors
+            .get(current)
+            .and_then(|descriptor| descriptor.parent_thread_id.as_deref())
+        else {
+            return current.to_string();
         };
-        if entry.entry_type.as_deref() != Some("session_meta") {
-            return Ok(None);
-        }
-        return Ok(entry
-            .payload
-            .and_then(|payload| payload.cwd.map(|cwd| PathBuf::from(cwd.as_ref()))));
+        let Some(parent_session_id) = sessions_by_thread.get(parent_thread_id) else {
+            return current.to_string();
+        };
+        current = parent_session_id;
     }
 }
 
@@ -1587,14 +1594,19 @@ pub(in crate::app) fn merge_session_summaries(
 ) {
     for (session_key, source_summary) in source {
         if let Some(existing) = target.get_mut(&session_key) {
-            existing.totals.add(&source_summary.totals);
-            existing.last_activity = existing.last_activity.max(source_summary.last_activity);
-            merge_model_breakdowns(&mut existing.models, source_summary.models);
+            merge_session_summary(existing, source_summary);
             continue;
         }
 
         target.insert(session_key, source_summary);
     }
+}
+
+/// Merge one physical session summary into an existing attributed session.
+fn merge_session_summary(target: &mut SessionSummary, source: SessionSummary) {
+    target.totals.add(&source.totals);
+    target.last_activity = target.last_activity.max(source.last_activity);
+    merge_model_breakdowns(&mut target.models, source.models);
 }
 
 /// Merge per-model usage without allocating intermediate report rows.
