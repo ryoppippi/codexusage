@@ -1,5 +1,13 @@
 //! Watch-mode runtime and incremental refresh helpers.
 
+#[path = "watch/terminal.rs"]
+mod terminal;
+
+pub(in crate::app) use terminal::supports_watch_screen_clear;
+#[cfg(test)]
+pub(in crate::app) use terminal::supports_watch_screen_clear_with_platform;
+use terminal::{WatchInterrupt, WatchTerminal};
+
 use super::codex_limits::{
     CodexLimitStatus, codex_limit_status_for_watch_start, fetch_codex_limits,
 };
@@ -411,13 +419,15 @@ pub(in crate::app) fn run_watch_loop(
     let mut last_pricing_refresh_attempt_at = startup_refresh_attempted.then_some(now);
     let (mut codex_limit_status, mut last_codex_limit_refresh_attempt_at) =
         initial_codex_limit_watch_state(options.offline);
-    let should_clear = supports_watch_screen_clear(std::env::var("TERM").ok().as_deref());
-    if !should_clear {
+    if !supports_watch_screen_clear(std::env::var("TERM").ok().as_deref()) {
         return Err(eyre!(
             "watch mode requires a terminal with ANSI screen-clearing support"
         ));
     }
+    let interrupt = WatchInterrupt::install()?;
     let mut stdout = std::io::stdout().lock();
+    let mut terminal = WatchTerminal::enter(&mut stdout)
+        .wrap_err("failed to enter alternate screen for watch mode")?;
     loop {
         let loop_started_at = Instant::now();
         let now = SystemTime::now();
@@ -452,7 +462,7 @@ pub(in crate::app) fn run_watch_loop(
             options.show_model_burn_rate,
         )?;
         write_watch_snapshot(
-            &mut stdout,
+            terminal.output(),
             &snapshot,
             options,
             &codex_limit_status,
@@ -463,11 +473,15 @@ pub(in crate::app) fn run_watch_loop(
             &refresh_scan_runner,
             scan_index,
         ));
-        thread::sleep(remaining_watch_sleep(
-            options.interval,
-            loop_started_at.elapsed(),
-        ));
+        let sleep = remaining_watch_sleep(options.interval, loop_started_at.elapsed());
+        if interrupt.wait_timeout(sleep) {
+            break;
+        }
     }
+    terminal
+        .leave()
+        .wrap_err("failed to restore terminal after watch mode")?;
+    Ok(())
 }
 
 /// Build startup and steady-state scan runners for watch mode.
@@ -579,68 +593,6 @@ pub(in crate::app) fn watch_codex_limits_refresh_due(
             now.duration_since(attempted_at)
                 .is_ok_and(|elapsed| elapsed >= WATCH_LIMITS_REFRESH_INTERVAL)
         })
-}
-
-/// Decide whether the terminal should receive ANSI clear-screen sequences.
-pub(in crate::app) fn supports_watch_screen_clear(term: Option<&str>) -> bool {
-    supports_watch_screen_clear_with_platform(term, cfg!(windows), windows_stdout_supports_ansi())
-}
-
-/// Decide whether the terminal should receive ANSI clear-screen sequences.
-pub(in crate::app) fn supports_watch_screen_clear_with_platform(
-    term: Option<&str>,
-    is_windows: bool,
-    windows_stdout_supports_ansi: bool,
-) -> bool {
-    if term == Some("dumb") {
-        return false;
-    }
-
-    if !is_windows {
-        return true;
-    }
-
-    term.is_some() || windows_stdout_supports_ansi
-}
-
-/// Check whether the active Windows stdout console supports ANSI clear-screen sequences.
-#[cfg(windows)]
-fn windows_stdout_supports_ansi() -> bool {
-    type Bool = i32;
-    type Dword = u32;
-    type Handle = *mut std::ffi::c_void;
-
-    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: Dword = 0x0004;
-    const STD_OUTPUT_HANDLE: Dword = (-11_i32) as Dword;
-
-    unsafe extern "system" {
-        fn GetStdHandle(n_std_handle: Dword) -> Handle;
-        fn GetConsoleMode(handle: Handle, mode: *mut Dword) -> Bool;
-        fn SetConsoleMode(handle: Handle, mode: Dword) -> Bool;
-    }
-
-    unsafe {
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        if handle.is_null() || handle as isize == -1 {
-            return false;
-        }
-
-        let mut mode = 0;
-        if GetConsoleMode(handle, &mut mode) == 0 {
-            return false;
-        }
-        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
-            return true;
-        }
-
-        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
-    }
-}
-
-/// Non-Windows platforms rely on TERM and TTY detection instead of console probing.
-#[cfg(not(windows))]
-fn windows_stdout_supports_ansi() -> bool {
-    false
 }
 
 /// Decide whether watch mode should refresh pricing before the next redraw.

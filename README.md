@@ -115,6 +115,8 @@ Date: 2026-03-11  Window: 60 minutes
 ```
 
 Watch mode does not support `--json`, `--since`, `--until`, or `--last-days`.
+It runs in the terminal's alternate screen, ignoring keyboard and scroll input without echoing it;
+press Ctrl-C to exit and restore the previous screen, cursor, and input mode.
 Use `--per-model-burn-rate` to append one burn-rate column per active model, with aggregate `Burn Rate (/h)` kept as the rightmost column.
 When the terminal is too narrow to fit every per-model column in one table, watch mode automatically
 stacks multiple table blocks vertically, repeating the `Metric` column in each block while keeping
