@@ -3294,7 +3294,7 @@ fn render_watch_screen_shows_eight_hour_cost_graph_when_space_allows() {
 
     let graph_markers = normalized_watch_graph_markers(&rendered);
     assert!(rendered.contains("Burn Rate History"));
-    assert!(graph_markers.contains("- $33.00/h"));
+    assert!(graph_markers.contains("- $28.88/h"));
     assert!(!rendered.contains("$0.00/h"));
     assert!(!rendered.contains("Max Burn Rate"));
     assert!(graph_markers.contains("00:00 --------------------- 08:00"));

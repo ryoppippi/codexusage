@@ -497,12 +497,12 @@ fn format_watch_graph(
     Some(output)
 }
 
-/// Build right-side cost scale labels for the fixed-height graph.
+/// Build right-side cost scale labels centered on each fixed-height graph row.
 fn cost_legend_labels(max_cost: f64, borders: super::table::BorderStyle) -> Vec<String> {
     (1..=WATCH_GRAPH_BODY_HEIGHT)
         .rev()
         .map(|level| {
-            let level_f64 = u32::try_from(level).map_or(0.0, f64::from);
+            let level_f64 = u32::try_from(level).map_or(0.0, f64::from) - 0.5;
             let cost = max_cost * level_f64 / WATCH_GRAPH_BODY_HEIGHT_F64;
             cost_legend_label(cost, borders)
         })
@@ -1140,6 +1140,18 @@ mod tests {
         assert_eq!(
             cost_plot_rows(&points, 2.0, BorderStyle::Unicode),
             vec!["  █", "  █", "  █", " ▄█"]
+        );
+    }
+
+    #[test]
+    fn cost_legend_labels_match_graph_row_midpoints() {
+        assert_eq!(
+            cost_legend_labels(8.0, BorderStyle::Unicode),
+            vec!["─ $7.00/h", "─ $5.00/h", "─ $3.00/h", "─ $1.00/h"]
+        );
+        assert_eq!(
+            cost_legend_labels(8.0, BorderStyle::Ascii),
+            vec!["- $7.00/h", "- $5.00/h", "- $3.00/h", "- $1.00/h"]
         );
     }
 
