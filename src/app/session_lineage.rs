@@ -35,24 +35,33 @@ struct EntryKind<'a> {
 /// Parse the first session metadata record into lineage fields.
 pub(in crate::app) fn parse_session_descriptor(line: &[u8]) -> Option<SessionDescriptor> {
     let entry = serde_json::from_slice::<serde_json::Value>(line).ok()?;
-    if entry.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
-        return None;
+    match entry.get("type").and_then(serde_json::Value::as_str) {
+        Some("session_meta") => {
+            let payload = entry.get("payload")?;
+            Some(SessionDescriptor {
+                thread_id: payload
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+                parent_thread_id: payload
+                    .pointer("/source/subagent/thread_spawn/parent_thread_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+                cwd: payload
+                    .get("cwd")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from),
+            })
+        }
+        Some("session") => Some(SessionDescriptor {
+            cwd: entry
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from),
+            ..SessionDescriptor::default()
+        }),
+        _ => None,
     }
-    let payload = entry.get("payload")?;
-    Some(SessionDescriptor {
-        thread_id: payload
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
-        parent_thread_id: payload
-            .pointer("/source/subagent/thread_spawn/parent_thread_id")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
-        cwd: payload
-            .get("cwd")
-            .and_then(serde_json::Value::as_str)
-            .map(PathBuf::from),
-    })
 }
 
 /// Read lineage metadata from the first non-empty record of one rollout file.

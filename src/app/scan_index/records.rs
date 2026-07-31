@@ -12,7 +12,7 @@ use rusqlite::{Connection, Transaction, params, params_from_iter};
 use std::collections::HashMap;
 
 /// Parser-state version stored with checkpoints.
-const PARSER_VERSION: i64 = 2;
+const PARSER_VERSION: i64 = 3;
 
 /// Full result of parsing one selected file.
 #[derive(Clone)]

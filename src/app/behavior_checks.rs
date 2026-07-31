@@ -2542,6 +2542,34 @@ fn scan_session_file_from_checkpoint_reads_only_appended_suffix() {
 }
 
 #[test]
+fn pi_fork_cutoff_is_recovered_for_incremental_scans() {
+    let temp = TempDir::new().expect("tempdir");
+    let session_file = temp.path().join("fork.jsonl");
+    let header = r#"{"type":"session","version":3,"id":"fork","timestamp":"2026-01-02T00:00:00Z","cwd":"/tmp/project","parentSession":"/tmp/parent.jsonl"}"#;
+    fs::write(&session_file, format!("{header}\n")).expect("write header");
+
+    let checkpoint = scan_session_file_from_checkpoint(
+        &session_file,
+        "project/fork",
+        &SessionParseCheckpoint::default(),
+        |_| {},
+    )
+    .expect("scan header");
+    let copied = r#"{"type":"message","id":"copied01","parentId":null,"timestamp":"2026-01-01T23:00:00Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.4","usage":{"input":100,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":110}}}"#;
+    let own = r#"{"type":"message","id":"own00001","parentId":"copied01","timestamp":"2026-01-02T00:00:01Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.4","usage":{"input":20,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":25}}}"#;
+    fs::write(&session_file, format!("{header}\n{copied}\n{own}\n"))
+        .expect("append copied history and own message");
+
+    let mut totals = Vec::new();
+    scan_session_file_from_checkpoint(&session_file, "project/fork", &checkpoint, |event| {
+        totals.push(event.usage.total);
+    })
+    .expect("incremental scan");
+
+    assert_eq!(totals, vec![25]);
+}
+
+#[test]
 fn spawned_subagent_emits_only_usage_after_communication_boundary() {
     let temp = TempDir::new().expect("tempdir");
     let session_file = temp.path().join("child.jsonl");
@@ -4151,6 +4179,14 @@ fn cli_accepts_threads_flag() {
     let cli = Cli::try_parse_from(["codexusage", "--threads", "1", "daily"]).expect("cli");
 
     assert_eq!(cli.threads, NonZeroUsize::new(1));
+}
+
+#[test]
+fn cli_accepts_no_pi_as_global_flag() {
+    let cli = Cli::try_parse_from(["codexusage", "--no-pi", "daily"]).expect("cli");
+
+    assert!(cli.no_pi);
+    assert_eq!(cli.command, Some(Command::Daily));
 }
 
 #[test]

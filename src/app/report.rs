@@ -360,6 +360,55 @@ pub(in crate::app) fn resolve_session_dirs(session_dirs: &[PathBuf]) -> Vec<Path
     vec![codex_home.join("sessions")]
 }
 
+/// Resolve CLI roots, optionally adding Pi's session store to the Codex default.
+pub(in crate::app) fn resolve_cli_session_dirs(
+    session_dirs: &[PathBuf],
+    include_pi: bool,
+) -> Vec<PathBuf> {
+    if !session_dirs.is_empty() {
+        return session_dirs.to_vec();
+    }
+
+    let mut resolved = resolve_session_dirs(session_dirs);
+    if include_pi {
+        let pi_sessions = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map_or_else(default_pi_session_dir, expand_pi_path);
+        if pi_sessions.is_dir() && !resolved.contains(&pi_sessions) {
+            resolved.push(pi_sessions);
+        }
+    }
+    resolved
+}
+
+/// Resolve Pi's default session directory from its configurable agent directory.
+fn default_pi_session_dir() -> PathBuf {
+    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(expand_pi_path)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi").join("agent"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".pi").join("agent"));
+    agent_dir.join("sessions")
+}
+
+/// Expand Pi's documented `~` and `~/...` directory forms.
+fn expand_pi_path(path: PathBuf) -> PathBuf {
+    let Some(value) = path.to_str() else {
+        return path;
+    };
+    if value == "~" {
+        return std::env::var_os("HOME").map_or(path, PathBuf::from);
+    }
+    let Some(relative) = value.strip_prefix("~/") else {
+        return path;
+    };
+    std::env::var_os("HOME").map_or(path.clone(), |home| PathBuf::from(home).join(relative))
+}
+
 /// Convert a path into an absolute lexical form without touching the filesystem.
 pub(in crate::app) fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {

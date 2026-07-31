@@ -72,6 +72,68 @@ fn daily_report_uses_last_usage_and_total_delta_fallback() {
 }
 
 #[test]
+fn pi_openai_codex_messages_are_ingested_with_normalized_cache_usage() {
+    let temp = TempDir::new().expect("tempdir");
+    write_session_file(
+        &temp,
+        "sessions/project/session-pi.jsonl",
+        concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"pi-session\",\"timestamp\":\"2026-03-01T12:00:00.000Z\",\"cwd\":\"/tmp/project\"}\n",
+            "{\"type\":\"message\",\"id\":\"abc12345\",\"parentId\":null,\"timestamp\":\"2026-03-01T12:00:01.000Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai-codex\",\"model\":\"gpt-5.4\",\"usage\":{\"input\":100,\"output\":30,\"cacheRead\":40,\"cacheWrite\":10,\"reasoning\":12,\"totalTokens\":180}}}\n",
+            "{\"type\":\"message\",\"id\":\"def67890\",\"parentId\":\"abc12345\",\"timestamp\":\"2026-03-01T12:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude\",\"usage\":{\"input\":999,\"output\":999,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":1998}}}\n"
+        ),
+    );
+
+    let mut options = base_options(&temp.path().join("sessions"));
+    options.project_dir = Some(std::path::PathBuf::from("/tmp/project"));
+    let report = build_report(ReportKind::Daily, &options).expect("build report");
+
+    match report {
+        ReportOutput::Daily { rows, totals, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].date, "2026-03-01");
+            assert_eq!(totals.input_tokens, 150);
+            assert_eq!(totals.cached_input_tokens, 40);
+            assert_eq!(totals.output_tokens, 30);
+            assert_eq!(totals.reasoning_output_tokens, 12);
+            assert_eq!(totals.total_tokens, 180);
+            assert!(rows[0].models.contains_key("gpt-5.4"));
+            assert!(!rows[0].models.contains_key("claude"));
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+#[test]
+fn pi_forks_do_not_recount_copied_parent_usage() {
+    let temp = TempDir::new().expect("tempdir");
+    write_session_file(
+        &temp,
+        "sessions/project/fork.jsonl",
+        concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"fork\",\"timestamp\":\"2026-03-01T12:00:00.000Z\",\"cwd\":\"/tmp/project\",\"parentSession\":\"/tmp/parent.jsonl\"}\n",
+            "{\"type\":\"message\",\"id\":\"copied01\",\"parentId\":null,\"timestamp\":\"2026-03-01T11:00:00.000Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai-codex\",\"model\":\"gpt-5.4\",\"usage\":{\"input\":100,\"output\":10,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":110}}}\n",
+            "{\"type\":\"message\",\"id\":\"own00001\",\"parentId\":\"copied01\",\"timestamp\":\"2026-03-01T12:00:01.000Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai-codex\",\"model\":\"gpt-5.4\",\"usage\":{\"input\":20,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":25}}}\n"
+        ),
+    );
+
+    let report = build_report(
+        ReportKind::Daily,
+        &base_options(&temp.path().join("sessions")),
+    )
+    .expect("build report");
+
+    match report {
+        ReportOutput::Daily { totals, .. } => {
+            assert_eq!(totals.input_tokens, 20);
+            assert_eq!(totals.output_tokens, 5);
+            assert_eq!(totals.total_tokens, 25);
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+#[test]
 fn session_report_marks_fallback_models_when_metadata_is_missing() {
     let temp = TempDir::new().expect("tempdir");
     write_session_file(

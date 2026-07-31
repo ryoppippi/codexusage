@@ -24,6 +24,15 @@ static TOKEN_COUNT_TYPE_FINDER: LazyLock<Finder<'static>> =
 /// Compact turn-context entry type marker.
 static TURN_CONTEXT_TYPE_FINDER: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new(br#""type":"turn_context""#));
+/// Compact Pi message-entry type marker.
+static PI_MESSAGE_TYPE_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(br#""type":"message""#));
+/// Exact Pi provider marker accepted by this Codex usage scanner.
+static PI_CODEX_PROVIDER_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(br#""provider":"openai-codex""#));
+/// Pi parent-session header field used to identify copied fork history.
+static PI_PARENT_SESSION_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(br#""parentSession":""#));
 /// JSON Unicode escape introducer.
 static UNICODE_ESCAPE_FINDER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\\u"));
 /// Usage-bearing turn-context marker.
@@ -187,6 +196,54 @@ struct SessionLogEntry<'a> {
         deserialize_with = "deserialize_optional_object_lossy"
     )]
     payload: Option<EntryPayload<'a>>,
+    /// Pi message payload.
+    #[serde(
+        borrow,
+        default,
+        deserialize_with = "deserialize_optional_object_lossy"
+    )]
+    message: Option<PiMessage<'a>>,
+}
+
+/// Usage-bearing subset of a Pi assistant message.
+#[derive(Default, Deserialize)]
+struct PiMessage<'a> {
+    /// Message role.
+    #[serde(borrow, default, deserialize_with = "deserialize_optional_cow_lossy")]
+    role: Option<Cow<'a, str>>,
+    /// Model provider.
+    #[serde(borrow, default, deserialize_with = "deserialize_optional_cow_lossy")]
+    provider: Option<Cow<'a, str>>,
+    /// Model identifier.
+    #[serde(borrow, default, deserialize_with = "deserialize_optional_cow_lossy")]
+    model: Option<Cow<'a, str>>,
+    /// Per-response token usage.
+    #[serde(default, deserialize_with = "deserialize_optional_object_lossy")]
+    usage: Option<PiUsage>,
+}
+
+/// Token counters persisted by Pi's provider-neutral runtime.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiUsage {
+    /// Non-cached input tokens.
+    #[serde(default, deserialize_with = "deserialize_u64_lossy")]
+    input: u64,
+    /// Output tokens, including reasoning tokens.
+    #[serde(default, deserialize_with = "deserialize_u64_lossy")]
+    output: u64,
+    /// Cache-read input tokens.
+    #[serde(default, deserialize_with = "deserialize_u64_lossy")]
+    cache_read: u64,
+    /// Cache-write input tokens.
+    #[serde(default, deserialize_with = "deserialize_u64_lossy")]
+    cache_write: u64,
+    /// Reasoning tokens, already included in output.
+    #[serde(default, deserialize_with = "deserialize_u64_lossy")]
+    reasoning: u64,
+    /// Provider-reported total tokens.
+    #[serde(default, deserialize_with = "deserialize_u64_lossy")]
+    total_tokens: u64,
 }
 
 /// Payload fields used by turn-context and token-count events.
@@ -904,6 +961,11 @@ fn scan_session_file_from_checkpoint_inner(
     }
 
     let mut file = File::open(file)?;
+    let pi_fork_started_at = if checkpoint.offset > 0 {
+        read_pi_fork_start_timestamp(&mut file)?
+    } else {
+        None
+    };
     file.seek(SeekFrom::Start(checkpoint.offset))?;
     let reader = BufReader::new(file);
     let mut line = Vec::new();
@@ -911,6 +973,7 @@ fn scan_session_file_from_checkpoint_inner(
     let mut current_model = checkpoint.current_model.clone();
     let mut current_model_is_fallback = checkpoint.current_model_is_fallback;
     let mut replay_state = checkpoint.replay_state;
+    let mut pi_fork_started_at = pi_fork_started_at;
     let mut reader = reader;
     let mut offset = checkpoint.offset;
     loop {
@@ -933,6 +996,7 @@ fn scan_session_file_from_checkpoint_inner(
             break;
         }
         classify_replay_record(trimmed, &mut replay_state);
+        pi_fork_started_at = pi_fork_started_at.or_else(|| pi_fork_start_timestamp(trimmed));
         if !line_might_affect_usage_bytes(trimmed) {
             on_bytes(&line);
             offset = next_offset;
@@ -946,6 +1010,7 @@ fn scan_session_file_from_checkpoint_inner(
             &mut current_model,
             &mut current_model_is_fallback,
         )? && replay_state == ReplayState::CountingOwn
+            && pi_fork_started_at.is_none_or(|started_at| event.timestamp_utc >= started_at)
         {
             on_event(&event);
         }
@@ -976,6 +1041,7 @@ fn scan_session_reader(
     let mut current_model = checkpoint.current_model.clone();
     let mut current_model_is_fallback = checkpoint.current_model_is_fallback;
     let mut replay_state = checkpoint.replay_state;
+    let mut pi_fork_started_at = None;
     let mut offset = start_offset;
     let mut stopped_at_partial_record = false;
     loop {
@@ -999,6 +1065,7 @@ fn scan_session_reader(
             break;
         }
         classify_replay_record(trimmed, &mut replay_state);
+        pi_fork_started_at = pi_fork_started_at.or_else(|| pi_fork_start_timestamp(trimmed));
         if !line_might_affect_usage_bytes(trimmed) {
             on_bytes(&line);
             offset = next_offset;
@@ -1012,6 +1079,7 @@ fn scan_session_reader(
             &mut current_model,
             &mut current_model_is_fallback,
         )? && replay_state == ReplayState::CountingOwn
+            && pi_fork_started_at.is_none_or(|started_at| event.timestamp_utc >= started_at)
         {
             on_event(&event);
         }
@@ -1029,6 +1097,39 @@ fn scan_session_reader(
         current_model_is_fallback,
         replay_state,
     })
+}
+
+/// Recover a Pi fork cutoff before scanning an appended suffix.
+fn read_pi_fork_start_timestamp(file: &mut File) -> Result<Option<DateTime<Utc>>> {
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(None);
+        }
+        let trimmed = trim_ascii_whitespace(&line);
+        if !trimmed.is_empty() {
+            return Ok(pi_fork_start_timestamp(trimmed));
+        }
+    }
+}
+
+/// Read the creation timestamp from a Pi fork header that precedes copied history.
+fn pi_fork_start_timestamp(line: &[u8]) -> Option<DateTime<Utc>> {
+    PI_PARENT_SESSION_FINDER.find(line)?;
+    let entry = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+    if entry.get("type").and_then(serde_json::Value::as_str) != Some("session")
+        || entry
+            .get("parentSession")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(entry.get("timestamp")?.as_str()?)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
 /// Advance inherited-history handling from one complete non-empty JSONL record.
@@ -1056,7 +1157,14 @@ pub(in crate::app) fn line_might_affect_usage(line: &str) -> bool {
 
 /// Return whether one JSONL byte record might affect usage aggregation.
 fn line_might_affect_usage_bytes(line: &[u8]) -> bool {
-    line_has_exact_usage_type_markers(line) || contains_escaped_usage_marker(line)
+    line_has_exact_usage_type_markers(line)
+        || line_has_pi_codex_usage_markers(line)
+        || contains_escaped_usage_marker(line)
+}
+
+/// Return whether a compact Pi record can contain accepted Codex usage.
+fn line_has_pi_codex_usage_markers(line: &[u8]) -> bool {
+    PI_MESSAGE_TYPE_FINDER.find(line).is_some() && PI_CODEX_PROVIDER_FINDER.find(line).is_some()
 }
 
 /// Return whether one compact JSON record has exact usage-bearing type markers.
@@ -1186,6 +1294,15 @@ fn parse_token_usage_line_bytes<'session, 'model>(
     let Some(entry_type) = entry.entry_type.as_deref() else {
         return Ok(None);
     };
+    if entry_type == "message" {
+        return parse_pi_token_usage_entry(
+            &entry,
+            session_key,
+            session_id,
+            current_model,
+            current_model_is_fallback,
+        );
+    }
     if entry_type == "turn_context" {
         if let Some(model) = entry.payload.as_ref().and_then(extract_payload_model) {
             remember_model(current_model, model);
@@ -1219,6 +1336,72 @@ fn parse_token_usage_line_bytes<'session, 'model>(
         timestamp_utc,
         model,
         is_fallback_model,
+        usage,
+    }))
+}
+
+/// Parse an accepted Pi assistant message into one normalized usage event.
+fn parse_pi_token_usage_entry<'session, 'model>(
+    entry: &SessionLogEntry<'_>,
+    session_key: &'session str,
+    session_id: &'session str,
+    current_model: &'model mut Option<String>,
+    current_model_is_fallback: &mut bool,
+) -> Result<Option<TokenUsageEvent<'session, 'model>>> {
+    let Some(message) = entry.message.as_ref() else {
+        return Ok(None);
+    };
+    if message.role.as_deref() != Some("assistant")
+        || message.provider.as_deref() != Some("openai-codex")
+    {
+        return Ok(None);
+    }
+    let Some(model) = message
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(raw) = message.usage else {
+        return Ok(None);
+    };
+    let input = raw
+        .input
+        .saturating_add(raw.cache_read)
+        .saturating_add(raw.cache_write);
+    let total = if raw.total_tokens > 0 {
+        raw.total_tokens
+    } else {
+        input.saturating_add(raw.output)
+    };
+    let usage = UsageTotals {
+        input,
+        cached_input: raw.cache_read.min(input),
+        output: raw.output,
+        reasoning_output: raw.reasoning.min(raw.output),
+        total,
+    };
+    if usage.input == 0 && usage.output == 0 {
+        return Ok(None);
+    }
+    let Some(timestamp) = entry.timestamp.as_deref() else {
+        return Ok(None);
+    };
+    let timestamp_utc = DateTime::parse_from_rfc3339(timestamp)
+        .wrap_err_with(|| format!("invalid timestamp {timestamp}"))?
+        .with_timezone(&Utc);
+    remember_model(current_model, model);
+    *current_model_is_fallback = false;
+    Ok(Some(TokenUsageEvent {
+        session_key,
+        session_id,
+        timestamp_utc,
+        model: current_model
+            .as_deref()
+            .expect("Pi message model was just stored"),
+        is_fallback_model: false,
         usage,
     }))
 }

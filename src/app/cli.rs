@@ -7,7 +7,7 @@ use super::model::{
     ScannerParallelism, WatchOptions,
 };
 use super::render::render_report;
-use super::report::{build_report_for_cli, default_timezone_name};
+use super::report::{build_report_for_cli, default_timezone_name, resolve_cli_session_dirs};
 use super::scan_index::ScanIndexConfig;
 use super::watch::{cli_scan_behavior, run_watch_loop, validate_watch_flags};
 use clap::{Args, Parser, Subcommand};
@@ -139,6 +139,7 @@ where
         cache_cost,
         project,
         session_dir,
+        no_pi,
         threads,
         scan_index,
         command,
@@ -147,6 +148,7 @@ where
     let timezone = timezone.unwrap_or_else(default_timezone_name);
     let project_dir = project.resolve_project_dir()?;
     let parallelism = threads.map_or(ScannerParallelism::Auto, ScannerParallelism::Fixed);
+    let session_dir = resolve_cli_session_dirs(&session_dir, !no_pi);
     let cached_input_cost_mode = cache_cost.cached_input_cost_mode();
     let cache_read_mode = cache_cost.cache_read_mode();
 
@@ -220,6 +222,10 @@ where
 }
 
 /// Command-line interface for the binary.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent global CLI switches map naturally to booleans"
+)]
 #[derive(Debug, Parser)]
 #[command(
     author,
@@ -270,6 +276,9 @@ pub(in crate::app) struct Cli {
     /// Override the session directory. May be repeated.
     #[arg(long, global = true)]
     pub(in crate::app) session_dir: Vec<PathBuf>,
+    /// Do not automatically ingest Pi sessions using the openai-codex provider.
+    #[arg(long, global = true)]
+    pub(in crate::app) no_pi: bool,
     /// Scanner worker count. Use `1` for single-threaded profiling runs.
     #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(NonZeroUsize))]
     pub(in crate::app) threads: Option<NonZeroUsize>,

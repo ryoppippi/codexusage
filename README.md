@@ -33,6 +33,9 @@ codexusage daily --current-dir
 
 # Custom session directory
 codexusage session --session-dir /path/to/sessions
+
+# Ignore Pi runtime sessions
+codexusage daily --no-pi
 ```
 
 ## Examples
@@ -144,6 +147,7 @@ Flags:
 - `--no-cache-cost` - treat cache-read input tokens as free in cost calculations
 - `--exclude-cache-read` - subtract cache-read input tokens from reported input/total usage and hide cache-read columns
 - `--session-dir` - override session directory (repeatable)
+- `--no-pi` - do not automatically scan Pi runtime sessions
 - `--project-dir PATH` - only include sessions whose logged working directory is under this project path
 - `--current-dir` - shortcut for `--project-dir` with the current directory
 - `--threads N` - scanner worker count
@@ -153,7 +157,7 @@ Flags:
 
 `--last-days` cannot be combined with `--since` or `--until`.
 
-By default, `codexusage` scans `CODEX_HOME/sessions` (or `~/.codex/sessions` when `CODEX_HOME` is not set).
+By default, `codexusage` scans `CODEX_HOME/sessions` (or `~/.codex/sessions` when `CODEX_HOME` is not set). It also discovers Pi sessions under `${PI_CODING_AGENT_SESSION_DIR:-${PI_CODING_AGENT_DIR:-~/.pi/agent}/sessions}` and includes assistant usage from the `openai-codex` provider. Use `--no-pi` to disable Pi discovery. Supplying any `--session-dir` keeps its existing override behavior and disables automatic roots.
 Daily, monthly, and session reports maintain a local scan index under the user cache directory so repeated reports only parse changed session bytes. If the index cannot be read or written, the report still runs and emits a warning. Use `--no-scan-index` for a one-off full scan.
 
 ## Sample output
